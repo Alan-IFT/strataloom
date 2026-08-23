@@ -60,7 +60,11 @@ rm -f ./*.tgz
 # normally and find the artefact on disk, which is also the honest question —
 # what was actually produced, not what npm said it produced.
 npm pack >/dev/null
-packed=$(ls -1 ./*.tgz 2>/dev/null | head -1)
+# Glob rather than `ls | head`: `head` closes the pipe early, which SIGPIPEs
+# `ls`, which `pipefail` reports as failure — the same trap as the check below.
+# `rm -f ./*.tgz` above means at most one match.
+packed=$(printf '%s' ./*.tgz)
+[[ -f $packed ]] || packed=''
 if [[ -z $packed ]]; then
   echo "error: npm pack produced no tarball (its output is above)" >&2
   exit 1
@@ -69,7 +73,14 @@ fi
 # A tarball missing `lib/` installs as an empty package: `main` points there and
 # `.gitignore` excludes it, so this is the one failure that would reach users
 # silently. Fail here instead.
-if ! tar tzf "$packed" | grep -q '^package/lib/index\.js$'; then
+#
+# Listed into a variable rather than piped to `grep -q`: `-q` exits on the
+# first match, `tar` then dies of SIGPIPE, and `pipefail` turns that into a
+# failed pipeline — so a SUCCESSFUL match reported the archive as broken.
+# Reading the whole listing first keeps the check's answer about the tarball
+# rather than about who closed the pipe.
+contents=$(tar tzf "$packed")
+if ! grep -qx 'package/lib/index\.js' <<<"$contents"; then
   echo "error: $packed has no lib/index.js — build output missing" >&2
   exit 1
 fi
