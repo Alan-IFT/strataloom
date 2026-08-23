@@ -9,7 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { MemoryAccessError, MemoryInputError, type MemoryService } from './service.ts'
 import type { MemoryId, MemoryKind, MemoryScope } from './types.ts'
-import { MEMORY_KINDS, MEMORY_SCOPES } from './types.ts'
+import { kindGuidance, MEMORY_KINDS, MEMORY_SCOPES } from './types.ts'
 import { renderFramed } from './recall/inject.ts'
 import { PROJECTION_DIR } from './projection.ts'
 import {
@@ -35,9 +35,11 @@ const MEMORY_HIT_ITEMS = {
   },
 } as const
 
-const KIND_DESCRIPTION =
-  'fact (a durable statement about this repo/codebase) | preference (how the user ' +
-  'wants things done) | procedure (a working sequence of steps)'
+/**
+ * Rendered from the kind definitions, never retyped: the enum the model sees
+ * and the criteria that let it choose are one decision (see types.ts).
+ */
+const KIND_DESCRIPTION = kindGuidance()
 
 const requireAgent = <T>(agent: T | undefined): T => {
   if (agent === undefined) throw new Error('this tool requires an owning agent session')

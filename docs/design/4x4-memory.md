@@ -174,8 +174,12 @@ L2 取当前最相关的 1 块，余额留给 L1。当 L2/L3 不存在时退化�
 每期**独立可交付、可回滚**，且不破坏既有不变量（D1–D9）。
 
 ### 阶段 1 · Coding Memory ＋ 澄清询问
-- `MEMORY_KINDS` 增 `coding`；schema v6 扩 CHECK；工具描述写清与 `fact` 的判据
-  （「换个仓库还成立吗」）与典型 scope。
+- **准备工作已完成**：kind 与其判据现为同一处定义（`MEMORY_KIND_CRITERIA`），
+  加 kind 时判据是同一行的必填项，空判据在加载期报错。此前枚举由常量派生、
+  判据却是另一处手写散文——加 `coding` 会编译通过、测试全绿，却让模型看到
+  一个无从判断的选项。
+- 在 `MEMORY_KIND_CRITERIA` 增 `coding` 及其判据（「换个仓库还成立吗」）；
+  schema v6 扩 CHECK。
 - scope 仍由调用者按条声明，**不引入 kind→scope 的默认绑定**。
 - 不确定是否长期有效时先问，而非静默存下。
 - **验收**：`fact`/`coding` 在 recall 中可分别过滤；同一条 coding 经验既能存成

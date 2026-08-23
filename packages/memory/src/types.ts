@@ -9,11 +9,47 @@ declare const MemoryIdBrand: unique symbol
 /** Branded memory identity (spec §3.2). */
 export type MemoryId = string & { readonly [MemoryIdBrand]: true }
 
-/** Content kinds — content classification only; scope lives in the physical store (spec §2.2). */
-export type MemoryKind = 'fact' | 'preference' | 'procedure'
+/**
+ * Content kinds and the judgement that picks each one — ONE definition.
+ *
+ * The name and its criterion are inseparable: a kind the model can select but
+ * cannot tell apart is worse than no kind at all, because the classification
+ * silently degrades into a guess and recall inherits the mistake. Keeping the
+ * enum here and its prose in the tool description would be the same rule in
+ * two places, and adding a kind would compile, pass every test, and expose an
+ * unexplained option to the model (the shape of D7-D9).
+ *
+ * Criteria are written FOR THE MODEL — they must discriminate, not merely
+ * describe. Adding a kind means answering "how does one tell it from the
+ * others?" right here, or not adding it (spec §2.2 — content classification
+ * only; scope lives in the physical store).
+ */
+export const MEMORY_KIND_CRITERIA = {
+  fact: 'a durable statement about this repo/codebase',
+  preference: 'how the user wants things done',
+  procedure: 'a working sequence of steps',
+} as const satisfies Record<string, string>
+
+/** Content kinds — derived, so the type cannot list a kind with no criterion. */
+export type MemoryKind = keyof typeof MEMORY_KIND_CRITERIA
 
 /** The domain kind enum as a runtime tuple (schema CHECK and tool enum share it). */
-export const MEMORY_KINDS = ['fact', 'preference', 'procedure'] as const
+export const MEMORY_KINDS = Object.keys(MEMORY_KIND_CRITERIA) as readonly MemoryKind[]
+
+/* A blank criterion is the one way the pairing above can still be defeated:
+   it satisfies the type while telling the model nothing. Cheap to assert at
+   load, and it names the kind that caused it. */
+for (const [kind, criterion] of Object.entries(MEMORY_KIND_CRITERIA)) {
+  if (criterion.trim() === '') {
+    throw new Error(`strataloom: memory kind ${JSON.stringify(kind)} has no criterion`)
+  }
+}
+
+/** The model-facing rendering of every kind and its criterion. */
+export const kindGuidance = (): string =>
+  Object.entries(MEMORY_KIND_CRITERIA)
+    .map(([kind, criterion]) => `${kind} (${criterion})`)
+    .join(' | ')
 
 /** Memory lifecycle states (spec §3.3). */
 export type MemoryStatus =
