@@ -28,16 +28,19 @@ where a memory came from.
 
 ## Install
 
-See [INSTALL.md](INSTALL.md). Short version:
+One command, no clone and no build:
 
 ```bash
-cd packages/memory && npm install && npm run verify && npm pack
-dsh plugin --profile web add ./strataloom-dsh-memory-0.1.0.tgz
+dsh plugin --profile web add \
+  https://github.com/Alan-IFT/strataloom/releases/latest/download/strataloom-dsh-memory-0.1.0.tgz
 ```
 
 That single `add` is the whole installation: the package ships its own bundle
 patch, so `dsh` registers it as a profile layer and it loads on the next
-start. Nothing to hand-edit.
+start. Nothing to hand-edit. Restart the harness afterwards.
+
+Installing from a checkout, or publishing a release: see
+[INSTALL.md](INSTALL.md).
 
 Requires Node ≥ 22 (`node:sqlite`). Everything lives in
 `~/.dsh/strataloom/` — no external database, no network calls beyond the

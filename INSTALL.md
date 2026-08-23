@@ -2,34 +2,53 @@
 
 Requires Node ≥ 22 (the plugin uses `node:sqlite`).
 
-## 1. Build and pack
+## Install
+
+One command, no clone and no build:
+
+```bash
+dsh plugin --profile web add \
+  https://github.com/Alan-IFT/strataloom/releases/latest/download/strataloom-dsh-memory-0.1.0.tgz
+```
+
+Then restart the harness.
+
+That single `add` is the whole installation. `dsh plugin` forwards its
+arguments to pnpm inside the profile, and reconciles the profile manifest
+afterwards: a dependency declaring `dsh.bundle` is appended to
+`dsh.profile.bundles` automatically. This package declares one and ships a
+`cordis.patch.yml` that inserts itself into the layer stack, so installing and
+loading are the same step. Nothing to hand-edit.
+
+> **Why a release asset and not the git URL?** The published tarball carries
+> `lib/` already built. Installing from git would need pnpm to run our build
+> script, and pnpm blocks build scripts on git dependencies until the user adds
+> an `allowBuilds` entry — a security decision, and a hand-edited file, pushed
+> onto everyone installing. Shipping built output removes the build step rather
+> than asking permission for it.
+
+## Install from source instead
+
+For a checkout you are modifying:
 
 ```bash
 cd packages/memory
 npm install        # platform packages come from npm; nothing else is needed
 npm run verify     # typecheck + 124 tests — do this before installing
 npm pack           # -> strataloom-dsh-memory-0.1.0.tgz
+dsh plugin --profile web add ./strataloom-dsh-memory-0.1.0.tgz
 ```
 
 The plugin declares the harness packages as *peer* dependencies (the profile
 supplies them at runtime) and mirrors them in `devDependencies` so a clean
 checkout can build and test on its own.
 
-## 2. Install into the profile
+## Publishing a release
 
-```bash
-dsh plugin --profile web add ./strataloom-dsh-memory-0.1.0.tgz
-```
-
-## 3. That's it
-
-`dsh plugin add` reconciles the profile manifest after pnpm runs: any
-dependency that declares `dsh.bundle` is appended to `dsh.profile.bundles`
-automatically. This package declares one, and ships a `cordis.patch.yml` that
-inserts itself into the layer stack — so installing and loading are the same
-step. Nothing to hand-edit.
-
-Restart the harness to pick it up.
+`scripts/release.sh` verifies, packs, checks the tarball actually contains
+`lib/index.js` (a tarball without it installs as an empty package — `main`
+points there and `.gitignore` excludes it), then creates or updates the GitHub
+release and prints the exact install command.
 
 ## 4. Verify
 
