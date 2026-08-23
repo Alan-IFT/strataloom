@@ -42,6 +42,7 @@ test('the packed tarball installs and loads by package name', async (t) => {
     const listing = run('tar', ['-tzf', tarball], staging)
     assert.match(listing, /package\/lib\/index\.js/)
     assert.match(listing, /package\/lib\/types\/index\.d\.ts/)
+    assert.match(listing, /package\/cordis\.patch\.yml/, 'the bundle patch must ship')
     assert.doesNotMatch(listing, /package\/src\//, 'sources must not ship')
     assert.doesNotMatch(listing, /package\/test\//, 'tests must not ship')
 
@@ -86,6 +87,15 @@ test('the packed tarball installs and loads by package name', async (t) => {
     assert.equal(typeof entry.apply, 'function')
     assert.deepEqual(entry.inject, ['tools', 'systemPrompt', 'agents', 'timer'])
     assert.equal(entry.name, 'strataloom-memory')
+
+    // The bundle contract: `dsh plugin add` registers any dependency that
+    // declares `dsh.bundle`, and applies the patch it points at. Without
+    // both halves the user has to hand-edit the profile, so both are
+    // asserted here rather than trusted to a README.
+    assert.equal(manifest.dsh?.bundle?.patch, './cordis.patch.yml')
+    const patch = readFileSync(join(installed, 'cordis.patch.yml'), 'utf8')
+    assert.match(patch, /id: strataloom-memory/)
+    assert.match(patch, /name: '@strataloom\/dsh-memory'/)
   } finally {
     rmSync(staging, { recursive: true, force: true })
   }

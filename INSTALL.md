@@ -21,28 +21,15 @@ checkout can build and test on its own.
 dsh plugin --profile web add ./strataloom-dsh-memory-0.1.0.tgz
 ```
 
-## 3. Load it
+## 3. That's it
 
-Add it to the profile's bundle list in `~/.dsh/profiles/<name>/package.json`:
+`dsh plugin add` reconciles the profile manifest after pnpm runs: any
+dependency that declares `dsh.bundle` is appended to `dsh.profile.bundles`
+automatically. This package declares one, and ships a `cordis.patch.yml` that
+inserts itself into the layer stack — so installing and loading are the same
+step. Nothing to hand-edit.
 
-```jsonc
-{
-  "dsh": {
-    "profile": {
-      "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app",
-                  "@strataloom/dsh-memory"]
-    }
-  }
-}
-```
-
-…or insert it through that profile's `cordis.patch.yml`:
-
-```yaml
-- id: strataloom-memory
-  name: "@strataloom/dsh-memory"
-  config: {}
-```
+Restart the harness to pick it up.
 
 ## 4. Verify
 
@@ -63,6 +50,16 @@ there.
 | Option | Default | Effect |
 |---|---|---|
 | `rootDir` | `~/.dsh/strataloom` | Where stores live. Useful for testing, or to keep memory on another volume. |
+
+To set it, add a row to the profile's own `cordis.patch.yml` (that layer is
+applied after every bundle layer, so it overrides the defaults this package
+inserted):
+
+```yaml
+- id: strataloom-memory
+  config:
+    rootDir: /data/strataloom
+```
 
 Nothing else is configurable by design: budgets, retention windows, and decay
 thresholds are calibration parameters kept in one file (`src/constants.ts`),

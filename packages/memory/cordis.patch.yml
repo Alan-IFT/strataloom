@@ -1,0 +1,10 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+#
+# Naming this package in a profile's `dsh.profile.bundles` applies this file,
+# so installing and loading are one step — the alternative is asking every
+# user to hand-edit a patch file to repeat what the package already knows
+# about itself.
+- insert:
+    - id: strataloom-memory
+      name: '@strataloom/dsh-memory'
+      config: {}

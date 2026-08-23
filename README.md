@@ -35,6 +35,10 @@ cd packages/memory && npm install && npm run verify && npm pack
 dsh plugin --profile web add ./strataloom-dsh-memory-0.1.0.tgz
 ```
 
+That single `add` is the whole installation: the package ships its own bundle
+patch, so `dsh` registers it as a profile layer and it loads on the next
+start. Nothing to hand-edit.
+
 Requires Node ≥ 22 (`node:sqlite`). Everything lives in
 `~/.dsh/strataloom/` — no external database, no network calls beyond the
 model routes the harness already has.

@@ -18,9 +18,15 @@
     "memory",
     "sqlite"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "files": [
     "lib/**/*.js",
     "lib/types/**/*.d.ts",
+    "cordis.patch.yml",
     "README.md"
   ],
   "engines": {
