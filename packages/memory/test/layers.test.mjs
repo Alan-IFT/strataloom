@@ -20,7 +20,8 @@ import { runDecayJob } from '../lib/pipeline/decay.js'
 import { packetOverflows, readRevision, runRebuildJob } from '../lib/pipeline/rebuild.js'
 import { estimateTokens } from '../lib/constants.js'
 import { looksSecret, projectStore, PROJECTION_DIR, PROJECTION_FILE } from '../lib/projection.js'
-import { enqueueJob, claimNextJob } from '../lib/pipeline/jobs.js'
+import { enqueueJob, claimNextJob, commitClaimedJob } from '../lib/pipeline/jobs.js'
+import { queryInjectionRows } from '../lib/store/fts.js'
 import {
   openRegistry,
   cleanup,
@@ -599,6 +600,63 @@ test('any authoritative write retires the rollup and bumps the revision', async 
     'the summary built from the old snapshot is gone',
   )
   assert.ok(readRevision(store) > rev, 'and the revision advanced')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('a PIPELINE write retires the rollup too, not just a tool write', async () => {
+  // Regression. Invalidation used to hang off `commitL1Mutation` — the TOOL
+  // write entry — while the pipeline commits through `commitClaimedJob`. So
+  // reconcile (candidate ⇒ active) and decay (active ⇒ dormant) changed the
+  // authoritative set while the summary built from the OLD set kept shadowing
+  // it on the read path: a freshly learned fact stayed invisible behind a
+  // stale rollup. It could not self-heal either — the rebuild job's
+  // idempotence key is the revision, so with the revision frozen the retry was
+  // absorbed as a duplicate of the job that already ran.
+  //
+  // Schema v5 states the rule over the DATA, so this holds for any write path,
+  // including ones added later. Committing through the raw job entry here is
+  // the point: it proves the guarantee does not depend on the caller.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await overflow(service, principal)
+  ctx.get = (name) => (name === 'llm' ? rollupReply('OLD SUMMARY: repo uses npm') : undefined)
+  const rev = readRevision(store)
+  enqueueJob(store, 'rebuild', 'rb1', { expectedRevision: rev, provider: 'p', model: 'm' }, 0)
+  await runRebuildJob(
+    ctx, store, claimNextJob(store, Date.now(), Date.now() + 60_000),
+    { expectedRevision: rev, provider: 'p', model: 'm' }, new AbortController().signal,
+  )
+  assert.equal(store.db.prepare(`SELECT count(*) c FROM memories WHERE derived = 1`).get().c, 1)
+  const afterRollup = readRevision(store)
+
+  // A reconcile-shaped commit: flip a candidate to active through the JOB
+  // entry, which never knew about invalidation.
+  const now = Date.now()
+  store.tx(() => {
+    store.db.prepare(
+      `INSERT INTO jobs (id,kind,payload,state,attempts,run_after,created_at,lease_token)
+       VALUES ('rc1','reconcile','{}','running',1,?,?,'tok')`).run(now, now)
+    store.db.prepare(
+      `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at)
+       VALUES ('m-new','fact','repo-local','candidate','uses pnpm','THE REPO NOW USES PNPM','human',?,?)`,
+    ).run(now, now)
+  })
+  commitClaimedJob(store, 'rc1', 'tok', () => {
+    store.db.prepare(`UPDATE memories SET status='active' WHERE id='m-new'`).run()
+  })
+
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived = 1`).get().c,
+    0,
+    'a pipeline write must retire the summary built from the old snapshot',
+  )
+  assert.ok(readRevision(store) > afterRollup, 'and it must advance the revision')
+  // The newly learned fact is now actually reachable on the read path.
+  assert.ok(
+    queryInjectionRows(store).some((hit) => hit.body.includes('PNPM')),
+    'the fresh fact is no longer hidden behind a stale summary',
+  )
   registry.dispose()
   cleanup(root)
 })

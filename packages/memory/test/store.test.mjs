@@ -86,6 +86,43 @@ test('v1 -> v2 -> v3 stepwise upgrade works', () => {
   cleanup(root)
 })
 
+test('v4 -> v5 upgrade makes an EXISTING store invalidate on any write path', () => {
+  // The real population is v4 stores in the field, whose rollups were only
+  // retired by the tool write entry. The upgrade must retrofit the guarantee
+  // onto data that already exists, not just onto freshly created stores.
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo', 4)
+  const now = Date.now()
+  db.exec(`INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+    VALUES ('roll','fact','repo-local','active','summary','OLD','derived',${now},${now},1)`)
+  db.exec(`INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at)
+    VALUES ('m1','fact','repo-local','candidate','fresh','NEW','human',${now},${now})`)
+  // v4: a raw pipeline-shaped write leaves the stale rollup in place.
+  db.exec(`UPDATE memories SET status='active' WHERE id='m1'`)
+  assert.equal(
+    db.prepare(`SELECT count(*) c FROM memories WHERE derived=1`).get().c,
+    1,
+    'v4 is the buggy baseline: the summary survives a non-tool write',
+  )
+
+  migrate(db, 'repo', 5)
+  assert.equal(userVersion(db), 5)
+  // The same write now retires the summary, on the pre-existing data.
+  db.exec(`UPDATE memories SET status='dormant' WHERE id='m1'`)
+  assert.equal(
+    db.prepare(`SELECT count(*) c FROM memories WHERE derived=1`).get().c,
+    0,
+    'after the upgrade, any authoritative change invalidates',
+  )
+  assert.ok(
+    Number(db.prepare(`SELECT v FROM meta WHERE k='store_revision'`).get().v) > 0,
+    'and the revision advances, so a queued rebuild is a distinct job',
+  )
+  db.close()
+  cleanup(root)
+})
+
 test('foreign application_id is refused', () => {
   const root = tempRoot()
   const db = openRaw(join(root, 'm.sqlite'))

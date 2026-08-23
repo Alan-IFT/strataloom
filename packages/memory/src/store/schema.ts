@@ -216,11 +216,50 @@ const migrateV4 = (db: DatabaseSync): void => {
   `)
 }
 
+/**
+ * user_version = 5: derived-layer invalidation becomes a property of the DATA,
+ * not of the code path that wrote it.
+ *
+ * v4 invalidated the rollup from `commitL1Mutation` — the tool write entry.
+ * But the pipeline commits through `commitClaimedJob`, so `reconcile`
+ * (candidate ⇒ active) and `decay` (active ⇒ dormant) changed the authoritative
+ * set WITHOUT retiring the summary built from the old one. The stale rollup
+ * then *replaces* the real rows on the read path, so a freshly learned fact
+ * ("this repo now uses pnpm") stayed invisible behind an outdated summary
+ * ("repo uses npm"). It could not self-heal either: the rebuild job's
+ * idempotence key is the revision, so with the revision frozen the retry was
+ * absorbed as a duplicate of the job that already ran.
+ *
+ * "Two write entries, one of which remembers" is the same shape of bug as any
+ * rule written twice. Stating it once in SQL removes the class: ANY change to a
+ * non-derived row invalidates, whichever code path made it, including paths not
+ * written yet. `WHEN OLD/NEW.derived = 0` is what keeps rebuild's own
+ * delete-then-insert from fencing itself.
+ */
+const migrateV5 = (db: DatabaseSync): void => {
+  const invalidate = `
+      DELETE FROM memories WHERE derived = 1;
+      INSERT INTO meta (k, v) VALUES ('store_revision', '1')
+        ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT);`
+  db.exec(`
+    CREATE TRIGGER invalidate_derived_insert AFTER INSERT ON memories
+      WHEN NEW.derived = 0 BEGIN${invalidate}
+    END;
+    CREATE TRIGGER invalidate_derived_update AFTER UPDATE ON memories
+      WHEN OLD.derived = 0 BEGIN${invalidate}
+    END;
+    CREATE TRIGGER invalidate_derived_delete AFTER DELETE ON memories
+      WHEN OLD.derived = 0 BEGIN${invalidate}
+    END;
+  `)
+}
+
 const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
   migrateV1,
   migrateV2,
   migrateV3,
   migrateV4,
+  migrateV5,
 ]
 
 /**

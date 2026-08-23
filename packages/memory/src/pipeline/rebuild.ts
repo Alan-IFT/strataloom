@@ -53,24 +53,6 @@ export const readRevision = (store: OpenStore): number => {
 }
 
 /**
- * Invalidate the derived layer: drop every rollup and advance the revision.
- * Called from the single authoritative write entry, so any change to the
- * authoritative set retires the summary built from the old one.
- * MUST run inside the caller's transaction.
- */
-export const invalidateDerived = (store: OpenStore): number => {
-  const next = readRevision(store) + 1
-  store.db.prepare(`DELETE FROM memories WHERE derived = 1`).run()
-  store.db
-    .prepare(
-      `INSERT INTO meta (k, v) VALUES ('store_revision', ?)
-       ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
-    )
-    .run(String(next))
-  return next
-}
-
-/**
  * Whether direct injection currently overflows its budget — the measured
  * condition that both enables and disables the derived layer. Priced with
  * the packet's own estimator so the trigger means what the budget means.

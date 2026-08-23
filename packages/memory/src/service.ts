@@ -12,7 +12,6 @@ import { GLOBAL_STORE_KEY } from './store/store.ts'
 import type { OpenStore, StoreRegistry } from './store/store.ts'
 import { queryRecallRows, querySimilarRows } from './store/fts.ts'
 import { readSessionTurns } from './store/conversations.ts'
-import { invalidateDerived } from './pipeline/rebuild.ts'
 import { looksSecret, projectStore, PROJECTION_DIR, PROJECTION_FILE } from './projection.ts'
 import { deriveWorkspaceRoot } from './store/repo-key.ts'
 import type { TranscriptEvent } from './transcript.ts'
@@ -57,17 +56,14 @@ const PRINCIPAL_ONLY =
  * commitL1Mutation (spec §3.3): every authoritative change goes through one
  * immediate transaction on one store. The store's `tx` IS the BEGIN
  * IMMEDIATE wrapper; this alias exists so call sites say what they mean.
+ *
+ * It no longer retires the derived summary by hand. That was a write-path
+ * responsibility, and the pipeline commits through `commitClaimedJob` instead
+ * — so reconcile and decay changed the authoritative set while a stale rollup
+ * kept shadowing it. Schema v5 states the rule once, in SQL, over the data:
+ * any change to a non-derived row invalidates, whichever entry wrote it.
  */
-export const commitL1Mutation = <T>(store: OpenStore, mutate: () => T): T =>
-  store.tx(() => {
-    const value = mutate()
-    // Any authoritative change retires the summary built from the previous
-    // snapshot (§12): the derived layer is dropped and the revision advances,
-    // which also fences any rebuild job still in flight. Cheap and
-    // unconditional — a delete of at most one row plus a meta write.
-    invalidateDerived(store)
-    return value
-  })
+export const commitL1Mutation = <T>(store: OpenStore, mutate: () => T): T => store.tx(mutate)
 
 /** Public memory service (spec §3.1). */
 export class MemoryService extends Service {
