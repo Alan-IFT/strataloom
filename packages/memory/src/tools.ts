@@ -41,6 +41,14 @@ const MEMORY_HIT_ITEMS = {
  */
 const KIND_DESCRIPTION = kindGuidance()
 
+/**
+ * What a recall with no hits renders as. Exported because `metrics.ts` counts
+ * these in L0 to price the "should we add embeddings?" question: the recall
+ * tool's own output is the evidence, so the miss rate is a query over data we
+ * already keep rather than a counter someone has to maintain.
+ */
+export const RECALL_NO_MATCH = 'No stored memories matched.'
+
 const requireAgent = <T>(agent: T | undefined): T => {
   if (agent === undefined) throw new Error('this tool requires an owning agent session')
   return agent
@@ -115,7 +123,7 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
         },
         render: (_args, value) => {
           const text = renderFramed(value.hits, RECALL_RESULT_BUDGET_TOKENS, true)
-          return [{ type: 'text', text: text === '' ? 'No stored memories matched.' : text }]
+          return [{ type: 'text', text: text === '' ? RECALL_NO_MATCH : text }]
         },
       },
       isConcurrencySafe: () => true,

@@ -12,10 +12,11 @@ import { MemoryService } from '../lib/service.js'
 import { GLOBAL_STORE_KEY } from '../lib/store/store.js'
 import { captureTurn, readTurn, pruneConversations } from '../lib/store/conversations.js'
 import { collectTurnEvents } from '../lib/transcript.js'
-import { buildContextProvider } from '../lib/recall/inject.js'
+import { buildContextProvider, renderFramed } from '../lib/recall/inject.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import { L0_RETENTION_MS } from '../lib/constants.js'
 import { collectMetrics } from '../lib/metrics.js'
+import { RECALL_NO_MATCH } from '../lib/tools.js'
 import { runDecayJob } from '../lib/pipeline/decay.js'
 import {
   enqueueRebuildIfOverflowing,
@@ -431,6 +432,34 @@ test('metrics snapshot reports the §12 trigger indicators from the store', asyn
   cleanup(root)
 })
 
+test('metrics: the recall miss rate is read from L0, not from a counter', () => {
+  // This number prices the deferred retrieval-fusion work. It is computed from
+  // the recall tool's own recorded output, so there is no counter to maintain
+  // and no new column — the evidence was already being kept.
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  assert.equal(collectMetrics(store, Date.now()).recallMissRate, 0, 'no calls => no division by zero')
+
+  store.tx(() =>
+    captureTurn(store, 'sess-metrics', 1, [
+      { seq: 1, label: 'tool:memory_recall', provenance: 'tool-output', text: RECALL_NO_MATCH },
+      { seq: 2, label: 'tool:memory_recall', provenance: 'tool-output', text: 'The following are stored memory entries...' },
+      { seq: 3, label: 'tool:memory_recall', provenance: 'tool-output', text: RECALL_NO_MATCH },
+      { seq: 4, label: 'user', provenance: 'human', text: 'unrelated turn content' },
+    ]),
+  )
+  const m = collectMetrics(store, Date.now())
+  assert.equal(m.recallCalls, 3, 'only recall rows count')
+  assert.equal(m.recallMissRate, 0.667)
+
+  // The metric matches the tool's own rendered marker, so the two must stay in
+  // step: if that wording changed, this would count zero misses forever and the
+  // fusion decision would rest on a silently broken number.
+  assert.equal(renderFramed([], 500, true), '', 'an empty result renders empty...')
+  assert.equal(RECALL_NO_MATCH, 'No stored memories matched.', '...and the tool substitutes this marker')
+  registry.dispose()
+  cleanup(root)
+})
 test('metrics report oldest pending job age and dead letters', () => {
   const { root, registry } = openRegistry()
   const store = registry.open('k1')
