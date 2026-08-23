@@ -174,6 +174,12 @@ export interface MemoryHit {
   readonly body: string
 }
 
+/** One scope's memories, as `list()` returns them for review. */
+export interface MemoryScopeListing {
+  readonly scope: MemoryScope
+  readonly memories: readonly MemoryHit[]
+}
+
 /** Public alias: what `recall()` hands back per hit. */
 export type RecallHit = MemoryHit
 

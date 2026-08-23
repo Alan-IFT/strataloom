@@ -10,7 +10,7 @@ import { isLineagePrincipal, isLiveAgent } from './identity.ts'
 import { deriveRepoIdentity } from './store/repo-key.ts'
 import { GLOBAL_STORE_KEY } from './store/store.ts'
 import type { OpenStore, StoreRegistry } from './store/store.ts'
-import { queryRecallRows, querySimilarRows } from './store/fts.ts'
+import { queryAllMemories, queryRecallRows, querySimilarRows } from './store/fts.ts'
 import { readSessionTurns } from './store/conversations.ts'
 import { looksSecret, projectStore, PROJECTION_DIR, PROJECTION_FILE } from './projection.ts'
 import { deriveWorkspaceRoot } from './store/repo-key.ts'
@@ -25,6 +25,7 @@ import type {
   MemoryCandidate,
   MemoryId,
   MemoryHit,
+  MemoryScopeListing,
   ProposeResult,
   ShareReport,
   RecallQuery,
@@ -119,6 +120,35 @@ export class MemoryService extends Service {
     if (!isLineagePrincipal(agent)) {
       throw new MemoryAccessError(PRINCIPAL_ONLY)
     }
+  }
+
+  /**
+   * Everything this session can see, newest first, grouped by the store it
+   * came from — the "what have you been remembering about me?" question.
+   *
+   * A read, so it takes the same audience rule as `recall` (live agent, not
+   * necessarily principal). It deliberately does NOT touch `usage`: listing is
+   * browsing, not retrieval, and counting it would make decay think entries
+   * were being used every time someone looked at the list.
+   *
+   * Unlike `recall` there is no query and no relevance ranking, because the
+   * question is completeness rather than relevance. The cap exists so one very
+   * large store cannot flood a caller, not to hide anything.
+   */
+  async list(agent: Agent, limit: number): Promise<readonly MemoryScopeListing[]> {
+    if (!isLiveAgent(this.ctx, agent)) {
+      throw new MemoryAccessError('agent is not live in this registry')
+    }
+    const repo = this.storeFor(agent, false)
+    const personal = this.globalStore(false)
+    const listings: MemoryScopeListing[] = []
+    if (repo !== undefined) {
+      listings.push({ scope: 'repo', memories: queryAllMemories(repo, limit) })
+    }
+    if (personal !== undefined) {
+      listings.push({ scope: 'personal', memories: queryAllMemories(personal, limit) })
+    }
+    return listings
   }
 
   /**

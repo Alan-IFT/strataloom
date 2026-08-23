@@ -109,7 +109,7 @@ verified by adversarial tests rather than asserted in prose:
 ```bash
 cd packages/memory
 npm install           # once
-npm run verify        # typecheck + 125 tests
+npm run verify        # typecheck + 126 tests
 ```
 
 Tests run against the real platform where it matters: a real agent registry,

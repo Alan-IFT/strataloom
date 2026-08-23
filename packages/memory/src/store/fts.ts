@@ -65,6 +65,33 @@ export const queryInjectableSet = (store: OpenStore, limit: number): MemoryHit[]
     .all(limit) as unknown as MemoryHit[]
 
 /**
+ * Everything a person should be able to see: active, non-derived, whatever the
+ * provenance, newest first.
+ *
+ * Deliberately NOT `queryInjectableSet`. That one filters to injectable
+ * provenance, which is right for the packet and wrong here — the memories a
+ * user most needs to review are exactly the ones the pipeline wrote without
+ * being asked, and several of those (subagent, tool-output) never reach the
+ * packet. A review surface that hides what it learned quietly would defeat its
+ * own purpose.
+ *
+ * Derived rows are excluded because they are regenerated summaries of the rows
+ * already listed: showing both would double-count, and `forget` refuses them
+ * anyway.
+ * @param limit - row cap, so one enormous store cannot flood the caller.
+ */
+export const queryAllMemories = (store: OpenStore, limit: number): MemoryHit[] =>
+  store.db
+    .prepare(
+      `SELECT id, kind, title, body
+       FROM memories
+       WHERE status = 'active' AND derived = ${LAYER.RAW}
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+    )
+    .all(limit) as unknown as MemoryHit[]
+
+/**
  * What the next assembly would inject. Derived rows, when they exist, REPLACE
  * the raw set they summarize — that substitution is the whole point of the
  * layer. They exist only while the raw set overflows the budget and are

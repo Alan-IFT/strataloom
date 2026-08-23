@@ -19,6 +19,7 @@ import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { StoreRegistry } from './store/store.ts'
 import { MemoryService } from './service.ts'
 import { registerTools, GUIDANCE_SECTION } from './tools.ts'
+import { registerCommand } from './command.ts'
 import { buildContextProvider, MEMORY_CONTEXT_TEXT, MEMORY_VARIABLE } from './recall/inject.ts'
 import { JobRunner } from './pipeline/runner.ts'
 import { installAutoExtract } from './auto-extract.ts'
@@ -71,6 +72,7 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   // -- global registrations (all disposal rides this plugin's fiber) --------
   registerTools(ctx, memory)
+  registerCommand(ctx, memory)
   ctx.systemPrompt.section(GUIDANCE_SECTION)
   // The packet travels as a variable VALUE, not as context text: prompt text
   // is strictly interpolated, and stored memories legitimately contain `{{…}}`

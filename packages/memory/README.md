@@ -29,6 +29,7 @@ injection, and forgetting all work; only automatic extraction is disabled
 |---|---|---|
 | `memory_propose` | principal only | Saves as `active`; `scope: 'personal'` targets the cross-repo store; `replaces` supersedes an entry and the result lists near-duplicates |
 | `memory_recall` | any agent | FTS across both scopes; `sourceOf: <id>` returns the original conversation |
+| `/memory` | any live agent (list) / principal (forget) | Shows what is stored here without needing a search term — the plugin learns silently, so this is how a person sees the result |
 | `memory_forget` | principal only | Tombstones by id in either scope; `share: true` requests approval to commit it to `.repo_memory/` |
 | context injection | principal only | Personal memories first, then repo working set; framed, ≤1400 tok |
 | L0 capture | principal turns | Every turn recorded in our own store — provenance never depends on the platform log |
@@ -144,7 +145,7 @@ npm install      # platform packages from npm (peer deps, mirrored as dev deps)
 npm run verify   # tsc + the full test suite
 ```
 
-125 tests:
+126 tests:
 
 | File | Covers |
 |---|---|
@@ -156,6 +157,7 @@ npm run verify   # tsc + the full test suite
 | `inject.test.mjs` | discrete injection rules, audience, budget truncation, commit-visibility, cross-process WAL freshness, **no breaking out of a bullet**, **a budget-skipped memory is reported, not silent** |
 | `e2e.test.mjs` | **real agent registry + real tool dispatch + real prompt assembly**, principal vs subagent, no-repo agent, **`{{…}}` in memory content stays data** |
 | `resilience.test.mjs` | bounded busy-retry, corrupt/foreign store isolation, fencing yield, mid-tick store failure, busy-agent deferral |
+| `command.test.mjs` | `/memory` through the **real command runtime**: listing, forget by id, and a subagent refused the write but allowed the read |
 | `lifecycle.test.mjs` | activation, teardown ordering, HMR-shaped reload |
 | `layers.test.mjs` | L0 round-trip/retention/drill-down, personal scope, **bidirectional D2**, dedup and `replaces`, metrics incl. **recall miss rate read from L0**, decay and revival, derived rollup + **revision fencing**, **a pipeline write retires the rollup (D9)**, **coding memory filterable apart from fact and free in either scope**, **L2 scenario blocks that vanish with their L1 (D9)**, **the L3 portrait: written once, unchanged on "keep", present in a brand-new repo**, projection/approval/secret scanning |
 | `package.test.mjs` | the packed tarball installs as a dependency and loads **by package name** |

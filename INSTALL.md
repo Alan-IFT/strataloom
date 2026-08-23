@@ -61,7 +61,7 @@ For a checkout you are modifying:
 ```bash
 cd packages/memory
 npm install        # platform packages come from npm; nothing else is needed
-npm run verify     # typecheck + 125 tests — do this before installing
+npm run verify     # typecheck + 126 tests — do this before installing
 npm pack           # -> strataloom-dsh-memory-0.1.0.tgz
 dsh plugin --profile web add ./strataloom-dsh-memory-0.1.0.tgz
 ```
@@ -121,6 +121,20 @@ inside a git work tree has no repository store — personal memories still work
 there.
 
 ## Looking at what it has learned
+
+In a session, ask it directly:
+
+```
+/memory                  what is remembered here, both scopes
+/memory forget <id>      remove one
+```
+
+The plugin learns as you work, so this is how you see what it picked up
+without having to guess a search term. Listing is a read, open to any session;
+forgetting goes through the same principal check as the tool, because the
+command runs inside the agent context rather than around it.
+
+From a shell, for trends and the evidence behind phase 4:
 
 ```bash
 node scripts/inspect.mjs            # per-store summary and the weekly recall trend

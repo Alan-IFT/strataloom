@@ -44,6 +44,13 @@ export const RECALL_CANDIDATE_LIMIT = 50
 /** Rendered recall result budget (spec §4.3). */
 export const RECALL_RESULT_BUDGET_TOKENS = 500
 
+/**
+ * Rows `/memory` lists per scope. Generous: the point of that command is
+ * completeness, so the cap is a guard against flooding a chat with an enormous
+ * store, not an editorial filter.
+ */
+export const LIST_LIMIT = 200
+
 /** Turns returned by the L0 drill-down mode of memory_recall. */
 export const SOURCE_TURN_LIMIT = 20
 
