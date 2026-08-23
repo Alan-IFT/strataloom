@@ -48,6 +48,12 @@ class FixtureAdapter extends LlmAdapter {
       yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'aborted' } } }
       return
     }
+    if (script.kind === 'max-tokens') {
+      // A reply cut at the output cap: real text, then a non-stop finish.
+      yield { type: 'text-delta', index: 0, text: script.text }
+      yield { type: 'finish', reason: { kind: 'max-tokens' } }
+      return
+    }
     for (const piece of script.text.match(/.{1,20}/gs) ?? []) {
       yield { type: 'text-delta', index: 0, text: piece }
     }
@@ -159,6 +165,26 @@ test('real routing: aborted and errored finishes both reach the retry exit', asy
     )
     await shutdown()
   }
+})
+
+test('real routing: a reply cut at the output cap fails loud, not as bad JSON', async () => {
+  // Found against a LIVE model, which the fixture adapter could not surface
+  // because it always finished as `stop`. `max-tokens` used to fall through to
+  // "finished", so a truncated reply reached the parser and was reported as
+  // "not valid JSON" — the wrong diagnosis, and the retry then re-ran the same
+  // oversized request. Three replies in five arrived truncated mid-string.
+  const { ctx, shutdown } = await bootLlm({
+    pinned: { kind: 'max-tokens', text: '{"scenarios":[{"title":"Auth","body":"cut here' },
+  })
+  await assert.rejects(
+    callPipelineLlm(ctx, { provider: 'pinned', model: 'm' }, 'sys', 'user', new AbortController().signal),
+    (error) => {
+      assert.ok(error instanceof PipelineLlmError)
+      assert.match(error.message, /max-tokens/, 'the cause must name the cap, not the JSON')
+      return true
+    },
+  )
+  await shutdown()
 })
 
 test('real routing: an unregistered provider fails without a fallback service', async () => {

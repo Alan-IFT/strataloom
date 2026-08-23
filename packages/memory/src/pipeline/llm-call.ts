@@ -52,7 +52,14 @@ const streamOnce = async (
       const chunk = next.value
       if (chunk.type === 'text-delta') text += chunk.text
       else if (chunk.type === 'finish') {
-        if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
+        // `max-tokens` is a FAILURE here, not a completion. Every caller parses
+        // this text as a whole structure — strict JSON, or a portrait body —
+        // so a reply cut at the output cap is not a smaller answer, it is a
+        // broken one: real models truncate mid-string, and the parser then
+        // reports "not valid JSON" while the real cause was the cap.
+        // Observed against a live model, where the fixture adapter could not
+        // show it: it always finished as `stop`.
+        if (chunk.reason.kind !== 'stop') {
           throw new PipelineLlmError(`stream finished as ${chunk.reason.kind}`)
         }
         finished = true

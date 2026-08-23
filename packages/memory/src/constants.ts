@@ -94,8 +94,23 @@ export const EXTRACT_EVENT_EXCERPT_CHARS = 400
 export const EXTRACT_TRANSCRIPT_CHARS = 6_000
 /** Existing-memory context cap for reconcile. */
 export const RECONCILE_EXISTING_LIMIT = 30
-/** Output token cap for pipeline LLM calls. */
-export const LLM_MAX_TOKENS = 1_000
+/**
+ * Output token cap for pipeline LLM calls.
+ *
+ * It must exceed what the prompts ASK FOR, or the cap truncates a reply the
+ * prompt itself invited — and since every reply is parsed as a whole
+ * structure, a truncation is not a shorter answer but an unusable one. A live
+ * model hit this: `rollup` asks for up to ${ROLLUP_MAX_SCENARIOS} scenarios of
+ * ~${ROLLUP_TARGET_CHARS} chars each, which alone exceeds 1000 tokens, and
+ * three replies in five came back cut mid-string.
+ *
+ * The value is generous rather than tight on purpose: this is a guardrail
+ * against a runaway reply, not a budget. The real cost control is the input
+ * side (transcript and source limits) and the fact that these jobs are rare.
+ * `chars/4` also understates CJK, where a character is closer to one token, so
+ * a cap derived from character targets needs headroom to stay honest.
+ */
+export const LLM_MAX_TOKENS = 4_000
 
 /** Title length cap (fail loud beyond — propose validation). */
 export const TITLE_MAX_CHARS = 200
@@ -146,6 +161,23 @@ if (
   PERSONA_TARGET_CHARS > BODY_MAX_CHARS
 ) {
   throw new Error('strataloom: a prompt target exceeds the hard cap it must stay below')
+}
+
+/* The same rule one level up: the output cap must fit what the prompts invite.
+   Priced on the worst reply each prompt permits, with JSON scaffolding, and
+   doubled because `chars/4` understates CJK — where the truncation was
+   actually observed. Asserting it here means a future prompt that asks for
+   more fails at load instead of failing as "not valid JSON" in production. */
+const worstReplyChars = Math.max(
+  ROLLUP_MAX_SCENARIOS * (ROLLUP_TITLE_TARGET_CHARS + ROLLUP_TARGET_CHARS + 30),
+  EXTRACT_MAX_CANDIDATES * (EXTRACT_TITLE_TARGET_CHARS + EXTRACT_BODY_TARGET_CHARS + 60),
+  PERSONA_TARGET_CHARS + 60,
+)
+if (LLM_MAX_TOKENS < Math.ceil(worstReplyChars / 4) * 2) {
+  throw new Error(
+    `strataloom: LLM_MAX_TOKENS (${LLM_MAX_TOKENS}) is below what the prompts ask for; ` +
+      'a capped reply arrives truncated and unparseable',
+  )
 }
 
 /**
