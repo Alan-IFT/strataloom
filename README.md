@@ -47,9 +47,11 @@ model routes the harness already has.
 
 | Path | What it is |
 |---|---|
+| [`docs/`](docs/README.md) | **Start here when picking the work up.** Document map, current status, design, and decision records. |
+| [`docs/STATUS.md`](docs/STATUS.md) | Where the project stands and what is next. |
 | [`packages/memory/`](packages/memory) | The plugin: `@strataloom/dsh-memory`. Start at its [README](packages/memory/README.md). |
-| [`plugin-architecture.md`](plugin-architecture.md) | The specification. Where code and spec disagree, the spec wins — report it as a bug. |
-| [`implementation-report.html`](implementation-report.html) | Visual comparison of design vs. implementation. |
+| [`plugin-architecture.md`](plugin-architecture.md) | The specification. Where code and spec disagree, the spec normally wins — but the spec can be wrong too (v2.7 corrected six such places); fix the spec, don't bend the code back. |
+| [`implementation-report.html`](implementation-report.html) | Visual comparison of design vs. implementation (snapshot, may lag). |
 
 ## Why the design looks like this
 
