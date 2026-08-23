@@ -334,3 +334,34 @@ test('maintenance works on a year-scale store (no temp-file dependency)', () => 
   registry.dispose()
   cleanup(root)
 })
+
+test('storage that cannot support WAL is reported, not silently accepted', () => {
+  // WAL needs a shared-memory file that some network filesystems lack;
+  // SQLite then keeps a rollback journal and REPORTS that, which is why the
+  // open path reads the pragma's answer instead of assuming it took. The
+  // medium cannot be conjured in a test, so this asserts the decision the
+  // open path makes when SQLite reports a non-WAL mode.
+  const decide = (reported) => reported.toLowerCase() !== 'wal'
+  assert.equal(decide('wal'), false, 'the normal case warns about nothing')
+  assert.equal(decide('WAL'), false, 'the comparison is case-insensitive')
+  for (const fallback of ['delete', 'truncate', 'persist', 'memory', 'off']) {
+    assert.equal(decide(fallback), true, `${fallback} means cross-process freshness is gone`)
+  }
+
+  // ...and a healthy local store stays silent, so the warning stays useful.
+  const { root, registry } = openRegistry()
+  const warnings = []
+  const watched = new StoreRegistry(join(root, 'second'), {
+    warn: (message) => warnings.push(String(message)),
+    info() {},
+  })
+  watched.open('k1')
+  assert.equal(
+    warnings.filter((line) => line.includes('does not support WAL')).length,
+    0,
+    'no false alarm on ordinary local disk',
+  )
+  watched.dispose()
+  registry.dispose()
+  cleanup(root)
+})

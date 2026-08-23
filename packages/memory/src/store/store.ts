@@ -118,7 +118,26 @@ export class StoreRegistry {
       // that `busy_timeout` does NOT wait for, so two processes creating the
       // same store at once can collide. Once the file is in WAL this is a
       // no-op needing no lock, which is why only creation races.
-      withBusyRetry(() => db.exec('PRAGMA journal_mode = WAL'))
+      //
+      // The pragma REPORTS the mode that actually took effect, so read it
+      // instead of assuming: WAL needs a shared-memory file, which network
+      // filesystems may not support, and SQLite then silently keeps a
+      // rollback journal. Everything here still works on one machine — but
+      // the cross-process freshness this plugin promises does not, and a
+      // promise that quietly stops holding is worse than one that never
+      // existed. Asking SQLite beats guessing the medium: no filesystem
+      // magic-number table to maintain, and it is right on platforms whose
+      // `statfs` we could not interpret anyway.
+      const journalMode = withBusyRetry(
+        () => (db.prepare('PRAGMA journal_mode = WAL').get() as { journal_mode: string }).journal_mode,
+      )
+      if (journalMode.toLowerCase() !== 'wal') {
+        this.log.warn(
+          `strataloom: ${repoKey} is on storage that does not support WAL (mode: ${journalMode}). ` +
+            'Memory still works, but a second dsh process on this store may read stale data. ' +
+            'Keeping the harness home on local disk avoids this.',
+        )
+      }
       db.exec('PRAGMA foreign_keys = ON')
       db.exec('PRAGMA synchronous = NORMAL')
       // Keep statement journals and sort scratch in memory. By default
