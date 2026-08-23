@@ -102,7 +102,7 @@ Two structural rules make the above cheap rather than defensive:
 npm run verify   # tsc + the full test suite
 ```
 
-102 tests:
+103 tests:
 
 | File | Covers |
 |---|---|
