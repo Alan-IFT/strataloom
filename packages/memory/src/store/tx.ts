@@ -7,7 +7,7 @@
  * @module @strataloom/dsh-memory/store/tx
  */
 import type { DatabaseSync } from 'node:sqlite'
-import { IMMEDIATE_TX_RETRIES } from '../constants.ts'
+import { BUSY_BACKOFF_MS, IMMEDIATE_TX_RETRIES } from '../constants.ts'
 
 const isBusy = (error: unknown): boolean => {
   const code = (error as { errcode?: number } | null)?.errcode
@@ -16,9 +16,37 @@ const isBusy = (error: unknown): boolean => {
 }
 
 /**
+ * Sleep without yielding the event loop. `Atomics.wait` is the only way to
+ * pause a synchronous function, and this whole layer is synchronous because
+ * `DatabaseSync` is: the prompt-assembly path cannot await.
+ */
+const sleepSync = (ms: number): void => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/**
+ * Retry a statement that can lose a lock race, with jittered backoff.
+ *
+ * `busy_timeout` covers most contention, but not every case: switching a
+ * fresh database into WAL takes a brief exclusive lock that the timeout does
+ * not wait for, so two processes creating the same store at once can collide.
+ * Jitter matters — writers backing off in lockstep keep colliding.
+ * @param attempt - retry helper for one lock-sensitive statement.
+ */
+export const withBusyRetry = <T>(run: () => T): T => {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return run()
+    } catch (error) {
+      if (!isBusy(error) || attempt >= IMMEDIATE_TX_RETRIES) throw error
+      sleepSync(BUSY_BACKOFF_MS * (attempt + 1) * (1 + Math.random()))
+    }
+  }
+}
+
+/**
  * Run `body` inside one immediate transaction. Returns the body's value.
- * On SQLITE_BUSY at BEGIN, retries up to {@link IMMEDIATE_TX_RETRIES} times
- * (busy_timeout already waited inside each attempt). Any body throw rolls the
+ * On SQLITE_BUSY at BEGIN, retries with backoff. Any body throw rolls the
  * whole transaction back and rethrows — no partial commits, fail loud.
  */
 export const immediateTx = <T>(db: DatabaseSync, body: () => T): T => {
@@ -26,8 +54,13 @@ export const immediateTx = <T>(db: DatabaseSync, body: () => T): T => {
     try {
       db.exec('BEGIN IMMEDIATE')
     } catch (error) {
-      if (isBusy(error) && attempt < IMMEDIATE_TX_RETRIES) continue
-      throw error
+      if (!isBusy(error) || attempt >= IMMEDIATE_TX_RETRIES) throw error
+      // `busy_timeout` already waited its full budget inside the failed
+      // attempt, so retrying instantly would just re-enter the same losing
+      // race and burn every attempt in microseconds. Back off — with jitter,
+      // because several writers that back off in lockstep keep colliding.
+      sleepSync(BUSY_BACKOFF_MS * (attempt + 1) * (1 + Math.random()))
+      continue
     }
     try {
       const value = body()

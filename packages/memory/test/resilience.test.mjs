@@ -8,7 +8,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/** Absolute path of the built library, for worker subprocesses. */
+const packageLib = join(dirname(dirname(fileURLToPath(import.meta.url))), 'lib')
 import { DatabaseSync } from 'node:sqlite'
 import { immediateTx } from '../lib/store/tx.js'
 import { StoreRegistry } from '../lib/store/store.js'
@@ -181,4 +185,56 @@ test('git absent or failing does not crash repo-key derivation', async () => {
   const identity = deriveRepoIdentity(dir)
   assert.ok(identity === undefined || typeof identity.key === 'string')
   cleanup(dir)
+})
+
+test('concurrent processes can open the same store and all their writes land', async () => {
+  // Two harness processes pointed at one repository is the ordinary case, so
+  // neither opening nor writing may fail under contention. This regressed
+  // once: `PRAGMA journal_mode` needs a brief exclusive lock, and running it
+  // before `busy_timeout` made a concurrent open fail instantly.
+  const root = tempRoot()
+  const worker = join(root, 'w.mjs')
+  writeFileSync(
+    worker,
+    `const { StoreRegistry } = await import(${JSON.stringify(join(packageLib, 'store/store.js'))})
+     const reg = new StoreRegistry(process.argv[2], { warn() {}, info() {} })
+     const store = reg.open('shared')
+     const tag = process.argv[3]
+     for (let i = 0; i < 25; i++) {
+       store.tx(() => {
+         store.db.prepare(
+           \`INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+             VALUES (?, 'fact', 'repo-local', 'active', 't', 'b', 'human', 0, 0)\`,
+         ).run(tag + i)
+       })
+     }
+     reg.dispose()`,
+  )
+
+  // Start all three, THEN wait: spawnSync would serialize them and test
+  // nothing. Exit codes are collected from the async children's events, so
+  // this test is async — a synchronous busy-wait would starve them.
+  const home = join(root, 'home')
+  const codes = ['A', 'B', 'C'].map(
+    (tag) =>
+      new Promise((resolve) => {
+        const child = spawn(process.execPath, [worker, home, tag], { stdio: 'inherit' })
+        child.on('exit', resolve)
+      }),
+  )
+  for (const code of await Promise.all(codes)) {
+    assert.equal(code, 0, 'every worker succeeded')
+  }
+
+  const registry = new StoreRegistry(home, quiet)
+  registry.openAllKnown()
+  const store = registry.get('shared')
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM memories`).get().c,
+    75,
+    'no write was silently lost to lock contention',
+  )
+  store.db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('integrity-check')`)
+  registry.dispose()
+  cleanup(root)
 })

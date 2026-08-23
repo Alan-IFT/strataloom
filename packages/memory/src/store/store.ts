@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { BUSY_TIMEOUT_MS, SLOW_STATEMENT_MS } from '../constants.ts'
 import { migrate, MigrationError } from './schema.ts'
-import { immediateTx } from './tx.ts'
+import { immediateTx, withBusyRetry } from './tx.ts'
 
 /** Minimal structured-log seam (fail open, NOT fail silent — spec §0). */
 export interface StoreLogger {
@@ -109,8 +109,16 @@ export class StoreRegistry {
     mkdirSync(dir, { recursive: true })
     const db = new DatabaseSync(join(dir, kind === 'global' ? 'global.sqlite' : 'memory.sqlite'))
     try {
-      db.exec('PRAGMA journal_mode = WAL')
+      // busy_timeout FIRST: switching journal mode needs a brief exclusive
+      // lock, so a store being opened while another process writes fails
+      // instantly unless this connection already knows to wait. Two harness
+      // processes starting at once is the ordinary case, not a rare race.
       db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
+      // Switching a fresh database into WAL takes a brief exclusive lock
+      // that `busy_timeout` does NOT wait for, so two processes creating the
+      // same store at once can collide. Once the file is in WAL this is a
+      // no-op needing no lock, which is why only creation races.
+      withBusyRetry(() => db.exec('PRAGMA journal_mode = WAL'))
       db.exec('PRAGMA foreign_keys = ON')
       db.exec('PRAGMA synchronous = NORMAL')
       // The kind is stamped inside the migration transaction (it must be

@@ -16,6 +16,8 @@ export const BUSY_TIMEOUT_MS = 2_000
 
 /** Immediate-transaction retry cap on SQLITE_BUSY (spec §10 busy retry 上限). */
 export const IMMEDIATE_TX_RETRIES = 3
+/** Base backoff between busy retries; scaled by attempt and jittered. */
+export const BUSY_BACKOFF_MS = 50
 
 /** Slow-statement warning threshold — the injection path's correctness companion (spec §9). */
 export const SLOW_STATEMENT_MS = 50
