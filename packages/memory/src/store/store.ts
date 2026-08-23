@@ -121,6 +121,13 @@ export class StoreRegistry {
       withBusyRetry(() => db.exec('PRAGMA journal_mode = WAL'))
       db.exec('PRAGMA foreign_keys = ON')
       db.exec('PRAGMA synchronous = NORMAL')
+      // Keep statement journals and sort scratch in memory. By default
+      // SQLite spills them to a temp directory, so a large maintenance
+      // statement fails with "unable to open database file" wherever that
+      // directory is restricted — sandboxes, hardened containers, read-only
+      // /tmp. Our scratch is small (maintenance touches thousands of rows,
+      // not millions) and the failure it removes is silent and confusing.
+      db.exec('PRAGMA temp_store = MEMORY')
       // The kind is stamped inside the migration transaction (it must be
       // atomic with the guard that reads it), then verified: a store already
       // branded with the other kind is refused rather than reinterpreted.

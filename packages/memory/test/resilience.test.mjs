@@ -21,6 +21,9 @@ import { registerTools } from '../lib/tools.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import { JobRunner } from '../lib/pipeline/runner.js'
 import { commitClaimedJob, enqueueJob, claimNextJob, FencingError } from '../lib/pipeline/jobs.js'
+import { runDecayJob } from '../lib/pipeline/decay.js'
+import { pruneConversations } from '../lib/store/conversations.js'
+import { queryInjectionRows } from '../lib/store/fts.js'
 import { IMMEDIATE_TX_RETRIES } from '../lib/constants.js'
 import { openRegistry, cleanup, tempRoot, fakeAgent, fakeCtx } from './helpers.mjs'
 
@@ -288,4 +291,46 @@ test('an unusable store reads as unavailability, not as a filesystem error', asy
     chmodSync(home, 0o700)
     cleanup(root)
   }
+})
+
+test('maintenance works on a year-scale store (no temp-file dependency)', () => {
+  // Maintenance statements touch thousands of rows, and SQLite spills their
+  // scratch to a temp directory by default — which fails wherever that
+  // directory is restricted (sandboxes, hardened containers). The symptom is
+  // a confusing "unable to open database file" on an otherwise healthy
+  // store, and it only appears at scale.
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  const DAY = 86_400_000
+  const now = Date.now()
+
+  const memory = store.db.prepare(
+    `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+     VALUES (?, 'fact', 'repo-local', 'active', ?, 'body text here', 'human', ?, ?)`,
+  )
+  const turn = store.db.prepare(
+    `INSERT INTO conversations (session_id, seq, turn, label, provenance, text, created_at)
+     VALUES (?, ?, 1, 'user', 'human', ?, ?)`,
+  )
+  store.tx(() => {
+    for (let i = 0; i < 3_000; i++) {
+      const age = now - (i % 365) * DAY
+      memory.run(`m${i}`, `fact ${i}`, age, age)
+    }
+    for (let i = 0; i < 60_000; i++) {
+      turn.run(`sess${i % 500}`, i, 'conversation text '.repeat(4), now - (i % 365) * DAY)
+    }
+  })
+
+  enqueueJob(store, 'decay', 'd1', {}, 0)
+  const report = runDecayJob(store, claimNextJob(store, now, now + 60_000), now)
+  assert.ok(report.slept > 0, 'stale memories were retired')
+  pruneConversations(store, now)
+
+  // The read path stays fast because decay removed the noise, not because
+  // anything was cached.
+  assert.ok(queryInjectionRows(store).length <= 20)
+  store.db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('integrity-check')`)
+  registry.dispose()
+  cleanup(root)
 })
