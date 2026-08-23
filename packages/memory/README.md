@@ -116,6 +116,15 @@ affiliation: writes are refused and injection is empty — never a fallback to
   Nor could it self-heal: the rebuild job keys its idempotence on the revision,
   so a frozen revision made the retry a duplicate of the job that already ran.
   In SQL the rule covers write paths that do not exist yet.
+- **D10** the 4×4 memory architecture — four layers (L0 conversation, L1 atom,
+  L2 scenario, L3 persona) and four kinds (coding, repo, personal, procedure) —
+  is the product's substrate and may not be trimmed. "Less is more" governs
+  **mechanism**, never **capability**: carrying L2/L3 by widening the existing
+  `derived` column instead of adding a table is the rule working correctly;
+  dropping a layer because it looks expensive is not. Gaps close by being
+  implemented, not by shrinking the target. Today L2/L3 and coding memory are
+  still missing — tracked, with acceptance criteria, in
+  [`docs/design/4x4-memory.md`](../../docs/design/4x4-memory.md).
 
 Those four (D4's plural, D7, D8, D9) are one failure mode found four times: **a
 rule stated in two places drifts, and a self-description that miscounts its own
