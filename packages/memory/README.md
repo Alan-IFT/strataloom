@@ -144,7 +144,7 @@ npm install      # platform packages from npm (peer deps, mirrored as dev deps)
 npm run verify   # tsc + the full test suite
 ```
 
-119 tests:
+122 tests:
 
 | File | Covers |
 |---|---|
@@ -157,7 +157,7 @@ npm run verify   # tsc + the full test suite
 | `e2e.test.mjs` | **real agent registry + real tool dispatch + real prompt assembly**, principal vs subagent, no-repo agent, **`{{…}}` in memory content stays data** |
 | `resilience.test.mjs` | bounded busy-retry, corrupt/foreign store isolation, fencing yield, mid-tick store failure, busy-agent deferral |
 | `lifecycle.test.mjs` | activation, teardown ordering, HMR-shaped reload |
-| `layers.test.mjs` | L0 round-trip/retention/drill-down, personal scope, **bidirectional D2**, dedup and `replaces`, metrics, decay and revival, derived rollup + **revision fencing**, **a pipeline write retires the rollup (D9)**, **coding memory filterable apart from fact and free in either scope**, **L2 scenario blocks that vanish with their L1 (D9)**, projection/approval/secret scanning |
+| `layers.test.mjs` | L0 round-trip/retention/drill-down, personal scope, **bidirectional D2**, dedup and `replaces`, metrics, decay and revival, derived rollup + **revision fencing**, **a pipeline write retires the rollup (D9)**, **coding memory filterable apart from fact and free in either scope**, **L2 scenario blocks that vanish with their L1 (D9)**, **the L3 portrait: written once, unchanged on "keep", present in a brand-new repo**, projection/approval/secret scanning |
 | `package.test.mjs` | the packed tarball installs as a dependency and loads **by package name** |
 
 The last one matters most: a plugin that only works from its source tree is

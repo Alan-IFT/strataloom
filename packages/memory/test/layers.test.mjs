@@ -17,7 +17,12 @@ import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import { L0_RETENTION_MS } from '../lib/constants.js'
 import { collectMetrics } from '../lib/metrics.js'
 import { runDecayJob } from '../lib/pipeline/decay.js'
-import { packetOverflows, readRevision, runRebuildJob } from '../lib/pipeline/rebuild.js'
+import {
+  enqueueRebuildIfOverflowing,
+  packetOverflows,
+  readRevision,
+  runRebuildJob,
+} from '../lib/pipeline/rebuild.js'
 import { estimateTokens } from '../lib/constants.js'
 import { looksSecret, projectStore, PROJECTION_DIR, PROJECTION_FILE } from '../lib/projection.js'
 import { enqueueJob, claimNextJob, commitClaimedJob } from '../lib/pipeline/jobs.js'
@@ -766,6 +771,125 @@ test('L2: a rebuild emits scenario blocks, and they vanish with their L1 (D9)', 
     'every scenario block goes when the set it described changes',
   )
   assert.ok(readRevision(store) > rev0, 'and the revision advanced, fencing a queued rebuild')
+  registry.dispose()
+  cleanup(root)
+})
+
+/** A portrait reply: `true` keeps the stored one, a string rewrites it. */
+const personaReply = (verdictOrBody) => {
+  const payload =
+    verdictOrBody === true ? { verdict: 'keep' } : { verdict: 'rewrite', body: verdictOrBody }
+  return {
+    stream: async function* () {
+      yield { type: 'text-delta', index: 0, text: JSON.stringify(payload) }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+}
+
+/** Drive one persona judgement against the global store. */
+const judgePersona = async (ctx, global, llm, jobKey) => {
+  ctx.get = (name) =>
+    name === 'llm'
+      ? llm
+      : name === 'agentDefaultModel'
+        ? { currentSelection: () => ({ provider: 'p', model: 'm' }) }
+        : undefined
+  const rev = readRevision(global)
+  enqueueJob(global, 'rebuild', jobKey, { expectedRevision: rev, provider: 'p', model: 'm' }, 0)
+  const job = claimNextJob(global, Date.now(), Date.now() + 60_000)
+  return runRebuildJob(
+    ctx, global, job, JSON.parse(job.payload), new AbortController().signal,
+  )
+}
+
+test('L3: the portrait is written once, and "keep" does not churn it', async () => {
+  // The acceptance criteria for 4x4 phase 3 (docs/design/4x4-memory.md §5).
+  // L3 must not wobble with every stored preference, which is why "keep" is a
+  // real answer rather than an unconditional regeneration (ADR 0004): the
+  // model judges, and a judgement of "still accurate" writes nothing at all.
+  const { root, registry, principal, ctx, service } = setup()
+  await service.propose(
+    { title: 'answer in Chinese', body: 'the user prefers Chinese', kind: 'preference', scope: 'personal' },
+    principal,
+  )
+  await service.propose(
+    { title: 'evidence first', body: 'claims must be backed by a measurement', kind: 'coding', scope: 'personal' },
+    principal,
+  )
+  const global = registry.get(GLOBAL_STORE_KEY)
+
+  // First pass: no portrait yet, so one is written.
+  assert.equal(await judgePersona(ctx, global, personaReply('Chinese; conclusions first; wants evidence.'), 'pj1'), true)
+  const stored = global.db.prepare(`SELECT title, kind, visibility, body FROM memories WHERE derived = 3`).all()
+  assert.equal(stored.length, 1, 'exactly one portrait')
+  assert.equal(stored[0].visibility, 'private', 'the portrait never leaves the cross-repo store')
+  const revAfter = readRevision(global)
+
+  // Second pass: judged still accurate => nothing written, nothing invalidated.
+  assert.equal(await judgePersona(ctx, global, personaReply(true), 'pj2'), false)
+  assert.equal(
+    global.db.prepare(`SELECT body FROM memories WHERE derived = 3`).get().body,
+    stored[0].body,
+    'a "keep" verdict leaves the portrait byte-for-byte alone',
+  )
+  assert.equal(readRevision(global), revAfter, 'and does not advance the revision')
+
+  // A rewrite replaces rather than accumulates.
+  assert.equal(await judgePersona(ctx, global, personaReply('Now prefers English.'), 'pj3'), true)
+  const after = global.db.prepare(`SELECT body FROM memories WHERE derived = 3`).all()
+  assert.equal(after.length, 1, 'still exactly one portrait')
+  assert.match(after[0].body, /English/)
+  registry.dispose()
+  cleanup(root)
+})
+
+test('L3: the portrait reaches a brand-new repository, and a repo-less session', async () => {
+  const { root, registry, principal, ctx, service } = setup()
+  await service.propose(
+    { title: 'be terse', body: 'short answers', kind: 'preference', scope: 'personal' },
+    principal,
+  )
+  const global = registry.get(GLOBAL_STORE_KEY)
+  await judgePersona(ctx, global, personaReply('Terse, direct, evidence-led.'), 'pj-new')
+
+  // A repository this user has never opened before.
+  clearRepoIdentityMemo()
+  const fresh = makeRepo()
+  const newcomer = fakeAgent({ id: 'newcomer', cwd: fresh })
+  const freshCtx = fakeCtx({ agents: [newcomer] })
+  const freshService = Object.setPrototypeOf(
+    { ctx: freshCtx, stores: registry }, MemoryService.prototype,
+  )
+  const packet = buildContextProvider(freshCtx, freshService)({ agent: newcomer })
+  assert.match(packet, /Terse, direct/, 'the portrait is there on the first turn')
+
+  // And a session with no git work tree at all — that is what makes it personal.
+  const stray = fakeAgent({ id: 'stray', cwd: tempRoot() })
+  const strayCtx = fakeCtx({ agents: [stray] })
+  const strayService = Object.setPrototypeOf(
+    { ctx: strayCtx, stores: registry }, MemoryService.prototype,
+  )
+  assert.match(buildContextProvider(strayCtx, strayService)({ agent: stray }), /Terse, direct/)
+  registry.dispose()
+  cleanup(root)
+})
+
+test('L3: without an llm route nothing is queued and injection degrades to atoms', async () => {
+  const { root, registry, principal, ctx, service } = setup()
+  await service.propose(
+    { title: 'answer in Chinese', body: 'the user prefers Chinese', kind: 'preference', scope: 'personal' },
+    principal,
+  )
+  const global = registry.get(GLOBAL_STORE_KEY)
+  ctx.get = () => undefined // neither llm nor a default route
+  assert.equal(enqueueRebuildIfOverflowing(ctx, global, Date.now()), false, 'nothing queued')
+  assert.equal(global.db.prepare(`SELECT count(*) c FROM jobs`).get().c, 0)
+  // The raw preferences still inject — degraded, not broken.
+  assert.match(
+    buildContextProvider(ctx, service)({ agent: principal }),
+    /prefers Chinese/,
+  )
   registry.dispose()
   cleanup(root)
 })

@@ -10,6 +10,7 @@ import {
   ROLLUP_MAX_SCENARIOS,
   ROLLUP_TARGET_CHARS,
   ROLLUP_TITLE_TARGET_CHARS,
+  PERSONA_TARGET_CHARS,
 } from '../constants.ts'
 import { kindGuidance, MEMORY_KINDS } from '../types.ts'
 
@@ -87,4 +88,40 @@ Rules:
 - keep concrete identifiers verbatim (commands, paths, tool names, versions);
 - state rules as rules ("use pnpm, never npm"), not as narrative;
 - omit anything you cannot state precisely — a lost detail beats a wrong one;
+- output the JSON object only — no markdown fence, no commentary.`
+
+/**
+ * Persona (L3): judge whether the stored portrait still describes the person,
+ * and rewrite it only when it does not.
+ *
+ * "Keep" is a first-class answer, and the reason this is a judgement rather
+ * than an unconditional regeneration: L3 must not wobble with every stored
+ * preference (ADR 0004). Code cannot decide "this person changed" — no count
+ * of edits or elapsed days correlates with it — so the question goes to the
+ * model directly instead of being approximated in code.
+ *
+ * The portrait describes HOW TO WORK WITH someone, never who they are:
+ * demographics are neither ours to infer nor useful to the next session.
+ */
+export const personaSystemPrompt = (): string =>
+  `You maintain a short portrait of ONE person: how they want to be worked with.
+
+You receive their stored preferences and portable lessons, plus the CURRENT
+portrait when one exists.
+
+Return STRICT JSON: {"verdict":"keep"|"rewrite","body":string}
+
+Rules:
+- "keep" when the current portrait still describes this person — say keep
+  even if wording could be prettier; churn costs more than an imperfect line;
+- "rewrite" only when the portrait now contradicts the memories, or misses a
+  standing trait that shows up across several of them;
+- body: the portrait to store, ≤${PERSONA_TARGET_CHARS} chars, written for
+  another assistant to read at the start of a session;
+- describe working style only — language, tone, depth, format, what earns
+  trust, what annoys them. Never infer identity, demographics, or employer;
+- generalise: state the disposition behind the preferences, not a list of
+  them ("wants claims backed by evidence", not "asked for a test on Tuesday");
+- omit anything you cannot support from the memories given;
+- with "keep" you may echo the current body; it is ignored either way;
 - output the JSON object only — no markdown fence, no commentary.`

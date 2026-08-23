@@ -39,9 +39,10 @@ import {
   PipelineLlmError,
   type PinnedRoute,
 } from './llm-call.ts'
-import { rollupSystemPrompt } from './prompts.ts'
+import { personaSystemPrompt, rollupSystemPrompt } from './prompts.ts'
 import {
   INJECT_BODY_BUDGET_TOKENS,
+  PERSONA_SOURCE_LIMIT,
   ROLLUP_MAX_SCENARIOS,
   ROLLUP_SOURCE_LIMIT,
   TITLE_MAX_CHARS,
@@ -87,9 +88,45 @@ export const enqueueRebuildIfOverflowing = (
   store: OpenStore,
   now: number,
 ): boolean => {
+  // The global store's derived layer is the L3 portrait, and it is not
+  // budget-driven: personal preferences do not overflow (twenty cost ~440
+  // tokens against 1300), and the portrait's value is a disposition that
+  // extrapolates, not compression. So the two store kinds ask different
+  // questions — but through ONE job kind, so both inherit the same leasing,
+  // fencing and busy-agent deferral (ADR 0004).
+  if (store.kind === 'global') return enqueuePersonaRebuild(ctx, store, now)
   if (!packetOverflows(store)) return false
+  return enqueueRebuild(ctx, store, now)
+}
+
+/**
+ * Queue a portrait rebuild whenever the global store holds personal memories.
+ *
+ * There is no staleness test HERE: whether the portrait still describes the
+ * person is a semantic judgement, so the job asks the model and answers
+ * "keep" without writing (ADR 0004). Putting a proxy for that question in
+ * code — a counter, an age, a threshold — would be the rejected trust formula
+ * in a new costume: no count of edits correlates with someone changing.
+ *
+ * The revision still rides the idempotence key, so a portrait judgement is
+ * queued at most once per snapshot: repeated maintenance passes over an
+ * unchanged store collapse into the job that already ran.
+ */
+const enqueuePersonaRebuild = (ctx: Context, store: OpenStore, now: number): boolean => {
+  const source = store.db
+    .prepare(
+      `SELECT count(*) AS n FROM memories
+       WHERE status = 'active' AND derived = ${LAYER.RAW}`,
+    )
+    .get() as { n: number }
+  if (source.n === 0) return false // nothing to portray
+  return enqueueRebuild(ctx, store, now)
+}
+
+/** Shared enqueue: pins the current route and fences on the snapshot. */
+const enqueueRebuild = (ctx: Context, store: OpenStore, now: number): boolean => {
   const selection = ctx.get('agentDefaultModel')?.currentSelection()
-  if (selection === undefined) return false // no route ⇒ no rollup, packet truncates
+  if (selection === undefined) return false // no route ⇒ no derived layer, and that is fine
   const expectedRevision = readRevision(store)
   const payload: RebuildPayload = {
     expectedRevision,
@@ -117,6 +154,7 @@ export const runRebuildJob = async (
     commitClaimedJob(store, job.id, job.leaseToken, () => {})
     return false
   }
+  if (store.kind === 'global') return runPersonaJob(ctx, store, job, payload, signal)
   // Re-check overflow against the rows we are about to summarize: the set
   // may have shrunk since the job was queued, and an empty set cannot
   // overflow, so one test covers both.
@@ -190,4 +228,92 @@ const parseScenarios = (raw: unknown): Scenario[] => {
   }
   if (out.length === 0) throw new PipelineLlmError('rollup produced no usable scenario')
   return out
+}
+
+/**
+ * Run the portrait judgement for the global store (L3).
+ *
+ * Unlike the repo path this is not driven by budget: it asks whether the
+ * stored portrait still describes the person, and writes ONLY on "rewrite".
+ * A "keep" verdict commits the job without touching `memories`, which is what
+ * keeps L3 from wobbling — and what makes D9 deleting the portrait harmless,
+ * since the next pass restores the same text (ADR 0004).
+ */
+const runPersonaJob = async (
+  ctx: Context,
+  store: OpenStore,
+  job: ClaimedJob,
+  payload: RebuildPayload,
+  signal: AbortSignal,
+): Promise<boolean> => {
+  const memories = store.db
+    .prepare(
+      `SELECT kind, title, body FROM memories
+       WHERE status = 'active' AND derived = ${LAYER.RAW}
+       ORDER BY updated_at DESC LIMIT ?`,
+    )
+    .all(PERSONA_SOURCE_LIMIT) as unknown as { kind: string; title: string; body: string }[]
+  if (memories.length === 0) {
+    commitClaimedJob(store, job.id, job.leaseToken, () => {})
+    return false
+  }
+  const current = store.db
+    .prepare(
+      `SELECT body FROM memories WHERE derived = ${LAYER.PERSONA} AND status = 'active' LIMIT 1`,
+    )
+    .get() as { body: string } | undefined
+
+  const route: PinnedRoute = { provider: payload.provider, model: payload.model }
+  const reply = await callPipelineLlm(
+    ctx,
+    route,
+    personaSystemPrompt(),
+    JSON.stringify({ portrait: current?.body ?? null, memories }),
+    signal,
+  )
+  const verdict = parsePersona(parseStrictJson(reply))
+  if (verdict.keep && current !== undefined) {
+    // Judged still accurate: settle the job, write nothing. Not writing IS
+    // the feature — an unconditional rewrite would churn the portrait, and
+    // every write would advance the revision and invalidate the layer again.
+    commitClaimedJob(store, job.id, job.leaseToken, () => {})
+    return false
+  }
+
+  commitClaimedJob(store, job.id, job.leaseToken, () => {
+    if (readRevision(store) !== payload.expectedRevision) return
+    const now = Date.now()
+    // Exactly one portrait: replace rather than accumulate.
+    store.db.prepare(`DELETE FROM memories WHERE derived = ${LAYER.PERSONA}`).run()
+    store.db
+      .prepare(
+        `INSERT INTO memories
+           (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+         VALUES (?, 'preference', 'private', 'active', ?, ?, 'derived', ?, ?, ${LAYER.PERSONA})`,
+      )
+      .run(randomUUID(), PERSONA_TITLE, verdict.body, now, now)
+  })
+  return true
+}
+
+/** The portrait's fixed title; it is a singleton, so the title is a label. */
+const PERSONA_TITLE = 'How to work with this user'
+
+/**
+ * Validate a portrait reply. A "keep" needs no body; a "rewrite" without one
+ * is malformed and reaches the retry exit rather than storing an empty
+ * portrait that would inject as nothing.
+ */
+const parsePersona = (raw: unknown): { keep: boolean; body: string } => {
+  const root = raw as { verdict?: unknown; body?: unknown }
+  if (root === null || typeof root !== 'object') {
+    throw new PipelineLlmError('portrait reply is not an object')
+  }
+  if (root.verdict !== 'keep' && root.verdict !== 'rewrite') {
+    throw new PipelineLlmError('portrait reply has no usable verdict')
+  }
+  if (root.verdict === 'keep') return { keep: true, body: '' }
+  const body = typeof root.body === 'string' ? root.body.trim().slice(0, BODY_MAX_CHARS) : ''
+  if (body === '') throw new PipelineLlmError('portrait rewrite carries no body')
+  return { keep: false, body }
 }

@@ -117,6 +117,15 @@ export const EXTRACT_TITLE_TARGET_CHARS = 120
 export const EXTRACT_BODY_TARGET_CHARS = 800
 /** Body length asked of each scenario briefing (L2). */
 export const ROLLUP_TARGET_CHARS = 900
+/**
+ * Body length asked of the L3 portrait. Short on purpose: it is injected in
+ * EVERY repository, and its job is a disposition, not an inventory — the
+ * atomic preferences remain recallable underneath it.
+ */
+export const PERSONA_TARGET_CHARS = 600
+/** Personal memories fed into one persona judgement. */
+export const PERSONA_SOURCE_LIMIT = 100
+
 /** Title length asked of a scenario — it is a name, not a sentence. */
 export const ROLLUP_TITLE_TARGET_CHARS = 60
 /**
@@ -133,7 +142,8 @@ if (
   EXTRACT_TITLE_TARGET_CHARS > TITLE_MAX_CHARS ||
   EXTRACT_BODY_TARGET_CHARS > BODY_MAX_CHARS ||
   ROLLUP_TARGET_CHARS > BODY_MAX_CHARS ||
-  ROLLUP_TITLE_TARGET_CHARS > TITLE_MAX_CHARS
+  ROLLUP_TITLE_TARGET_CHARS > TITLE_MAX_CHARS ||
+  PERSONA_TARGET_CHARS > BODY_MAX_CHARS
 ) {
   throw new Error('strataloom: a prompt target exceeds the hard cap it must stay below')
 }
