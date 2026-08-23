@@ -72,7 +72,7 @@ export const rollupSystemPrompt = (): string =>
 Return PLAIN TEXT (no JSON, no markdown fence), at most ${ROLLUP_TARGET_CHARS} characters.
 
 Rules:
-- preserve every distinct fact, preference, and procedure; drop only wording;
+- preserve every distinct item whatever its kind; drop only wording;
 - group related items into single lines instead of repeating context;
 - keep concrete identifiers verbatim (commands, paths, tool names, versions);
 - state rules as rules ("use pnpm, never npm"), not as narrative;

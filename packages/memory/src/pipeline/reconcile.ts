@@ -137,9 +137,15 @@ export const runReconcileJob = async (
         const oldRow = store.db
           .prepare(`SELECT kind, status FROM memories WHERE id = ?`)
           .get(decision.supersedes) as { kind: MemoryKind; status: string } | undefined
-        // Preference conflicts keep both (spec §3.4) and a vanished/inactive
-        // target degrades to plain activation — durable state wins over the
-        // reply. Otherwise: fact ⇒ superseded, procedure ⇒ archived.
+        // Two rules, stated so a new kind inherits one rather than needing a
+        // branch: a `preference` is never superseded (only the user resolves
+        // conflicting preferences, spec §3.4), and a vanished or inactive
+        // target degrades to plain activation — durable state outranks the
+        // reply. Everything else is replaced, and the replaced row is
+        // `archived` when it was a `procedure` (superseding a procedure is
+        // versioning — the old sequence still describes what used to work)
+        // and `superseded` otherwise, including `coding`: a corrected
+        // engineering lesson means the old one was wrong, not merely older.
         //
         // No cycle check is needed: `superseded_by` is only ever written on a
         // row leaving 'active', pointing at a row entering 'active' from
