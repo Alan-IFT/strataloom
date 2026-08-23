@@ -136,9 +136,7 @@ derived  0 = 原始记忆（L1）   1 = 全库摘要   2 = 场景块（L2）   3
 
 > **与原始设计的一处有意偏离**：原设计称「Personal 和 Procedure 保存在
 > `.repo_memory/` 下」。实现改为：`.repo_memory/` 是**纯输出投影**（删了重写、
-> 从不读回），且 Personal 永不投影。理由有二——个人偏好（语气/语言/深度）
-> 提交进团队仓库会泄露个人习惯；且一个人人可编辑的文件若能成为记忆输入，
-> 就绕过了 D1 身份边界。已确认采纳。详见
+> 从不读回），且 Personal 永不投影。理由与代价见
 > [`../decisions/0001-repo-memory-is-projection-only.md`](../decisions/0001-repo-memory-is-projection-only.md)。
 
 ## 3. 分层召回
