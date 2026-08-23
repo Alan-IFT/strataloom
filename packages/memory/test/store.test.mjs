@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { migrate, MigrationError } from '../lib/store/schema.js'
 import { immediateTx } from '../lib/store/tx.js'
 import { APPLICATION_ID, TARGET_USER_VERSION } from '../lib/constants.js'
+import { StoreRegistry } from '../lib/store/store.js'
 import { openRegistry, cleanup, tempRoot } from './helpers.mjs'
 
 const openRaw = (path) => {
@@ -215,5 +216,48 @@ test('immediateTx: read-then-write succeeds under real cross-process contention'
   assert.equal(b.prepare('SELECT x FROM t').get().x, 3) // child's 2 + our 1
   b.close()
   child.kill()
+  cleanup(root)
+})
+
+test('a real v1 store upgrades to the current version with its data intact', () => {
+  // The stepwise test drives migrate() directly; this one is the user's
+  // path: a store written by an older release, opened by this one. Data
+  // written before the newer columns existed must survive untouched.
+  const root = tempRoot()
+  const dir = join(root, 'repos', 'old')
+  mkdirSync(dir, { recursive: true })
+  const legacy = openRaw(join(dir, 'memory.sqlite'))
+  migrate(legacy, 'repo', 1)
+  legacy
+    .prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+       VALUES ('legacy1', 'fact', 'repo-local', 'active', 'old title', 'written under v1', 'human', 1, 1)`,
+    )
+    .run()
+  legacy
+    .prepare(`INSERT INTO evidence (memory_id, kind, ref, excerpt) VALUES ('legacy1','session','s1','quote')`)
+    .run()
+  legacy.close()
+
+  const registry = new StoreRegistry(root, { warn() {}, info() {} })
+  registry.openAllKnown()
+  const store = registry.get('old')
+  assert.ok(store, 'the old store opens rather than being refused')
+  assert.equal(userVersion(store.db), TARGET_USER_VERSION)
+
+  const row = store.db
+    .prepare(`SELECT title, body, derived, human_confirmed, superseded_by FROM memories WHERE id = 'legacy1'`)
+    .get()
+  assert.equal(row.title, 'old title', 'pre-existing content is untouched')
+  assert.equal(row.derived, 0, 'columns added later take their defaults')
+  assert.equal(row.superseded_by, null)
+  assert.equal(
+    store.db.prepare(`SELECT excerpt FROM evidence WHERE memory_id = 'legacy1'`).get().excerpt,
+    'quote',
+  )
+  // Tables introduced by later versions exist and are usable.
+  assert.equal(store.db.prepare(`SELECT count(*) c FROM conversations`).get().c, 0)
+  store.db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('integrity-check')`)
+  registry.dispose()
   cleanup(root)
 })

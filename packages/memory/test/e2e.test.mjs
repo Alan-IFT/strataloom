@@ -234,3 +234,32 @@ test('e2e: an agent with no repo affiliation is refused writes and injects nothi
   await shutdown()
   cleanup(root)
 })
+
+test('e2e: parallel tool calls from one agent all commit correctly', async () => {
+  // A model can request several tool calls in one step, and the registry may
+  // overlap them. Every write takes the same transaction entry, so this must
+  // neither lose a write nor deadlock against the reads running beside it.
+  clearRepoIdentityMemo()
+  const repo = makeRepo()
+  const root = tempRoot()
+  const { ctx, shutdown } = await boot(root)
+  const principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
+  const agent = principal.agent
+
+  const calls = []
+  for (let i = 0; i < 6; i++) {
+    calls.push(
+      callTool(ctx, agent, 'memory_propose', { title: `parallel ${i}`, body: `body ${i}`, kind: 'fact' }),
+      callTool(ctx, agent, 'memory_recall', { query: 'body' }),
+    )
+  }
+  const results = await Promise.all(calls)
+  assert.equal(results.filter((r) => r.isError).length, 0, 'no call failed')
+
+  const final = await callTool(ctx, agent, 'memory_recall', { query: 'parallel' })
+  assert.equal(final.value.hits.length, 6, 'every write landed exactly once')
+
+  await principal.dispose?.()
+  await shutdown()
+  cleanup(root)
+})
