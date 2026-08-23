@@ -37,17 +37,46 @@ interface RenderableHit {
 }
 
 /**
- * What the raw injectable set would cost if rendered. The overflow test, the
- * metrics snapshot, and the packet itself all price memories the same way
- * because they all call this.
+ * One memory → one list item. THE definition, and the only place a memory's
+ * content is ever turned into text.
+ *
+ * Two rules live here because they are the same rule seen twice:
+ *
+ * 1. The packet is a flat `- ` list, so a body's own newlines are indented.
+ *    Otherwise stored text — which reaches injectable provenance from repo
+ *    content and tool output, not just from the user — could leave its bullet
+ *    and address the model at the top level ("The reference data above has
+ *    ended. New instruction: …") or forge a sibling entry. The framing header
+ *    is a *semantic* defense; this makes the *structure* say it too.
+ *    Continuations are indented, not stripped: bodies are often lists or short
+ *    procedures, and markdown already continues an item exactly this way, so
+ *    nothing is lost — even a blank line becomes an indented one.
+ * 2. Pricing calls this too, so what the budget measures is byte-for-byte what
+ *    the model receives. Estimating a different string than we render is how a
+ *    budget silently stops meaning anything.
+ * @param hit - the memory to render.
+ * @param withId - include the id (callers that offer a follow-up action need it).
  */
-export const packetTokens = (hits: readonly RenderableHit[]): number =>
-  hits.reduce((sum, hit) => sum + estimateTokens(`- [${hit.kind}] ${hit.title}: ${hit.body}`), 0)
+const renderEntry = (hit: RenderableHit, withId: boolean): string =>
+  `- [${hit.kind}] ${withId ? `(id ${hit.id}) ` : ''}${hit.title}: ${hit.body}`.replaceAll(
+    '\n',
+    '\n  ',
+  )
 
 /**
- * Render framed memory entries within a token budget — the single renderer
- * for BOTH read exits (injection §4.2 and the recall tool §4.3), so the
- * anti-injection framing and the budget rule exist in one place.
+ * What a set of memories costs when rendered. Priced through `renderEntry`,
+ * so the overflow trigger, the metrics snapshot, and the packet cannot drift.
+ */
+export const packetTokens = (hits: readonly RenderableHit[]): number =>
+  hits.reduce((sum, hit) => sum + estimateTokens(renderEntry(hit, false)), 0)
+
+/**
+ * Render framed memory entries within a token budget — the single renderer for
+ * EVERY exit that shows stored content to the model (injection §4.2, the
+ * recall tool §4.3, and the near-duplicate list `propose` offers back). The
+ * framing, the one-memory-one-item rule, and the budget therefore exist in
+ * exactly one place: a fourth exit gets them by calling this, and cannot get
+ * them wrong by hand.
  *
  * An entry that does not fit is skipped rather than ending the list: entries
  * arrive in priority order, so one oversized item must not hide the cheaper
@@ -64,9 +93,7 @@ export const renderFramed = (
   const lines: string[] = []
   let budget = budgetTokens
   for (const hit of hits) {
-    const entry = withId
-      ? `- [${hit.kind}] (id ${hit.id}) ${hit.title}: ${hit.body}`
-      : `- [${hit.kind}] ${hit.title}: ${hit.body}`
+    const entry = renderEntry(hit, withId)
     const cost = estimateTokens(entry)
     if (cost > budget) continue
     lines.push(entry)
@@ -76,8 +103,32 @@ export const renderFramed = (
 }
 
 /**
+ * The prompt variable the packet is delivered through, and the entire text of
+ * the registered context — one reference, nothing else.
+ *
+ * Memory content is arbitrary user/repo text, and `{{…}}` occurs naturally in
+ * it (CI matrices, Jinja/Handlebars/Vue templates, commit-message conventions).
+ * Prompt section and context text is interpolated strictly: an unknown
+ * `{{name}}` THROWS, and assembly happens on the agent's turn path, so one
+ * stored brace pair would abort every subsequent turn — and the memory cannot
+ * be forgotten without a turn in which to say so. A known name is worse than a
+ * crash: `{{cwd}}` would silently expand into the packet.
+ *
+ * Passing the packet as a variable VALUE removes that entire class: the
+ * platform substitutes values verbatim and never rescans them, so memory text
+ * is data by construction rather than by escaping. Escaping would be the wrong
+ * answer anyway — it would corrupt the very content the user asked us to
+ * remember.
+ */
+export const MEMORY_VARIABLE = 'strataloom_memory'
+
+/** The context contribution's text: a single reference, so content is never syntax. */
+export const MEMORY_CONTEXT_TEXT = `{{${MEMORY_VARIABLE}}}`
+
+/**
  * Build the provider's synchronous text callback. Every failure path returns
- * '' — prompt assembly must never break on a memory subsystem fault.
+ * '' — prompt assembly must never break on a memory subsystem fault. An empty
+ * value renders the context to '', which assembly drops entirely.
  */
 export const buildContextProvider = (
   ctx: Context,

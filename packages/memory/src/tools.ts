@@ -12,7 +12,12 @@ import type { MemoryId, MemoryKind, MemoryScope } from './types.ts'
 import { MEMORY_KINDS, MEMORY_SCOPES } from './types.ts'
 import { renderFramed } from './recall/inject.ts'
 import { PROJECTION_DIR } from './projection.ts'
-import { RECALL_RESULT_BUDGET_TOKENS, SOURCE_TURN_LIMIT } from './constants.ts'
+import {
+  BODY_MAX_CHARS,
+  RECALL_RESULT_BUDGET_TOKENS,
+  SOURCE_TURN_LIMIT,
+  TITLE_MAX_CHARS,
+} from './constants.ts'
 
 /**
  * The wire shape of one memory in a tool result — the schema counterpart of
@@ -153,8 +158,19 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
         'states a lasting preference, a repo fact worth keeping, or a procedure that ' +
         'worked. Only the top-level principal agent may save; subagent calls are refused.',
       parameters: {
-        title: { type: 'string', required: true, description: 'One imperative line (≤200 chars).' },
-        body: { type: 'string', required: true, description: 'Self-contained content (≤2000 chars).' },
+        // The caps are interpolated, not restated: a description that quotes a
+        // limit it does not read is a second copy of that limit, and the copy
+        // is what goes stale when the constant moves.
+        title: {
+          type: 'string',
+          required: true,
+          description: `One imperative line (≤${TITLE_MAX_CHARS} chars).`,
+        },
+        body: {
+          type: 'string',
+          required: true,
+          description: `Self-contained content (≤${BODY_MAX_CHARS} chars).`,
+        },
         kind: { type: 'string', required: true, enum: [...MEMORY_KINDS], description: KIND_DESCRIPTION },
         scope: {
           type: 'string',
@@ -186,17 +202,19 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
         render: (args, value) => {
           const scope = args.scope === 'personal' ? 'personal' : 'repository'
           const head = `Saved ${scope} memory ${value.id}. It is active immediately.`
-          if (value.similar.length === 0) return [{ type: 'text', text: head }]
-          const list = value.similar
-            .map((hit) => `- (id ${hit.id}) ${hit.title}: ${hit.body}`)
-            .join('\n')
+          // The near-duplicate list shows stored content, so it is a read exit
+          // like any other and goes through the shared renderer: same framing,
+          // same one-memory-one-item rule, same budget. Hand-formatting it here
+          // is how those three would quietly fail to apply on this path.
+          const list = renderFramed(value.similar, RECALL_RESULT_BUDGET_TOKENS, true)
+          if (list === '') return [{ type: 'text', text: head }]
           return [
             {
               type: 'text',
               text:
                 `${head}\n\nThese existing memories cover similar ground. If any of them ` +
                 'says the same thing, save again with `replaces` set to its id so one ' +
-                `entry remains instead of several:\n${list}`,
+                `entry remains instead of several:\n\n${list}`,
             },
           ]
         },

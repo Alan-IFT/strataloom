@@ -7,7 +7,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import Timer from '@deepseek-ai/cordis-plugin-timer'
-import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import SystemPrompt, { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
 import { ToolRuntime } from '@deepseek-ai/dsh-tools'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import * as memoryPlugin from '../lib/index.js'
@@ -45,11 +45,15 @@ test('plugin loads into a real cordis root and registers its global contribution
     ['memory_forget', 'memory_propose', 'memory_recall'],
   )
   assert.ok(assembly.sections.map((section) => section.name).includes('strataloom:memory-guidance'))
-  // One context provider, registered globally. With no agent on the assembly
-  // it contributes empty text (fail open) rather than throwing.
+  // One context provider, registered globally. Its text is a single variable
+  // reference — the packet travels as a substituted VALUE so that memory
+  // content can never be read as prompt syntax (see recall/inject.ts). With no
+  // agent on the assembly it resolves to empty (fail open) rather than
+  // throwing, and an empty context drops out of the rendered snapshot.
   const contexts = assembly.contexts.filter((entry) => entry.name === 'strataloom:memory')
   assert.equal(contexts.length, 1)
-  assert.equal(contexts[0].text, '')
+  assert.equal(assembly.variables.strataloom_memory, '')
+  assert.equal(renderContextSnapshot(assembly), '')
 
   await fiber.dispose()
   const after = await ctx.systemPrompt.assemble({})

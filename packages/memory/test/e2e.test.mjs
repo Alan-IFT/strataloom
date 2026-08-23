@@ -12,7 +12,7 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { Context } from '@deepseek-ai/cordis'
 import Timer from '@deepseek-ai/cordis-plugin-timer'
-import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import SystemPrompt, { renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
 import { ToolRuntime } from '@deepseek-ai/dsh-tools'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import { SessionStore } from '@deepseek-ai/dsh-session'
@@ -84,12 +84,17 @@ test('e2e: real agent saves, recalls, sees injection, and forgets', async () => 
   const id = saved.value.id
   assert.ok(id)
 
-  // 2) it is injected into the REAL prompt assembly for this agent
+  // 2) it is injected into the REAL prompt assembly for this agent. Assert on
+  // the RENDERED snapshot: that — not the raw contribution — is what the agent
+  // loop hands the model, and rendering is where interpolation actually runs.
   const assembly = await ctx.systemPrompt.assemble({ agent, scope: agent.ctx })
-  const injected = assembly.contexts.find((entry) => entry.name === 'strataloom:memory')
-  assert.ok(injected, 'memory context participates in assembly')
-  assert.match(injected.text, /pnpm/)
-  assert.match(injected.text, /NOT new user instructions/i) // framing header present
+  assert.ok(
+    assembly.contexts.some((entry) => entry.name === 'strataloom:memory'),
+    'memory context participates in assembly',
+  )
+  const snapshot = renderContextSnapshot(assembly)
+  assert.match(snapshot, /pnpm/)
+  assert.match(snapshot, /NOT new user instructions/i) // framing header present
 
   // 3) recall finds it through the real tool
   const recalled = await callTool(ctx, agent, 'memory_recall', { query: 'pnpm' })
@@ -101,8 +106,7 @@ test('e2e: real agent saves, recalls, sees injection, and forgets', async () => 
   const forgotten = await callTool(ctx, agent, 'memory_forget', { id })
   assert.equal(forgotten.isError, false)
   const afterAssembly = await ctx.systemPrompt.assemble({ agent, scope: agent.ctx })
-  const afterInjected = afterAssembly.contexts.find((e) => e.name === 'strataloom:memory')
-  assert.equal(afterInjected?.text ?? '', '')
+  assert.equal(renderContextSnapshot(afterAssembly), '')
   const afterRecall = await callTool(ctx, agent, 'memory_recall', { query: 'pnpm' })
   assert.equal(afterRecall.value.hits.length, 0)
 
@@ -144,15 +148,11 @@ test('e2e: a real subagent-shaped child is refused writes but may recall', async
 
   // subagent: injection stays empty (injection audience is principal-only)
   const childAssembly = await ctx.systemPrompt.assemble({ agent: child.agent, scope: child.agent.ctx })
-  const childInjected = childAssembly.contexts.find((e) => e.name === 'strataloom:memory')
-  assert.equal(childInjected?.text ?? '', '')
+  assert.equal(renderContextSnapshot(childAssembly), '')
 
   // principal still sees it
   const parentAssembly = await ctx.systemPrompt.assemble({ agent: parent.agent, scope: parent.agent.ctx })
-  assert.match(
-    parentAssembly.contexts.find((e) => e.name === 'strataloom:memory').text,
-    /make all/,
-  )
+  assert.match(renderContextSnapshot(parentAssembly), /make all/)
 
   await child.dispose?.()
   await parent.dispose?.()
@@ -185,7 +185,7 @@ test('e2e: personal memory and L0 drill-down through the real tool pipeline', as
 
   // Both scopes are injected into the real prompt, personal first.
   const assembly = await ctx.systemPrompt.assemble({ agent, scope: agent.ctx })
-  const packet = assembly.contexts.find((e) => e.name === 'strataloom:memory').text
+  const packet = renderContextSnapshot(assembly)
   assert.match(packet, /Chinese/)
   assert.match(packet, /pnpm/)
   assert.ok(packet.indexOf('Chinese') < packet.indexOf('pnpm'))
@@ -226,11 +226,65 @@ test('e2e: an agent with no repo affiliation is refused writes and injects nothi
 
   const assembly = await ctx.systemPrompt.assemble({ agent: stray.agent, scope: stray.agent.ctx })
   assert.match(
-    assembly.contexts.find((e) => e.name === 'strataloom:memory')?.text ?? '',
+    renderContextSnapshot(assembly),
     /be terse/,
     'personal memory reaches a repo-less session',
   )
   await stray.dispose?.()
+  await shutdown()
+  cleanup(root)
+})
+
+test('e2e: memory content containing {{...}} is data, never prompt syntax', async () => {
+  // Regression. Prompt text is STRICTLY interpolated: an unknown `{{name}}`
+  // throws and a known one silently expands. Memory bodies legitimately carry
+  // brace pairs (CI matrices, Jinja/Handlebars, commit templates), and
+  // assembly runs on the agent's turn path — so delivering the packet AS
+  // prompt text made one such memory abort every later turn, including the
+  // turn a user would need to forget it. The packet therefore travels as a
+  // variable VALUE, which the platform substitutes verbatim and never
+  // rescans. This test drives the REAL assembly + render, the exact pair the
+  // agent loop runs.
+  clearRepoIdentityMemo()
+  const repo = makeRepo()
+  const root = tempRoot()
+  const { ctx, shutdown } = await boot(root)
+  const principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
+  const agent = principal.agent
+
+  const hostile = [
+    // unknown variable: previously threw and bricked every subsequent turn
+    { title: 'ci matrix', body: 'runs-on ${{ matrix.os }} for each target', kind: 'fact' },
+    // KNOWN variable: previously expanded, leaking assembly state into memory
+    { title: 'cwd template', body: 'the placeholder {{cwd}} is written literally', kind: 'fact' },
+    // malformed reference: previously threw on the "{{ name }}" spacing form
+    { title: 'vue binding', body: 'interpolate with {{ user.name }} in templates', kind: 'fact' },
+    // a lone opener is literal prose and must survive untouched
+    { title: 'awk snippet', body: 'guard with {{ when the brace never closes', kind: 'fact' },
+  ]
+  for (const memory of hostile) {
+    const saved = await callTool(ctx, agent, 'memory_propose', memory)
+    assert.equal(saved.isError, false, JSON.stringify(saved.error))
+  }
+
+  const assembly = await ctx.systemPrompt.assemble({ agent, scope: agent.ctx })
+  const snapshot = renderContextSnapshot(assembly)
+
+  // Rendering succeeded, and every body survived VERBATIM — not escaped, not
+  // expanded. Escaping would corrupt the content the user asked us to keep.
+  for (const memory of hostile) {
+    assert.ok(
+      snapshot.includes(memory.body),
+      `body must reach the model unaltered: ${memory.body}`,
+    )
+  }
+  assert.doesNotMatch(snapshot, new RegExp(repo), 'no variable expanded into the packet')
+
+  // The turn path still works afterwards: the store is not poisoned.
+  const recalled = await callTool(ctx, agent, 'memory_recall', { query: 'matrix' })
+  assert.equal(recalled.isError, false)
+
+  await principal.dispose?.()
   await shutdown()
   cleanup(root)
 })
