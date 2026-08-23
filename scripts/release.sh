@@ -55,7 +55,16 @@ npm run verify
 
 echo "==> packing"
 rm -f ./*.tgz
-packed=$(npm pack --silent)
+# Not `npm pack --silent`: that silences the filename it prints on stdout too,
+# so the name comes back empty and every later step operates on "". Pack
+# normally and find the artefact on disk, which is also the honest question —
+# what was actually produced, not what npm said it produced.
+npm pack >/dev/null
+packed=$(ls -1 ./*.tgz 2>/dev/null | head -1)
+if [[ -z $packed ]]; then
+  echo "error: npm pack produced no tarball (its output is above)" >&2
+  exit 1
+fi
 
 # A tarball missing `lib/` installs as an empty package: `main` points there and
 # `.gitignore` excludes it, so this is the one failure that would reach users
