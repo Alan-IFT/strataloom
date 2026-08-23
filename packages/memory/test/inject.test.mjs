@@ -5,7 +5,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { MemoryService } from '../lib/service.js'
-import { buildContextProvider, renderFramed, FRAMING_HEADER } from '../lib/recall/inject.js'
+import { buildContextProvider, countEntries, renderFramed, FRAMING_HEADER } from '../lib/recall/inject.js'
 import { registerTools } from '../lib/tools.js'
 import { queryInjectionRows } from '../lib/store/fts.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
@@ -107,6 +107,24 @@ test('budget: oversized entries are skipped, header only appears with content', 
   assert.equal(renderFramed([], 1_300), '')
   // all-skipped ⇒ '' (never a lone framing header)
   assert.equal(renderFramed([rows[0]], 1_300), '')
+})
+
+test('a memory skipped by the budget is reported, not silent', () => {
+  // Skipping an entry that does not fit is by design, but it is still a memory
+  // the model was meant to see and did not — "fail open, not fail silent".
+  // L2 makes this routine: a rebuild may emit more scenario blocks than the
+  // budget admits, and a persistently dropped one means the blocks are too fat.
+  // Entries are counted by bullet starts, because D8 indents a body's own
+  // newlines — counting lines would report one memory as several.
+  const multiline = { id: 'a', kind: 'fact', title: 't', body: 'one\ntwo\nthree' }
+  assert.equal(countEntries(renderFramed([multiline], 1_300)), 1, 'continuations are not entries')
+  assert.equal(countEntries(''), 0)
+
+  const rows = [
+    { id: 'a', kind: 'fact', title: 'huge', body: 'x'.repeat(20_000) },
+    { id: 'b', kind: 'fact', title: 'small', body: 'fits fine' },
+  ]
+  assert.equal(rows.length - countEntries(renderFramed(rows, 1_300)), 1, 'one entry was dropped')
 })
 
 test('a full packet stays within the §4.2 total budget (header included)', () => {

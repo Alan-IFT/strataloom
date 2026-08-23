@@ -144,7 +144,7 @@ npm install      # platform packages from npm (peer deps, mirrored as dev deps)
 npm run verify   # tsc + the full test suite
 ```
 
-118 tests:
+119 tests:
 
 | File | Covers |
 |---|---|
@@ -153,7 +153,7 @@ npm run verify   # tsc + the full test suite
 | `jobs.test.mjs` | idempotent enqueue, single-winner claims, lease expiry, fencing-before-writes, poison dead-letter, cleanup retention |
 | `pipeline.test.mjs` | provenance mapping (all categories + unknown), source suppression and relearning, reconcile decisions per kind, malformed-reply retry exits |
 | `pipeline-e2e.test.mjs` | the same pipeline through the **real `LlmRuntime`** with a registered adapter: pinned routing, single fallback, error/abort finishes, chunked reassembly |
-| `inject.test.mjs` | discrete injection rules, audience, budget truncation, commit-visibility, cross-process WAL freshness, **no breaking out of a bullet** |
+| `inject.test.mjs` | discrete injection rules, audience, budget truncation, commit-visibility, cross-process WAL freshness, **no breaking out of a bullet**, **a budget-skipped memory is reported, not silent** |
 | `e2e.test.mjs` | **real agent registry + real tool dispatch + real prompt assembly**, principal vs subagent, no-repo agent, **`{{…}}` in memory content stays data** |
 | `resilience.test.mjs` | bounded busy-retry, corrupt/foreign store isolation, fencing yield, mid-tick store failure, busy-agent deferral |
 | `lifecycle.test.mjs` | activation, teardown ordering, HMR-shaped reload |

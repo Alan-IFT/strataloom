@@ -71,6 +71,14 @@ export const packetTokens = (hits: readonly RenderableHit[]): number =>
   hits.reduce((sum, hit) => sum + estimateTokens(renderEntry(hit, false)), 0)
 
 /**
+ * How many entries a rendered packet contains. Counts bullet starts rather
+ * than lines, because D8 indents a body's own newlines into continuations —
+ * counting lines would report one multi-line memory as several entries.
+ */
+export const countEntries = (packet: string): number =>
+  packet === '' ? 0 : (packet.match(/^- \[/gm) ?? []).length
+
+/**
  * Render framed memory entries within a token budget — the single renderer for
  * EVERY exit that shows stored content to the model (injection §4.2, the
  * recall tool §4.3, and the near-duplicate list `propose` offers back). The
@@ -156,9 +164,17 @@ export const buildContextProvider = (
       // §9: every assembly reports whether it injected and how much. This is
       // the per-turn counterpart to the periodic store snapshot — together
       // they answer "is the packet overflowing?" (§12 derived-layer trigger).
+      //
+      // `dropped` is the answer to that question, and counting candidates
+      // alone could not give it. Skipping an entry that does not fit is
+      // by design (§4.2), but it is still a memory the model was meant to see
+      // and did not, so it is reported rather than silent — the L2 layer makes
+      // it routine: a rebuild may emit more scenario blocks than the budget
+      // admits, and a persistently dropped one means the blocks are too fat.
       ctx.logger.debug('strataloom inject', {
         agent: agent.id,
         hits: hits.length,
+        dropped: hits.length - countEntries(packet),
         tokens: packet === '' ? 0 : estimateTokens(packet),
       })
       return packet
