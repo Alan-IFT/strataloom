@@ -120,6 +120,19 @@ Stores are created on first write. A session whose working directory is not
 inside a git work tree has no repository store — personal memories still work
 there.
 
+## Looking at what it has learned
+
+```bash
+node scripts/inspect.mjs            # per-store summary and the weekly recall trend
+node scripts/inspect.mjs --misses   # the conversation around each recall miss
+node scripts/inspect.mjs --days 30  # narrower window (default 90)
+```
+
+Read-only, and it needs no `sqlite3` binary. Everything shown is a query over
+data the plugin already stores: the periodic metrics line is a snapshot that
+log rotation eventually discards, but L0 rows carry timestamps, so the *trend*
+is recoverable retroactively — which is why there is no time-series table.
+
 ## Configuration
 
 | Option | Default | Effect |

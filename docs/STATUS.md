@@ -23,6 +23,16 @@ Coding/Repo/Personal/Procedure 皆到位。详见
 命中同一条」的实例。详见
 [`decisions/0005-recall-miss-rate-is-a-screening-signal.md`](decisions/0005-recall-miss-rate-is-a-screening-signal.md)。
 
+**查看数据**（无需 sqlite3，无需新增存储）：
+
+```bash
+node scripts/inspect.mjs            # 各库摘要 + 按周未命中率趋势
+node scripts/inspect.mjs --misses   # 每次未命中前后的对话
+```
+
+趋势是从 L0 的时间戳**回溯算出**的（一条 GROUP BY），所以没有时序表——
+周期性 metrics 日志会被轮转清掉，而 L0 本来就为溯源而保留。
+
 在此之前，插件功能已完整（4×4 全部到位 + 真实 LLM 冒烟通过），可以先投入使用
 积累真实数据。
 
