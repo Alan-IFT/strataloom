@@ -30,7 +30,7 @@ import type {
   RecallQuery,
   RecallResult,
 } from './types.ts'
-import { MEMORY_KINDS } from './types.ts'
+import { LAYER, MEMORY_KINDS } from './types.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -306,7 +306,7 @@ export class MemoryService extends Service {
       | undefined
     if (row === undefined) throw new MemoryInputError(`no memory with id ${id} in this repository`)
     if (row.status !== 'active') throw new MemoryInputError(`memory ${id} is not active`)
-    if (row.derived === 1) throw new MemoryInputError(`${id} is a generated summary`)
+    if (row.derived !== LAYER.RAW) throw new MemoryInputError(`${id} is a generated summary`)
     // Scan BEFORE asking: a human should never be prompted to approve
     // something that would be refused at write time anyway, and the row must
     // not be marked shareable on the strength of an approval we will not act
@@ -375,7 +375,7 @@ export class MemoryService extends Service {
         .prepare(`SELECT status, derived FROM memories WHERE id = ?`)
         .get(id) as { status: string; derived: number } | undefined
       if (row === undefined) throw new MemoryInputError(`no memory with id ${id}`)
-      if (row.derived === 1) {
+      if (row.derived !== LAYER.RAW) {
         // A rollup has no independent existence: forgetting it would be
         // undone by the next rebuild. Point the caller at the real source.
         throw new MemoryInputError(

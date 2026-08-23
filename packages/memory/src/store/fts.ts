@@ -12,6 +12,7 @@ import type { MemoryHit, MemoryKind } from '../types.ts'
 import {
   EXCLUDED_STATUSES,
   INJECTABLE_PROVENANCE,
+  LAYER,
   PROVENANCE_PRIORITY,
 } from '../types.ts'
 import { INJECT_TOP_N, RECALL_CANDIDATE_LIMIT } from '../constants.ts'
@@ -64,21 +65,31 @@ export const queryInjectableSet = (store: OpenStore, limit: number): MemoryHit[]
     .all(limit) as unknown as MemoryHit[]
 
 /**
- * What the next assembly would inject. A rollup, when one exists, REPLACES
- * the raw set it summarizes — that substitution is the whole point of the
- * derived layer. It exists only while the raw set overflows the budget and
- * is dropped by the next authoritative write, so this branch is normally
- * not taken.
+ * What the next assembly would inject. Derived rows, when they exist, REPLACE
+ * the raw set they summarize — that substitution is the whole point of the
+ * layer. They exist only while the raw set overflows the budget and are
+ * dropped by the next authoritative write, so this branch is normally not
+ * taken.
+ *
+ * Scenario blocks (L2) come back most-recent-first, and the renderer's budget
+ * decides how many survive. There is deliberately no "pick the relevant one"
+ * step: this path has no query string (spec §4.1), so relevance cannot be
+ * computed here honestly, and the alternative — guessing from the agent's cwd
+ * or last tool call — would be a second, weaker retrieval rule competing with
+ * `memory_recall`. Recency is a signal we actually have, and the budget makes
+ * the rest a non-question: a rebuild emits at most a handful of blocks, of
+ * which the budget already admits most.
  */
 export const queryInjectionRows = (store: OpenStore): MemoryHit[] =>
   store.timed('inject-top-n', () => {
-    const rollup = store.db
+    const derived = store.db
       .prepare(
         `SELECT id, kind, title, body FROM memories
-         WHERE derived = 1 AND status = 'active' LIMIT 1`,
+         WHERE derived != ${LAYER.RAW} AND status = 'active'
+         ORDER BY derived DESC, updated_at DESC`,
       )
-      .get() as MemoryHit | undefined
-    return rollup !== undefined ? [rollup] : queryInjectableSet(store, INJECT_TOP_N)
+      .all() as unknown as MemoryHit[]
+    return derived.length > 0 ? derived : queryInjectableSet(store, INJECT_TOP_N)
   })
 
 /**

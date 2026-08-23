@@ -7,7 +7,9 @@
 import {
   EXTRACT_BODY_TARGET_CHARS,
   EXTRACT_TITLE_TARGET_CHARS,
+  ROLLUP_MAX_SCENARIOS,
   ROLLUP_TARGET_CHARS,
+  ROLLUP_TITLE_TARGET_CHARS,
 } from '../constants.ts'
 import { kindGuidance, MEMORY_KINDS } from '../types.ts'
 
@@ -67,14 +69,22 @@ Rules (by kind):
  * the instruction optimizes for coverage-per-token, not prose.
  */
 export const rollupSystemPrompt = (): string =>
-  `You compress a repository's stored memories into ONE compact briefing.
+  `You organise a repository's stored memories into a few SCENARIO briefings.
 
-Return PLAIN TEXT (no JSON, no markdown fence), at most ${ROLLUP_TARGET_CHARS} characters.
+A scenario is a piece of work someone would resume as a unit — "the auth
+refactor", "CI and release", "the storage layer". It is a topic, not a
+directory: one scenario may span several parts of the codebase.
+
+Return STRICT JSON: {"scenarios":[{"title":string,"body":string}]}
 
 Rules:
+- at most ${ROLLUP_MAX_SCENARIOS} scenarios; prefer FEWER, larger ones over many thin ones;
+- title: the scenario's name, ≤${ROLLUP_TITLE_TARGET_CHARS} chars, no prefix like "Scenario:";
+- body: ≤${ROLLUP_TARGET_CHARS} chars, the briefing for that scenario alone;
+- assign every input memory to exactly ONE scenario; when something fits
+  nowhere, put it in a scenario titled "General";
 - preserve every distinct item whatever its kind; drop only wording;
-- group related items into single lines instead of repeating context;
 - keep concrete identifiers verbatim (commands, paths, tool names, versions);
 - state rules as rules ("use pnpm, never npm"), not as narrative;
 - omit anything you cannot state precisely — a lost detail beats a wrong one;
-- write nothing but the briefing text.`
+- output the JSON object only — no markdown fence, no commentary.`

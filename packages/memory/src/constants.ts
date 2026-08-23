@@ -11,9 +11,9 @@ export const APPLICATION_ID = 0x53_54_4c_4d
 /**
  * Current schema version (v1 = P0 core, v2 = P1 jobs/usage/superseded_by,
  * v3 = L0 + global store, v4 = decay/derived, v5 = derived invalidation as a
- * data property rather than a write-path responsibility, v6 = `coding` kind).
+ * data property rather than a write-path responsibility, v6 = `coding` kind, v7 = `derived` widened to a layer).
  */
-export const TARGET_USER_VERSION = 6
+export const TARGET_USER_VERSION = 7
 
 /** Per-connection busy timeout — waits happen at BEGIN IMMEDIATE (spec §3.3). */
 export const BUSY_TIMEOUT_MS = 2_000
@@ -115,15 +115,25 @@ export const BODY_MAX_CHARS = 2_000
  */
 export const EXTRACT_TITLE_TARGET_CHARS = 120
 export const EXTRACT_BODY_TARGET_CHARS = 800
-/** What the rollup prompt asks for; it replaces the whole injectable set. */
+/** Body length asked of each scenario briefing (L2). */
 export const ROLLUP_TARGET_CHARS = 900
+/** Title length asked of a scenario — it is a name, not a sentence. */
+export const ROLLUP_TITLE_TARGET_CHARS = 60
+/**
+ * How many scenarios one rebuild may produce. Injection shows the most
+ * relevant one and prices the rest against the budget, so this bounds the
+ * work, not the packet. Few and large beats many and thin: a scenario exists
+ * to restore a working context, and a one-line scenario restores nothing.
+ */
+export const ROLLUP_MAX_SCENARIOS = 6
 
 /* A target above its own truncation point would ask the model for text we
    would then cut. Cheap to assert at load; impossible to forget later. */
 if (
   EXTRACT_TITLE_TARGET_CHARS > TITLE_MAX_CHARS ||
   EXTRACT_BODY_TARGET_CHARS > BODY_MAX_CHARS ||
-  ROLLUP_TARGET_CHARS > BODY_MAX_CHARS
+  ROLLUP_TARGET_CHARS > BODY_MAX_CHARS ||
+  ROLLUP_TITLE_TARGET_CHARS > TITLE_MAX_CHARS
 ) {
   throw new Error('strataloom: a prompt target exceeds the hard cap it must stay below')
 }

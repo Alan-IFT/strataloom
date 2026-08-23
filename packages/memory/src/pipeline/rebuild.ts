@@ -1,10 +1,17 @@
 /**
- * The derived summary layer (spec §12).
+ * The derived layer: L2 scenario blocks (spec §12, 4×4 phase 2).
  *
  * When direct L1 injection outgrows its budget, the packet silently truncates
- * — the model stops seeing memories nobody decided to drop. The fix is a
- * rollup: one LLM-written summary of the injectable working set, stored as an
- * ordinary row with `derived = 1`.
+ * — the model stops seeing memories nobody decided to drop. The fix is to
+ * rebuild the working set into SCENARIO blocks: one LLM-written briefing per
+ * piece of work someone would resume as a unit, each an ordinary row carrying
+ * `derived = LAYER.SCENARIO`.
+ *
+ * Scenarios rather than one whole-store summary, because the layer exists to
+ * restore a working context and a single briefing over everything restores
+ * none of them well. A scenario is a topic, not a directory — it may span
+ * several parts of the codebase — so the clustering is the model's judgement,
+ * made once per rebuild and never on the read path.
  *
  * Two deliberate reductions against the archived design:
  *
@@ -26,14 +33,21 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type { OpenStore } from '../store/store.ts'
 import { commitClaimedJob, enqueueJob, jobId, type ClaimedJob } from './jobs.ts'
-import { callPipelineLlm, PipelineLlmError, type PinnedRoute } from './llm-call.ts'
+import {
+  callPipelineLlm,
+  parseStrictJson,
+  PipelineLlmError,
+  type PinnedRoute,
+} from './llm-call.ts'
 import { rollupSystemPrompt } from './prompts.ts'
 import {
   INJECT_BODY_BUDGET_TOKENS,
+  ROLLUP_MAX_SCENARIOS,
   ROLLUP_SOURCE_LIMIT,
   TITLE_MAX_CHARS,
   BODY_MAX_CHARS,
 } from '../constants.ts'
+import { LAYER } from '../types.ts'
 import { queryInjectableSet } from '../store/fts.ts'
 import { packetTokens } from '../recall/inject.ts'
 
@@ -121,29 +135,59 @@ export const runRebuildJob = async (
     JSON.stringify({ memories: sources }),
     signal,
   )
-  const body = reply.trim().slice(0, BODY_MAX_CHARS)
-  if (body === '') throw new PipelineLlmError('empty rollup')
+  const scenarios = parseScenarios(parseStrictJson(reply))
 
   commitClaimedJob(store, job.id, job.leaseToken, () => {
     // Fence again inside the commit: the snapshot may have moved while the
     // model was answering.
     if (readRevision(store) !== payload.expectedRevision) return
     const now = Date.now()
-    store.db.prepare(`DELETE FROM memories WHERE derived = 1`).run()
-    store.db
-      .prepare(
-        `INSERT INTO memories
-           (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
-         VALUES (?, 'fact', ?, 'active', ?, ?, 'derived', ?, ?, 1)`,
-      )
-      .run(
-        randomUUID(),
-        store.kind === 'global' ? 'private' : 'repo-local',
-        `Working set summary (${sources.length} memories)`.slice(0, TITLE_MAX_CHARS),
-        body,
-        now,
-        now,
-      )
+    // Clear EVERY derived layer, not just this one: whatever is here was
+    // built from the same snapshot, so it is replaced as a set.
+    store.db.prepare(`DELETE FROM memories WHERE derived != ${LAYER.RAW}`).run()
+    const insert = store.db.prepare(
+      `INSERT INTO memories
+         (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+       VALUES (?, 'fact', ?, 'active', ?, ?, 'derived', ?, ?, ${LAYER.SCENARIO})`,
+    )
+    const visibility = store.kind === 'global' ? 'private' : 'repo-local'
+    for (const scenario of scenarios) {
+      insert.run(randomUUID(), visibility, scenario.title, scenario.body, now, now)
+    }
   })
   return true
+}
+
+/** One scenario block as the model returns it, already bounded. */
+interface Scenario {
+  readonly title: string
+  readonly body: string
+}
+
+/**
+ * Validate the rollup reply into scenario blocks.
+ *
+ * Empty or malformed replies throw, reaching the runner's retry exit: a
+ * rebuild that produced nothing must not commit, because committing zero
+ * scenarios would look like "the packet fits now" and leave the overflowing
+ * raw set injected in truncated form.
+ */
+const parseScenarios = (raw: unknown): Scenario[] => {
+  const root = raw as { scenarios?: unknown }
+  if (root === null || typeof root !== 'object' || !Array.isArray(root.scenarios)) {
+    throw new PipelineLlmError('rollup reply missing scenarios array')
+  }
+  const out: Scenario[] = []
+  for (const item of root.scenarios.slice(0, ROLLUP_MAX_SCENARIOS)) {
+    const scenario = item as Partial<Scenario>
+    if (typeof scenario.title !== 'string' || typeof scenario.body !== 'string') {
+      throw new PipelineLlmError('malformed scenario in rollup reply')
+    }
+    const title = scenario.title.trim().slice(0, TITLE_MAX_CHARS)
+    const body = scenario.body.trim().slice(0, BODY_MAX_CHARS)
+    if (title === '' || body === '') continue
+    out.push({ title, body })
+  }
+  if (out.length === 0) throw new PipelineLlmError('rollup produced no usable scenario')
+  return out
 }

@@ -58,23 +58,66 @@ export const kindGuidance = (): string =>
     .map(([kind, criterion]) => `${kind} (${criterion})`)
     .join(' | ')
 
-/** Memory lifecycle states (spec §3.3). */
-export type MemoryStatus =
-  | 'candidate'
-  | 'active'
-  | 'superseded'
-  | 'dormant'
-  | 'archived'
-  | 'tombstone'
+/**
+ * Which layer a row belongs to — the `derived` column, widened from a boolean
+ * to a level so L2/L3 need no new table, column, or invalidation protocol.
+ *
+ * The values are ordered by distance from the raw record, and `RAW = 0` is
+ * load-bearing: every query that asks "is this an original memory?" is written
+ * `derived = 0`, and D9's triggers fire on `OLD/NEW.derived = 0`. Widening
+ * therefore leaves both untouched, and each new layer inherits invalidation
+ * for free — the dividend of stating that rule over the data rather than in
+ * the writers (see docs/design/4x4-memory.md §1).
+ *
+ * An alternative `scenario_key` column was rejected: it would let one concept
+ * (what this row is) be expressed by two fields, admitting states like
+ * "whole-store summary carrying a scenario key" that then need a constraint to
+ * forbid. A single widened column makes those unrepresentable.
+ */
+export const LAYER = {
+  /** L1 — an original memory. Never produced by the rebuild job. */
+  RAW: 0,
+  /** A single briefing over the whole injectable set (the pre-L2 rollup). */
+  SUMMARY: 1,
+  /** L2 — one block per scenario, clustered by topic. */
+  SCENARIO: 2,
+  /** L3 — the cross-repo persona. Exactly one per user, in the global store. */
+  PERSONA: 3,
+} as const
 
-/** Provenance enum (spec §2.4 — assignment paths are exhaustively service-owned, D1/D3). */
-export type Provenance =
-  | 'human'
-  | 'principal-explicit'
-  | 'parent-agent'
-  | 'subagent'
-  | 'tool-output'
-  | 'derived'
+/** Every derived layer, i.e. everything a rebuild may produce. */
+export const DERIVED_LAYERS = [LAYER.SUMMARY, LAYER.SCENARIO, LAYER.PERSONA] as const
+
+/**
+ * Memory lifecycle states (spec §3.3). The runtime tuple is the source and
+ * the type is derived, so the schema's CHECK and the code's type cannot list
+ * different states.
+ */
+export const MEMORY_STATUSES = [
+  'candidate',
+  'active',
+  'superseded',
+  'dormant',
+  'archived',
+  'tombstone',
+] as const
+
+export type MemoryStatus = (typeof MEMORY_STATUSES)[number]
+
+/**
+ * Provenance enum (spec §2.4 — assignment paths are exhaustively
+ * service-owned, D1/D3). Tuple first, type derived, for the same reason.
+ */
+export const PROVENANCES = [
+  'human',
+  'principal-explicit',
+  'parent-agent',
+  'subagent',
+  'tool-output',
+  'derived',
+] as const
+
+export type Provenance = (typeof PROVENANCES)[number]
 
 /**
  * Provenances allowed into the default injection packet

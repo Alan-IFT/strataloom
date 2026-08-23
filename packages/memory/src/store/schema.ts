@@ -11,7 +11,13 @@
  */
 import type { DatabaseSync } from 'node:sqlite'
 import { APPLICATION_ID, TARGET_USER_VERSION } from '../constants.ts'
-import { MEMORY_KINDS } from '../types.ts'
+import {
+  DERIVED_LAYERS,
+  LAYER,
+  MEMORY_KINDS,
+  MEMORY_STATUSES,
+  PROVENANCES,
+} from '../types.ts'
 import type { StoreKind } from './store.ts'
 import { immediateTx } from './tx.ts'
 
@@ -32,8 +38,12 @@ export class MigrationError extends Error {
  * freshly rebuilt table.
  */
 const createMemoryTriggers = (db: DatabaseSync): void => {
+  // `!= 0`, never `= 1`: `derived` is a LEVEL, so every derived layer is
+  // retired together. Matching a single value would leave scenario and
+  // persona blocks standing after the set they summarize had changed — the
+  // exact shadowing D9 exists to prevent.
   const invalidate = `
-      DELETE FROM memories WHERE derived = 1;
+      DELETE FROM memories WHERE derived != ${LAYER.RAW};
       INSERT INTO meta (k, v) VALUES ('store_revision', '1')
         ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT);`
   db.exec(`
@@ -61,22 +71,87 @@ const createMemoryTriggers = (db: DatabaseSync): void => {
         <> ((SELECT v FROM meta WHERE k = 'store_kind') = 'global')
       BEGIN SELECT RAISE(ABORT, 'visibility does not match this store kind'); END;
 
-    -- A derived rollup is regenerated wholesale, never aged out row by row (v4).
+    -- Any derived layer is regenerated wholesale, never aged out row by row (v4).
     CREATE TRIGGER guard_derived_dormant BEFORE UPDATE OF status, derived ON memories
-      WHEN new.status = 'dormant' AND new.derived = 1
-      BEGIN SELECT RAISE(ABORT, 'a derived rollup cannot go dormant'); END;
+      WHEN new.status = 'dormant' AND new.derived != ${LAYER.RAW}
+      BEGIN SELECT RAISE(ABORT, 'a derived row cannot go dormant'); END;
 
     -- D9: invalidation is a property of the data, not of the writer (v5).
+    -- The guard matches RAW only, so a rebuild writing its own derived rows
+    -- does not fence itself, whichever layer it is producing.
     CREATE TRIGGER invalidate_derived_insert AFTER INSERT ON memories
-      WHEN NEW.derived = 0 BEGIN${invalidate}
+      WHEN NEW.derived = ${LAYER.RAW} BEGIN${invalidate}
     END;
     CREATE TRIGGER invalidate_derived_update AFTER UPDATE ON memories
-      WHEN OLD.derived = 0 BEGIN${invalidate}
+      WHEN OLD.derived = ${LAYER.RAW} BEGIN${invalidate}
     END;
     CREATE TRIGGER invalidate_derived_delete AFTER DELETE ON memories
-      WHEN OLD.derived = 0 BEGIN${invalidate}
+      WHEN OLD.derived = ${LAYER.RAW} BEGIN${invalidate}
     END;
   `)
+}
+
+/** Render a string enum as a SQL `IN (...)` list, quoted. */
+const sqlEnum = (values: readonly string[]): string =>
+  values.map((value) => `'${value}'`).join(',')
+
+/** The columns of `memories`, current as of the newest rebuild. */
+const MEMORY_COLUMNS = [
+  'rowid       INTEGER PRIMARY KEY',
+  'id          TEXT NOT NULL UNIQUE',
+  `kind        TEXT NOT NULL CHECK (kind IN (${sqlEnum(MEMORY_KINDS)}))`,
+  "visibility  TEXT NOT NULL CHECK (visibility IN ('private','repo-local','team-shareable'))",
+  `status      TEXT NOT NULL CHECK (status IN (${sqlEnum(MEMORY_STATUSES)}))`,
+  'title       TEXT NOT NULL',
+  'body        TEXT NOT NULL',
+  `provenance  TEXT NOT NULL CHECK (provenance IN (${sqlEnum(PROVENANCES)}))`,
+  'created_at  INTEGER NOT NULL',
+  'updated_at  INTEGER NOT NULL',
+  'superseded_by TEXT REFERENCES memories(id)',
+  // As of v6, `derived` is still the boolean rollup flag; v7 overrides this
+  // definition to widen it into a layer. A migration must reproduce the schema
+  // OF ITS OWN VERSION, so the baseline here is the oldest rebuild's, and each
+  // later rebuild passes only what it changes.
+  `derived     INTEGER NOT NULL DEFAULT ${LAYER.RAW} CHECK (derived IN (${LAYER.RAW},${LAYER.SUMMARY}))`,
+  'human_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (human_confirmed IN (0,1))',
+] as const
+
+/**
+ * Rebuild `memories` in place, replacing the column definitions named in
+ * `overrides`. SQLite cannot widen a CHECK, so every enum extension is a
+ * rebuild; doing it here once means the hazards are handled once:
+ *
+ * - `evidence.memory_id` is `ON DELETE CASCADE`, so dropping the old table
+ *   with foreign keys enforced **deletes every evidence row** — the
+ *   provenance D3 guarantees. Measured, not assumed. `migrate()` therefore
+ *   runs with enforcement off and re-checks before committing.
+ * - The triggers belong to the table and go down with it; they come back from
+ *   `createMemoryTriggers`, the single definition.
+ * - The FTS index survives as a table but its rowids now reference dropped
+ *   content, so it is rebuilt rather than trusted.
+ *
+ * A migration passes only the column it is changing. Writing out the whole
+ * table per migration would fork the schema into as many copies as there are
+ * rebuilds, and the copies would drift.
+ * @param db - the connection being migrated.
+ * @param overrides - replacement column definitions, matched by column name.
+ */
+const rebuildMemories = (db: DatabaseSync, ...overrides: readonly string[]): void => {
+  const nameOf = (definition: string): string => definition.trim().split(/\s+/)[0] ?? ''
+  const replaced = new Map(overrides.map((definition) => [nameOf(definition), definition]))
+  const columns = MEMORY_COLUMNS.map(
+    (definition) => replaced.get(nameOf(definition)) ?? definition,
+  )
+  const names = MEMORY_COLUMNS.map(nameOf).join(', ')
+  db.exec(`
+    CREATE TABLE memories_rebuilt (${columns.join(',\n      ')});
+    INSERT INTO memories_rebuilt (${names}) SELECT ${names} FROM memories;
+    DROP TABLE memories;
+    ALTER TABLE memories_rebuilt RENAME TO memories;
+    CREATE INDEX memories_decay ON memories(status, updated_at);
+    INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
+  `)
+  createMemoryTriggers(db)
 }
 
 const readPragma = (db: DatabaseSync, name: string): number => {
@@ -335,39 +410,27 @@ const migrateV5 = (db: DatabaseSync): void => {
  * and the enum the database enforces cannot disagree.
  */
 const migrateV6 = (db: DatabaseSync): void => {
-  const kinds = MEMORY_KINDS.map((kind) => `'${kind}'`).join(',')
-  db.exec(`
-    CREATE TABLE memories_v6 (
-      rowid       INTEGER PRIMARY KEY,
-      id          TEXT NOT NULL UNIQUE,
-      kind        TEXT NOT NULL CHECK (kind IN (${kinds})),
-      visibility  TEXT NOT NULL CHECK (visibility IN ('private','repo-local','team-shareable')),
-      status      TEXT NOT NULL CHECK (status IN
-                    ('candidate','active','superseded','dormant','archived','tombstone')),
-      title       TEXT NOT NULL,
-      body        TEXT NOT NULL,
-      provenance  TEXT NOT NULL CHECK (provenance IN
-                    ('human','principal-explicit','parent-agent','subagent','tool-output','derived')),
-      created_at  INTEGER NOT NULL,
-      updated_at  INTEGER NOT NULL,
-      superseded_by TEXT REFERENCES memories(id),
-      derived     INTEGER NOT NULL DEFAULT 0 CHECK (derived IN (0,1)),
-      human_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (human_confirmed IN (0,1))
-    );
-    INSERT INTO memories_v6 (rowid, id, kind, visibility, status, title, body,
-                             provenance, created_at, updated_at, superseded_by,
-                             derived, human_confirmed)
-      SELECT rowid, id, kind, visibility, status, title, body, provenance,
-             created_at, updated_at, superseded_by, derived, human_confirmed
-        FROM memories;
-    DROP TABLE memories;
-    ALTER TABLE memories_v6 RENAME TO memories;
-    CREATE INDEX memories_decay ON memories(status, updated_at);
-  `)
-  // The FTS index survives the rebuild as a table, but its rowids now point at
-  // dropped content; rebuild it from the new table rather than trusting it.
-  db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')`)
-  createMemoryTriggers(db)
+  rebuildMemories(db, `kind TEXT NOT NULL CHECK (kind IN (${sqlEnum(MEMORY_KINDS)}))`)
+}
+
+/**
+ * user_version = 7: `derived` widens from a boolean to a LAYER (4×4 phase 2).
+ *
+ * L2 scenarios and the L3 persona need no table, no column, and no
+ * invalidation protocol of their own — they are rows of the layer they belong
+ * to. Only the CHECK has to admit the new values, which is again a rebuild.
+ *
+ * Nothing else in this migration: the D9 triggers already read
+ * `derived = RAW`, so they are recreated (by the rebuild) with semantics that
+ * cover every layer, including layers not yet written. That is the whole
+ * dividend of having stated invalidation over the data in v5.
+ */
+const migrateV7 = (db: DatabaseSync): void => {
+  rebuildMemories(
+    db,
+    `derived INTEGER NOT NULL DEFAULT ${LAYER.RAW}
+       CHECK (derived IN (${[LAYER.RAW, ...DERIVED_LAYERS].join(',')}))`,
+  )
 }
 
 const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
@@ -377,6 +440,7 @@ const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
   migrateV4,
   migrateV5,
   migrateV6,
+  migrateV7,
 ]
 
 /**

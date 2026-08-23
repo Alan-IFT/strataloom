@@ -175,6 +175,52 @@ test('v5 -> v6 rebuilds the memories table without losing evidence or guards', (
   cleanup(root)
 })
 
+test('v6 -> v7 widens derived to a layer and carries the guards across', () => {
+  // Phase 2 needs no new table: L2/L3 are rows at a higher `derived` level.
+  // The rebuild must therefore keep the data AND come back with triggers whose
+  // semantics now span every layer, so a scenario block cannot outlive the set
+  // it summarizes.
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo', 6)
+  const now = Date.now()
+  db.exec(`INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at)
+    VALUES ('raw','fact','repo-local','active','a raw fact','body','human',${now},${now})`)
+  db.exec(`INSERT INTO evidence (memory_id,kind,ref,excerpt) VALUES ('raw','session','s1','the words')`)
+  // v6 can only express the boolean rollup.
+  db.exec(`INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+    VALUES ('old-sum','fact','repo-local','active','old summary','b','derived',${now},${now},1)`)
+  assert.throws(
+    () => db.exec(`UPDATE memories SET derived = 2 WHERE id = 'old-sum'`),
+    'v6 is the baseline: a scenario layer cannot yet be expressed',
+  )
+
+  migrate(db, 'repo', 7)
+  assert.equal(userVersion(db), 7)
+  assert.equal(db.prepare(`SELECT excerpt FROM evidence WHERE memory_id='raw'`).get()?.excerpt, 'the words')
+  assert.equal(db.prepare(`SELECT count(*) c FROM sqlite_master WHERE type='trigger'`).get().c, 9)
+
+  // The new layers are now expressible, and nonsense is still refused.
+  db.exec(`INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+    VALUES ('sc','fact','repo-local','active','a scenario','b','derived',${now},${now},2)`)
+  assert.throws(() =>
+    db.exec(`INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+      VALUES ('bad','fact','repo-local','active','t','b','derived',${now},${now},9)`),
+  )
+  // A derived row of any layer still cannot be aged out row by row.
+  assert.throws(() => db.exec(`UPDATE memories SET status='dormant' WHERE id='sc'`))
+
+  // D9 now spans layers: touching the raw set clears the scenario too.
+  db.exec(`UPDATE memories SET title='edited' WHERE id='raw'`)
+  assert.equal(
+    db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c,
+    0,
+    'the widened triggers retire every layer, not just the old boolean rollup',
+  )
+  db.close()
+  cleanup(root)
+})
+
 test('foreign application_id is refused', () => {
   const root = tempRoot()
   const db = openRaw(join(root, 'm.sqlite'))

@@ -592,12 +592,21 @@ const overflow = async (service, principal, n = 60) => {
   }
 }
 
-const rollupReply = (text) => ({
-  stream: async function* () {
-    yield { type: 'text-delta', index: 0, text }
-    yield { type: 'finish', reason: { kind: 'stop' } }
-  },
-})
+/**
+ * A rollup reply. The job now expects scenario blocks as strict JSON, so a
+ * bare string is sugar for "one scenario with this body"; pass an array of
+ * {title, body} to exercise several.
+ */
+const rollupReply = (reply) => {
+  const scenarios =
+    typeof reply === 'string' ? [{ title: 'General', body: reply }] : reply
+  return {
+    stream: async function* () {
+      yield { type: 'text-delta', index: 0, text: JSON.stringify({ scenarios }) }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+}
 
 test('derived layer engages only on overflow and replaces the raw set', async () => {
   const { root, registry, principal, ctx, service } = setup()
@@ -636,12 +645,12 @@ test('any authoritative write retires the rollup and bumps the revision', async 
     ctx, store, claimNextJob(store, Date.now(), Date.now() + 60_000),
     { expectedRevision: rev, provider: 'p', model: 'm' }, new AbortController().signal,
   )
-  assert.equal(store.db.prepare(`SELECT count(*) c FROM memories WHERE derived = 1`).get().c, 1)
+  assert.equal(store.db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c, 1)
 
   // One more save invalidates it.
   await service.propose({ title: 'new thing', body: 'changes the set', kind: 'fact' }, principal)
   assert.equal(
-    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived = 1`).get().c,
+    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c,
     0,
     'the summary built from the old snapshot is gone',
   )
@@ -673,7 +682,7 @@ test('a PIPELINE write retires the rollup too, not just a tool write', async () 
     ctx, store, claimNextJob(store, Date.now(), Date.now() + 60_000),
     { expectedRevision: rev, provider: 'p', model: 'm' }, new AbortController().signal,
   )
-  assert.equal(store.db.prepare(`SELECT count(*) c FROM memories WHERE derived = 1`).get().c, 1)
+  assert.equal(store.db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c, 1)
   const afterRollup = readRevision(store)
 
   // A reconcile-shaped commit: flip a candidate to active through the JOB
@@ -693,7 +702,7 @@ test('a PIPELINE write retires the rollup too, not just a tool write', async () 
   })
 
   assert.equal(
-    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived = 1`).get().c,
+    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c,
     0,
     'a pipeline write must retire the summary built from the old snapshot',
   )
@@ -703,6 +712,60 @@ test('a PIPELINE write retires the rollup too, not just a tool write', async () 
     queryInjectionRows(store).some((hit) => hit.body.includes('PNPM')),
     'the fresh fact is no longer hidden behind a stale summary',
   )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('L2: a rebuild emits scenario blocks, and they vanish with their L1 (D9)', async () => {
+  // The two acceptance criteria for 4x4 phase 2 (docs/design/4x4-memory.md §5).
+  // A scenario block is an ordinary row at `derived = LAYER.SCENARIO`, so it
+  // inherits D9 without a single line of new invalidation code — that
+  // inheritance is the whole reason the layer is a widened column rather than
+  // a new table.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await overflow(service, principal)
+
+  ctx.get = (name) =>
+    name === 'llm'
+      ? rollupReply([
+          { title: 'Auth refactor', body: 'tokens now rotate on refresh; see auth/*' },
+          { title: 'CI and release', body: 'tag, build, publish; never npm, always pnpm' },
+        ])
+      : undefined
+  const rev0 = readRevision(store)
+  enqueueJob(store, 'rebuild', 'rb-l2', { expectedRevision: rev0, provider: 'p', model: 'm' }, 0)
+  await runRebuildJob(
+    ctx, store, claimNextJob(store, Date.now(), Date.now() + 60_000),
+    { expectedRevision: rev0, provider: 'p', model: 'm' }, new AbortController().signal,
+  )
+
+  // 1) Several blocks, each its own row at the scenario layer — not one summary.
+  const blocks = store.db
+    .prepare(`SELECT title, derived FROM memories WHERE derived != 0 ORDER BY title`)
+    .all()
+  assert.deepEqual(blocks.map((b) => b.title), ['Auth refactor', 'CI and release'])
+  assert.deepEqual([...new Set(blocks.map((b) => b.derived))], [2], 'stored at LAYER.SCENARIO')
+
+  // Injection carries the scenarios instead of the raw set, within budget.
+  const packet = buildContextProvider(ctx, service)({ agent: principal })
+  assert.match(packet, /Auth refactor/)
+  assert.match(packet, /CI and release/)
+  assert.doesNotMatch(packet, /fact number 3 about/, 'raw entries are replaced')
+  assert.ok(estimateTokens(packet) <= 1400)
+
+  // 2) One authoritative write to the RAW layer retires every block — no new
+  // invalidation path was written for L2; it rides the v5 triggers.
+  await service.propose(
+    { title: 'a new fact', body: 'changes the set the blocks summarized', kind: 'fact' },
+    principal,
+  )
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c,
+    0,
+    'every scenario block goes when the set it described changes',
+  )
+  assert.ok(readRevision(store) > rev0, 'and the revision advanced, fencing a queued rebuild')
   registry.dispose()
   cleanup(root)
 })
@@ -741,7 +804,7 @@ test('forget refuses a generated summary and points at the real source', async (
     ctx, store, claimNextJob(store, Date.now(), Date.now() + 60_000),
     { expectedRevision: rev, provider: 'p', model: 'm' }, new AbortController().signal,
   )
-  const derived = store.db.prepare(`SELECT id FROM memories WHERE derived = 1`).get()
+  const derived = store.db.prepare(`SELECT id FROM memories WHERE derived != 0`).get()
   await assert.rejects(service.forget(derived.id, principal), /generated summary/)
   registry.dispose()
   cleanup(root)

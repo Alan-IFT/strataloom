@@ -7,7 +7,7 @@ Requires Node ≥ 22 (the plugin uses `node:sqlite`).
 ```bash
 cd packages/memory
 npm install        # platform packages come from npm; nothing else is needed
-npm run verify     # typecheck + 116 tests — do this before installing
+npm run verify     # typecheck + 118 tests — do this before installing
 npm pack           # -> strataloom-dsh-memory-0.1.0.tgz
 ```
 
