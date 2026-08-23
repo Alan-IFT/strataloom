@@ -72,12 +72,35 @@ checkout can build and test on its own.
 
 ## Publishing a release
 
-`scripts/release.sh` verifies, packs, checks the tarball actually contains
-`lib/index.js` (a tarball without it installs as an empty package — `main`
-points there and `.gitignore` excludes it), then creates or updates the GitHub
-release and prints the exact install command.
+```bash
+bash scripts/release.sh
+```
 
-## 4. Verify
+It verifies, packs, checks the tarball actually contains `lib/index.js` (a
+tarball without it installs as an empty package — `main` points there and
+`.gitignore` excludes it), then creates or updates the GitHub release and
+prints the install command.
+
+### On a headless host
+
+`gh auth login` needs no browser *on this machine*: without `--web` it uses
+the device flow, printing a one-time code you enter from a phone or laptop.
+
+```bash
+gh auth login --hostname github.com --git-protocol ssh --skip-ssh-key
+```
+
+If you would rather not store a token, pass one for a single run:
+
+```bash
+GH_TOKEN=<token with the repo scope> bash scripts/release.sh
+```
+
+The script checks authentication *before* building or tagging, so an expired
+token costs you an error message and nothing else — no half-published tag to
+clean up.
+
+## Verify
 
 After booting, the model should have `memory_recall`, `memory_propose`, and
 `memory_forget`. Save something, then check that a store appeared:

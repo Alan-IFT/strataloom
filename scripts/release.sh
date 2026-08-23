@@ -26,6 +26,29 @@ repo="Alan-IFT/strataloom"
 # Stable name: the same URL means "current" forever (see decision 2 above).
 asset="strataloom-dsh-memory.tgz"
 
+# Check authentication BEFORE doing anything with side effects. Without this,
+# an expired token makes `gh release view` fail, which reads as "no release
+# yet", which pushes the tag — and only then does `gh release create` fail,
+# leaving a pushed tag with no release behind it.
+if ! gh auth status >/dev/null 2>&1; then
+  cat >&2 <<'AUTH'
+error: not authenticated to GitHub.
+
+On a headless host, `gh auth login` still works — it prints a one-time code
+you type on any other device, no browser needed here:
+
+  gh auth login --hostname github.com --git-protocol ssh --skip-ssh-key
+
+Or, if you already have a token (needs the `repo` scope):
+
+  gh auth login --with-token < /path/to/token
+  # or, for one command only:  GH_TOKEN=... bash scripts/release.sh
+
+Nothing has been built, tagged or pushed.
+AUTH
+  exit 1
+fi
+
 echo "==> verifying (typecheck + tests)"
 npm run verify
 
@@ -50,9 +73,12 @@ echo "==> releasing $tag"
 if gh release view "$tag" >/dev/null 2>&1; then
   gh release upload "$tag" "$asset" --clobber
 else
-  git tag -a "$tag" -m "$tag" 2>/dev/null || true
-  git push origin "$tag"
+  # `gh release create --target` tags on the server, so there is no local tag
+  # to push and nothing to strand if the call fails. It also keeps the tag and
+  # the release atomic from the user's point of view: either both exist or
+  # neither does.
   gh release create "$tag" "$asset" \
+    --target "$(git rev-parse HEAD)" \
     --title "$tag" \
     --notes "Install or update — the same command either way:
 
