@@ -31,9 +31,14 @@ test('/memory lists what was learned, forgets by id, and keeps the D1 boundary',
   const repo = join(tempRoot(),'r'); mkdirSync(repo,{recursive:true})
   execFileSync('git',['init','-q'],{cwd:repo})
   const ctx = new Context()
-  await Promise.all([ctx.plugin(Timer), ctx.plugin(SystemPrompt,{}), ctx.plugin(ToolRuntime,{}),
-    ctx.plugin(AgentRegistry), ctx.plugin(SessionStore), ctx.plugin(LlmRuntime,{}), ctx.plugin(AgentLoop,{}), ctx.plugin(Commands)])
-  await ctx.plugin(memoryPlugin, { rootDir: tempRoot() })
+  const platform = [
+    ctx.plugin(Timer), ctx.plugin(SystemPrompt, {}), ctx.plugin(ToolRuntime, {}),
+    ctx.plugin(AgentRegistry), ctx.plugin(SessionStore), ctx.plugin(LlmRuntime, {}),
+    ctx.plugin(AgentLoop, {}), ctx.plugin(Commands),
+  ]
+  await Promise.all(platform)
+  const fiber = ctx.plugin(memoryPlugin, { rootDir: tempRoot() })
+  await fiber
   const { agent } = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
 
   const run = (input) => ctx.commands.execute(agent, `/memory${input ? ' ' + input : ''}`, [], new AbortController().signal)
@@ -79,4 +84,11 @@ test('/memory lists what was learned, forgets by id, and keeps the D1 boundary',
   const listed = await ctx.commands.execute(child.agent, '/memory', [], new AbortController().signal)
   assert.equal(listed.result.kind, 'success')
   assert.match(listed.result.text, /survivor/, 'reads stay open to any live agent')
+
+  // Tear the root down. The plugin owns a 30s interval, so a test that leaks
+  // its fiber keeps the whole run alive — invisible under
+  // `--test-force-exit`, and a hang under plain `npm run verify`.
+  await child.dispose?.()
+  await fiber.dispose()
+  for (const entry of [...platform].reverse()) await entry.dispose()
 })
