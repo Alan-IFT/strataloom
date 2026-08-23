@@ -6,9 +6,14 @@ Requires Node ≥ 22 (the plugin uses `node:sqlite`).
 
 ```bash
 cd packages/memory
+npm install        # platform packages come from npm; nothing else is needed
 npm run verify     # typecheck + 103 tests — do this before installing
 npm pack           # -> strataloom-dsh-memory-0.1.0.tgz
 ```
+
+The plugin declares the harness packages as *peer* dependencies (the profile
+supplies them at runtime) and mirrors them in `devDependencies` so a clean
+checkout can build and test on its own.
 
 ## 2. Install into the profile
 

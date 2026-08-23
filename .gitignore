@@ -1,3 +1,9 @@
 node_modules/
 packages/*/lib/
-.verify-v26/*.db*
+*.tgz
+
+# No lockfile: the harness packages are peer dependencies that the dsh
+# profile supplies at runtime. Pinning them here would create a second,
+# silently diverging source of truth for versions the deployment owns.
+package-lock.json
+pnpm-lock.yaml

@@ -31,7 +31,7 @@ where a memory came from.
 See [INSTALL.md](INSTALL.md). Short version:
 
 ```bash
-cd packages/memory && npm run verify && npm pack
+cd packages/memory && npm install && npm run verify && npm pack
 dsh plugin --profile web add ./strataloom-dsh-memory-0.1.0.tgz
 ```
 
@@ -87,6 +87,7 @@ verified by adversarial tests rather than asserted in prose:
 
 ```bash
 cd packages/memory
+npm install           # once
 npm run verify        # typecheck + 103 tests
 ```
 
