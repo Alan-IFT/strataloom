@@ -81,14 +81,20 @@ tarball without it installs as an empty package — `main` points there and
 `.gitignore` excludes it), then creates or updates the GitHub release and
 prints the install command.
 
-### On a headless host
+### Over SSH, or on a headless host
 
-`gh auth login` needs no browser *on this machine*: without `--web` it uses
-the device flow, printing a one-time code you enter from a phone or laptop.
+The device flow needs no browser *on this machine* — but `gh` will still try
+to open one at the "Press Enter" prompt, and if `DISPLAY` is set (X11
+forwarding, common over SSH) that launches a real browser through the tunnel:
+slow, and buried in unrelated GPU/TensorFlow warnings from Chrome. Point
+`BROWSER` at a no-op so `gh` prints the code and waits instead:
 
 ```bash
-gh auth login --hostname github.com --git-protocol ssh --skip-ssh-key
+BROWSER=true gh auth login --hostname github.com --git-protocol ssh --skip-ssh-key
 ```
+
+It prints a one-time code and a URL, then waits. Open the URL on whatever
+device you like, enter the code, and the command completes on its own.
 
 If you would rather not store a token, pass one for a single run:
 

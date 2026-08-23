@@ -34,10 +34,11 @@ if ! gh auth status >/dev/null 2>&1; then
   cat >&2 <<'AUTH'
 error: not authenticated to GitHub.
 
-On a headless host, `gh auth login` still works — it prints a one-time code
-you type on any other device, no browser needed here:
+Over SSH or on a headless host, use the device flow. `BROWSER=true` stops gh
+from launching a browser through X11 forwarding; it prints a code and waits
+while you authorize from any other device:
 
-  gh auth login --hostname github.com --git-protocol ssh --skip-ssh-key
+  BROWSER=true gh auth login --hostname github.com --git-protocol ssh --skip-ssh-key
 
 Or, if you already have a token (needs the `repo` scope):
 
