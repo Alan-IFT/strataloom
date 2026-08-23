@@ -25,7 +25,14 @@ export type MemoryId = string & { readonly [MemoryIdBrand]: true }
  * only; scope lives in the physical store).
  */
 export const MEMORY_KIND_CRITERIA = {
-  fact: 'a durable statement about this repo/codebase',
+  // `fact` and `coding` are the pair most easily confused, so each criterion
+  // names the OTHER and gives the one test that separates them: would this
+  // still be true in a different repository? `fact` is stated first because
+  // repo knowledge is the common case.
+  fact: "true of THIS repo and false elsewhere — its layout, entry points, conventions, history",
+  coding:
+    'an engineering lesson that survives a change of repository — a verified fix, an ' +
+    'approach that failed and why, a design rationale, a pitfall, a non-regression check',
   preference: 'how the user wants things done',
   procedure: 'a working sequence of steps',
 } as const satisfies Record<string, string>

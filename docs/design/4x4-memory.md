@@ -100,7 +100,7 @@ derived  0 = 原始记忆（L1）   1 = 全库摘要   2 = 场景块（L2）   3
 
 | Memory | 回答的问题 | 典型内容 | 现状 |
 |---|---|---|---|
-| **Coding** | 哪些工程经验值得带入下一次任务？ | 已验证的修复、失败方案、设计依据、陷阱、非回归检查 | ❌ **缺失** |
+| **Coding** | 哪些工程经验值得带入下一次任务？ | 已验证的修复、失败方案、设计依据、陷阱、非回归检查 | ✅ = `coding` |
 | **Repo** | Agent 需要了解这个仓库的什么？ | 架构地图、模块职责、代码入口、Commit/PR/Issue 证据 | ✅ = `fact` |
 | **Personal** | 应该如何与你沟通协作？ | 语言、语气、解释深度、结果呈现偏好 | ✅ = `preference` |
 | **Procedure** | 这类任务该如何执行？ | 步骤、检查清单、前置条件、例外、验证要求 | ✅ = `procedure` |
@@ -173,17 +173,22 @@ L2 取当前最相关的 1 块，余额留给 L1。当 L2/L3 不存在时退化�
 
 每期**独立可交付、可回滚**，且不破坏既有不变量（D1–D9）。
 
-### 阶段 1 · Coding Memory ＋ 澄清询问
-- **准备工作已完成**：kind 与其判据现为同一处定义（`MEMORY_KIND_CRITERIA`），
-  加 kind 时判据是同一行的必填项，空判据在加载期报错。此前枚举由常量派生、
-  判据却是另一处手写散文——加 `coding` 会编译通过、测试全绿，却让模型看到
-  一个无从判断的选项。
-- 在 `MEMORY_KIND_CRITERIA` 增 `coding` 及其判据（「换个仓库还成立吗」）；
-  schema v6 扩 CHECK。
-- scope 仍由调用者按条声明，**不引入 kind→scope 的默认绑定**。
-- 不确定是否长期有效时先问，而非静默存下。
-- **验收**：`fact`/`coding` 在 recall 中可分别过滤；同一条 coding 经验既能存成
-  `personal` 也能存成 `repo`（证明两维度未被绑死）。
+### 阶段 1 · Coding Memory ＋ 澄清询问 ✅ 已完成
+
+- `coding` 及其判据入 `MEMORY_KIND_CRITERIA`；同轮**收紧了 `fact` 的判据**
+  ——二者最易混淆，故各自点名对方并给出唯一测试：「换个仓库还成立吗」。
+- **schema v6**：扩 kind CHECK。SQLite 只能靠**重建表**做到，而该表挂着 9 个
+  触发器与 FTS 外部内容索引，且 `evidence.memory_id` 是 `ON DELETE CASCADE`
+  ——实测：带外键约束直接 DROP 会**删光全部证据行**（D3 所保证的可审计来源）。
+  故迁移期间关闭外键（该 pragma 在事务内无效，须在事务外切换），提交前用
+  `foreign_key_check` 复验；触发器由**唯一定义** `createMemoryTriggers` 重建，
+  不另抄一份。
+- 引导段与 extract 提示词的 kind 列表改为**渲染**，不再手写散文。
+- scope 未引入 kind→scope 绑定；澄清询问由引导实现、复用平台既有
+  `ask_user_question`，**未新建机制**（见
+  [`../decisions/0003-clarify-by-guidance-not-machinery.md`](../decisions/0003-clarify-by-guidance-not-machinery.md)）。
+- **验收（已通过）**：`fact`/`coding` 可分别过滤；同一 kind 可落两种 scope；
+  v5→v6 升级不丢证据/对话/触发器/FTS，且新 kind 可写、未知 kind 被拒。
 
 ### 阶段 2 · L2 Scenario
 - schema v6→v7：`derived` 由布尔**加宽为层级**（0 原始 / 1 全库摘要 / 2 场景 /

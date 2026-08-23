@@ -176,6 +176,52 @@ test('personal scope writes to the global store as private; repo scope stays rep
   cleanup(root)
 })
 
+test('coding memory: filterable apart from fact, and free to take either scope', async () => {
+  // The two acceptance criteria for 4x4 phase 1 (docs/design/4x4-memory.md §5).
+  // Coding is "an engineering lesson that survives a change of repository";
+  // fact is "true of THIS repo and false elsewhere". They are different kinds
+  // precisely so recall can tell them apart.
+  const { root, registry, principal, service } = setup()
+
+  await service.propose(
+    { title: 'sqlite WAL pragma order', body: 'set busy_timeout before switching journal_mode', kind: 'coding', scope: 'personal' },
+    principal,
+  )
+  await service.propose(
+    { title: 'sqlite store layout', body: 'this repo keeps its sqlite stores under packages/memory', kind: 'fact' },
+    principal,
+  )
+
+  // 1) The two kinds are separately filterable.
+  const coding = await service.recall({ query: 'sqlite', kind: 'coding' }, principal)
+  const facts = await service.recall({ query: 'sqlite', kind: 'fact' }, principal)
+  assert.deepEqual(coding.hits.map((h) => h.kind), ['coding'])
+  assert.deepEqual(facts.hits.map((h) => h.kind), ['fact'])
+  // Both are still found when the caller does not filter — recall spans scopes.
+  assert.equal((await service.recall({ query: 'sqlite' }, principal)).hits.length, 2)
+
+  // 2) kind and scope stay orthogonal: the SAME kind can go to either store.
+  // A lesson that travels is personal; one that only holds here is repo-local.
+  const repoScoped = await service.propose(
+    { title: 'our vitest shim', body: 'the vitest shim here needs a manual reset between suites', kind: 'coding' },
+    principal,
+  )
+  const global = registry.get(GLOBAL_STORE_KEY)
+  const repo = service.storeFor(principal, false)
+  assert.equal(
+    global.db.prepare(`SELECT count(*) c FROM memories WHERE kind = 'coding'`).get().c,
+    1,
+    'the portable lesson lives in the cross-repo store',
+  )
+  assert.equal(
+    repo.db.prepare(`SELECT visibility FROM memories WHERE id = ?`).get(repoScoped.id).visibility,
+    'repo-local',
+    'the repo-specific lesson stays here — no kind-to-scope binding',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
 test('D2 holds in both directions: neither store accepts the other\'s visibility', () => {
   const { root, registry } = openRegistry()
   const repo = registry.open('k1')

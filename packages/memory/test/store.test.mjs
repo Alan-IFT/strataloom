@@ -123,6 +123,58 @@ test('v4 -> v5 upgrade makes an EXISTING store invalidate on any write path', ()
   cleanup(root)
 })
 
+test('v5 -> v6 rebuilds the memories table without losing evidence or guards', () => {
+  // v6 widens the kind CHECK, which SQLite can only do by rebuilding the
+  // table. Two things make that dangerous, and both are load-bearing:
+  // `evidence.memory_id` cascades on delete (dropping the old table with
+  // foreign keys ON erases every provenance row — D3), and nine triggers plus
+  // the FTS index hang off this table. This is the upgrade real users take.
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo', 5)
+  const now = Date.now()
+  db.exec(`INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at)
+    VALUES ('keep','fact','repo-local','active','existing fact','body text','human',${now},${now})`)
+  db.exec(`INSERT INTO evidence (memory_id,kind,ref,excerpt) VALUES ('keep','session','sess-1','the exact words')`)
+  db.exec(`INSERT INTO conversations (session_id,seq,turn,label,provenance,text,created_at)
+    VALUES ('sess-1',1,1,'user','human','original turn',${now})`)
+
+  migrate(db, 'repo', 6)
+  assert.equal(userVersion(db), 6)
+
+  // Nothing was lost, including the quote that makes provenance checkable.
+  assert.equal(db.prepare(`SELECT count(*) c FROM memories`).get().c, 1)
+  assert.equal(db.prepare(`SELECT count(*) c FROM conversations`).get().c, 1)
+  assert.equal(
+    db.prepare(`SELECT excerpt FROM evidence WHERE memory_id='keep'`).get()?.excerpt,
+    'the exact words',
+    'ON DELETE CASCADE must not fire during the rebuild',
+  )
+  // The FTS external-content index still resolves against the new table.
+  assert.equal(
+    db.prepare(`SELECT count(*) c FROM memories_fts WHERE memories_fts MATCH '"existing fact"'`).get().c,
+    1,
+  )
+  // Every trigger came back: FTS sync (3), visibility guard (2), derived
+  // dormant guard (1), D9 invalidation (3).
+  assert.equal(
+    db.prepare(`SELECT count(*) c FROM sqlite_master WHERE type='trigger'`).get().c,
+    9,
+  )
+
+  // The point of the migration: the new kind is accepted, unknown ones are not.
+  db.exec(`INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at)
+    VALUES ('new','coding','repo-local','active','a lesson','travels between repos','human',${now},${now})`)
+  assert.throws(() =>
+    db.exec(`INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at)
+      VALUES ('bad','bogus','repo-local','active','t','b','human',${now},${now})`),
+  )
+  // D9 survived the rebuild: writing a non-derived row advanced the revision.
+  assert.ok(Number(db.prepare(`SELECT v FROM meta WHERE k='store_revision'`).get().v) > 0)
+  db.close()
+  cleanup(root)
+})
+
 test('foreign application_id is refused', () => {
   const root = tempRoot()
   const db = openRaw(join(root, 'm.sqlite'))

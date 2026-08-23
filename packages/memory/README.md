@@ -144,11 +144,11 @@ npm install      # platform packages from npm (peer deps, mirrored as dev deps)
 npm run verify   # tsc + the full test suite
 ```
 
-114 tests:
+116 tests:
 
 | File | Covers |
 |---|---|
-| `store.test.mjs` | migration atomicity, concurrent-migration TOCTOU regression, stepwise upgrades incl. **v4→v5 retrofitting invalidation onto an existing store**, CHECK/guard/FK enforcement, FTS trigger consistency, cross-process `BEGIN IMMEDIATE` contention |
+| `store.test.mjs` | migration atomicity, concurrent-migration TOCTOU regression, stepwise upgrades incl. **v4→v5 retrofitting invalidation** and **v5→v6 rebuilding `memories` without losing evidence or triggers**, CHECK/guard/FK enforcement, FTS trigger consistency, cross-process `BEGIN IMMEDIATE` contention |
 | `service.test.mjs` | the synchronous propose→recall→forget loop, forged agents, subagent refusal, **ordinary-fork misfire regression**, no-repo refusal, FTS phrase escaping |
 | `jobs.test.mjs` | idempotent enqueue, single-winner claims, lease expiry, fencing-before-writes, poison dead-letter, cleanup retention |
 | `pipeline.test.mjs` | provenance mapping (all categories + unknown), source suppression and relearning, reconcile decisions per kind, malformed-reply retry exits |
@@ -157,7 +157,7 @@ npm run verify   # tsc + the full test suite
 | `e2e.test.mjs` | **real agent registry + real tool dispatch + real prompt assembly**, principal vs subagent, no-repo agent, **`{{…}}` in memory content stays data** |
 | `resilience.test.mjs` | bounded busy-retry, corrupt/foreign store isolation, fencing yield, mid-tick store failure, busy-agent deferral |
 | `lifecycle.test.mjs` | activation, teardown ordering, HMR-shaped reload |
-| `layers.test.mjs` | L0 round-trip/retention/drill-down, personal scope, **bidirectional D2**, dedup and `replaces`, metrics, decay and revival, derived rollup + **revision fencing**, **a pipeline write retires the rollup (D9)**, projection/approval/secret scanning |
+| `layers.test.mjs` | L0 round-trip/retention/drill-down, personal scope, **bidirectional D2**, dedup and `replaces`, metrics, decay and revival, derived rollup + **revision fencing**, **a pipeline write retires the rollup (D9)**, **coding memory filterable apart from fact and free in either scope**, projection/approval/secret scanning |
 | `package.test.mjs` | the packed tarball installs as a dependency and loads **by package name** |
 
 The last one matters most: a plugin that only works from its source tree is

@@ -11,9 +11,9 @@ export const APPLICATION_ID = 0x53_54_4c_4d
 /**
  * Current schema version (v1 = P0 core, v2 = P1 jobs/usage/superseded_by,
  * v3 = L0 + global store, v4 = decay/derived, v5 = derived invalidation as a
- * data property rather than a write-path responsibility).
+ * data property rather than a write-path responsibility, v6 = `coding` kind).
  */
-export const TARGET_USER_VERSION = 5
+export const TARGET_USER_VERSION = 6
 
 /** Per-connection busy timeout — waits happen at BEGIN IMMEDIATE (spec §3.3). */
 export const BUSY_TIMEOUT_MS = 2_000

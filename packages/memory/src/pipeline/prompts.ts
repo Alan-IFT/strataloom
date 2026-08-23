@@ -9,6 +9,7 @@ import {
   EXTRACT_TITLE_TARGET_CHARS,
   ROLLUP_TARGET_CHARS,
 } from '../constants.ts'
+import { kindGuidance, MEMORY_KINDS } from '../types.ts'
 
 /** Bumped whenever a template's semantics change. */
 export const PROMPT_VERSION = 1
@@ -25,12 +26,14 @@ export const PAYLOAD_VERSION = 1
 export const extractSystemPrompt = (): string =>
   `You distill durable, re-usable memories from one agent-session transcript.
 
-Return STRICT JSON: {"candidates":[{"title":string,"body":string,"kind":"fact"|"preference"|"procedure","sourceSeqs":number[]}]}
+Return STRICT JSON: {"candidates":[{"title":string,"body":string,"kind":${MEMORY_KINDS.map(
+    (kind) => `"${kind}"`,
+  ).join('|')},"sourceSeqs":number[]}]}
 
 Rules:
 - at most 5 candidates; return {"candidates":[]} when nothing is durable;
-- a candidate must be useful BEYOND this session (facts about the repo,
-  user preferences, working procedures) — no task-progress notes, no
+- kind: ${kindGuidance()};
+- a candidate must be useful BEYOND this session — no task-progress notes, no
   one-off values, no secrets/credentials/tokens (omit them entirely);
 - title: one imperative line ≤${EXTRACT_TITLE_TARGET_CHARS} chars; body: ≤${EXTRACT_BODY_TARGET_CHARS} chars, self-contained;
 - sourceSeqs: the transcript event seq numbers the candidate came from
