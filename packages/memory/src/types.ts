@@ -1,0 +1,153 @@
+/**
+ * Value objects shared by the Service, the tools, and the pipeline
+ * (spec §3.2 — tool schemas and Service types have one source).
+ * @module @strataloom/dsh-memory/types
+ */
+
+declare const MemoryIdBrand: unique symbol
+
+/** Branded memory identity (spec §3.2). */
+export type MemoryId = string & { readonly [MemoryIdBrand]: true }
+
+/** Content kinds — content classification only; scope lives in the physical store (spec §2.2). */
+export type MemoryKind = 'fact' | 'preference' | 'procedure'
+
+/** The domain kind enum as a runtime tuple (schema CHECK and tool enum share it). */
+export const MEMORY_KINDS = ['fact', 'preference', 'procedure'] as const
+
+/** Memory lifecycle states (spec §3.3). */
+export type MemoryStatus =
+  | 'candidate'
+  | 'active'
+  | 'superseded'
+  | 'dormant'
+  | 'archived'
+  | 'tombstone'
+
+/** Provenance enum (spec §2.4 — assignment paths are exhaustively service-owned, D1/D3). */
+export type Provenance =
+  | 'human'
+  | 'principal-explicit'
+  | 'parent-agent'
+  | 'subagent'
+  | 'tool-output'
+  | 'derived'
+
+/**
+ * Provenances allowed into the default injection packet
+ * (spec §2.3 content filter; subagent/tool-output are recall-only).
+ */
+export const INJECTABLE_PROVENANCE: readonly Provenance[] = [
+  'human',
+  'principal-explicit',
+  'parent-agent',
+]
+
+/**
+ * Injection ordering priority (higher first). human > principal-explicit >
+ * parent-agent > the rest (spec §2.3).
+ */
+export const PROVENANCE_PRIORITY: Readonly<Record<Provenance, number>> = {
+  human: 5,
+  'principal-explicit': 4,
+  'parent-agent': 3,
+  subagent: 2,
+  'tool-output': 1,
+  derived: 0,
+}
+
+/** Statuses excluded from every read surface (spec §3.3 排除规则). */
+export const EXCLUDED_STATUSES: readonly MemoryStatus[] = [
+  'superseded',
+  'tombstone',
+  'archived',
+  'candidate',
+  // Dormant entries stay stored and revivable but leave every read surface —
+  // that removal IS the point of decay. Revival happens in the decay batch,
+  // never on a read (D4).
+  'dormant',
+]
+
+/** Recall query (spec §3.2 — no level/derived parameters). */
+export interface RecallQuery {
+  readonly query: string
+  readonly kind?: MemoryKind
+}
+
+/**
+ * One memory as every read path returns it. Both queries (injection and
+ * recall) select exactly these columns, so this is simultaneously the row
+ * shape and the public hit shape — the status/provenance/timestamp columns
+ * decide *which* rows come back and in what order, but no consumer reads
+ * them, so fetching them would be work done to be discarded.
+ */
+export interface MemoryHit {
+  readonly id: MemoryId
+  readonly kind: MemoryKind
+  readonly title: string
+  readonly body: string
+}
+
+/** Public alias: what `recall()` hands back per hit. */
+export type RecallHit = MemoryHit
+
+/** Recall result — rendered by the tool within the §4.3 budget. */
+export interface RecallResult {
+  readonly hits: readonly RecallHit[]
+}
+
+/**
+ * Where a memory belongs. `repo` is this checkout's knowledge; `personal` is
+ * the cross-repo user profile (Personal Memory) — how the user wants to be
+ * worked with, valid in every repository.
+ *
+ * Scope selects the physical store, and the store's guard derives visibility
+ * from its own kind: a caller declares intent but can never assert
+ * visibility itself (D1/D2).
+ */
+export type MemoryScope = 'repo' | 'personal'
+
+/** The scope enum as a runtime tuple (tool schema and service share it). */
+export const MEMORY_SCOPES = ['repo', 'personal'] as const
+
+/** Candidate content for propose — no visibility/provenance fields by design (D1). */
+export interface MemoryCandidate {
+  readonly title: string
+  readonly body: string
+  readonly kind: MemoryKind
+  /** Defaults to `repo` when omitted. */
+  readonly scope?: MemoryScope
+  /**
+   * Id of an existing active memory this one supersedes. The caller model
+   * decides equivalence — it can see the existing entries; code cannot judge
+   * semantics and must not guess.
+   */
+  readonly replaces?: MemoryId
+}
+
+/**
+ * What a save returns: the new id, plus any active memories that already
+ * cover similar ground. The model uses `similar` to collapse duplicates via
+ * `replaces` — surfacing the overlap is code's job, judging equivalence is
+ * the model's.
+ */
+export interface ProposeResult {
+  readonly id: MemoryId
+  readonly similar: readonly MemoryHit[]
+}
+
+/** Result of a share attempt (spec §12 projection). */
+export interface ShareReport {
+  readonly id: MemoryId
+  readonly shared: boolean
+  readonly note: string
+}
+
+/** Forget report (spec §3.2/§6). */
+export interface ForgetReport {
+  readonly id: MemoryId
+  readonly suppressedRefs: number
+  readonly note: string
+}
+
+

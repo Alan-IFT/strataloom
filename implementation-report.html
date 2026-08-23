@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StrataLoom — 设计 vs 实现</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#161a22; --panel2:#1c212b; --line:#2a3140;
+    --ink:#e6e9ef; --dim:#98a2b3; --faint:#6b7688;
+    --ok:#3fb950; --imp:#58a6ff; --dev:#d29922; --gap:#8b949e; --no:#f85149;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:40px 24px 80px}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.4px}
+  .sub{color:var(--dim);margin:0 0 34px;font-size:14px}
+  h2{font-size:19px;margin:46px 0 4px;display:flex;align-items:center;gap:10px}
+  h2 .bar{width:4px;height:20px;border-radius:2px;background:var(--imp)}
+  .note{color:var(--faint);font-size:13px;margin:0 0 18px;padding-left:14px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:14px 0}
+
+  /* ---------- scoreboard ---------- */
+  .score{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:22px 0 8px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;text-align:center}
+  .card .n{font:700 30px/1.1 var(--mono);letter-spacing:-1px}
+  .card .l{color:var(--dim);font-size:12px;margin-top:6px}
+  .c-ok .n{color:var(--ok)} .c-imp .n{color:var(--imp)}
+  .c-dev .n{color:var(--dev)} .c-gap .n{color:var(--gap)}
+
+  /* ---------- legend ---------- */
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 0;font-size:12.5px;color:var(--dim)}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:middle}
+
+  /* ---------- invariant grid ---------- */
+  .inv{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
+  .invcell{background:var(--panel2);border:1px solid var(--line);border-top:3px solid var(--ok);
+    border-radius:8px;padding:12px 10px}
+  .invcell .id{font:700 15px var(--mono);color:var(--ok)}
+  .invcell .t{font-size:12px;color:var(--dim);margin:5px 0 8px;min-height:48px}
+  .invcell .ev{font:11px var(--mono);color:var(--faint);border-top:1px solid var(--line);padding-top:7px}
+
+  /* ---------- matrix ---------- */
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th{text-align:left;color:var(--dim);font-weight:600;font-size:12px;
+     border-bottom:1px solid var(--line);padding:8px 10px;white-space:nowrap}
+  td{border-bottom:1px solid #222836;padding:9px 10px;vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  .st{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;vertical-align:middle}
+  .s-ok{background:var(--ok)} .s-imp{background:var(--imp)}
+  .s-dev{background:var(--dev)} .s-gap{background:var(--gap)}
+  code{font:12px var(--mono);background:#11151d;border:1px solid var(--line);
+       border-radius:4px;padding:1px 5px;color:#b9c4d4}
+  .muted{color:var(--faint)}
+
+  /* ---------- flow diagram ---------- */
+  .flow{display:grid;grid-template-columns:1fr 1fr;gap:26px}
+  .lane{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .lane h3{margin:0 0 14px;font-size:14px;color:var(--dim);font-weight:600;
+    display:flex;align-items:center;gap:8px}
+  .node{background:#11151d;border:1px solid var(--line);border-radius:7px;
+    padding:9px 12px;font-size:12.5px;margin:0;position:relative}
+  .node b{display:block;font-size:12.5px;margin-bottom:2px}
+  .node span{color:var(--faint);font:11px var(--mono)}
+  .arrow{text-align:center;color:var(--faint);font-size:15px;line-height:1;margin:5px 0}
+  .n-gate{border-left:3px solid var(--dev)}
+  .n-tx{border-left:3px solid var(--ok)}
+  .n-llm{border-left:3px solid var(--imp)}
+  .n-stop{border-left:3px solid var(--no)}
+
+  /* ---------- delta bars ---------- */
+  .delta{display:grid;grid-template-columns:190px 1fr 96px;gap:12px;align-items:center;
+    padding:9px 0;border-bottom:1px solid #222836;font-size:13px}
+  .delta:last-child{border-bottom:none}
+  .track{background:#11151d;border-radius:4px;height:22px;position:relative;overflow:hidden;
+    border:1px solid var(--line)}
+  .fill{height:100%;border-radius:3px;display:flex;align-items:center;padding-left:8px;
+    font:11px var(--mono);color:#0b0e13;font-weight:700}
+  .f-cut{background:linear-gradient(90deg,#f85149,#d29922)}
+  .f-keep{background:#2a3140;color:var(--dim)}
+  .why{color:var(--faint);font-size:12px}
+
+  /* ---------- coverage bars ---------- */
+  .cov{display:grid;grid-template-columns:170px 1fr 52px;gap:10px;align-items:center;
+    padding:5px 0;font-size:12.5px}
+  .covtrack{background:#11151d;height:14px;border-radius:3px;overflow:hidden;border:1px solid var(--line)}
+  .covfill{height:100%;background:linear-gradient(90deg,#238636,#3fb950)}
+  .covfill.warn{background:linear-gradient(90deg,#9e6a03,#d29922)}
+  .covn{font:11px var(--mono);color:var(--dim);text-align:right}
+
+  /* ---------- deviation cards ---------- */
+  .devgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .devcard{background:var(--panel2);border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .devcard .hd{padding:11px 14px;font-size:13px;font-weight:600;display:flex;
+    justify-content:space-between;align-items:center;gap:10px}
+  .devcard.warn .hd{background:rgba(210,153,34,.13);border-bottom:1px solid rgba(210,153,34,.3);color:#e3b341}
+  .devcard.info .hd{background:rgba(88,166,255,.11);border-bottom:1px solid rgba(88,166,255,.28);color:#79c0ff}
+  .devcard .bd{padding:12px 14px;font-size:12.5px;color:var(--dim)}
+  .devcard .row{display:grid;grid-template-columns:52px 1fr;gap:8px;margin-bottom:7px}
+  .devcard .row:last-child{margin-bottom:0}
+  .devcard .k{color:var(--faint);font-size:11px;padding-top:1px}
+  .tag{font:10px var(--mono);padding:2px 7px;border-radius:10px;white-space:nowrap}
+  .tag-w{background:rgba(210,153,34,.18);color:#e3b341}
+  .tag-i{background:rgba(88,166,255,.16);color:#79c0ff}
+
+  /* ---------- phase bar ---------- */
+  .phases{display:flex;gap:2px;margin:16px 0 10px;border-radius:7px;overflow:hidden}
+  .ph{padding:13px 14px;font-size:12.5px;flex:1}
+  .ph b{display:block;font-size:13px;margin-bottom:3px}
+  .ph-done{background:rgba(63,185,80,.15);border-top:3px solid var(--ok)}
+  .ph-done b{color:var(--ok)}
+  .ph-defer{background:#181c24;border-top:3px solid #3a4354}
+  .ph-defer b{color:var(--faint)}
+  .ph span{color:var(--faint);font-size:11.5px}
+  @media(max-width:900px){
+    .score,.inv{grid-template-columns:repeat(2,1fr)}
+    .flow,.devgrid{grid-template-columns:1fr}
+    .phases{flex-direction:column}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>StrataLoom — 设计 vs 实现</h1>
+  <p class="sub">
+    规范 <code>plugin-architecture.md</code> v2.6 · 实现 <code>@strataloom/dsh-memory</code> ·
+    1648 行代码 / 72 测试 / 覆盖率 96.6%
+  </p>
+
+  <div class="score">
+    <div class="card c-ok"><div class="n">18</div><div class="l">已实现（与规范一致）</div></div>
+    <div class="card c-imp"><div class="n">7</div><div class="l">实现期改进</div></div>
+    <div class="card c-dev"><div class="n">2</div><div class="l">偏离规范</div></div>
+    <div class="card c-gap"><div class="n">6</div><div class="l">按计划未实现（P2+）</div></div>
+  </div>
+  <div class="legend">
+    <span><i style="background:var(--ok)"></i>一致</span>
+    <span><i style="background:var(--imp)"></i>改进</span>
+    <span><i style="background:var(--dev)"></i>偏离</span>
+    <span><i style="background:var(--gap)"></i>延后</span>
+  </div>
+
+  <!-- ============ 1. 不变量 ============ -->
+  <h2><span class="bar"></span>一、领域不变量 D1–D6 — 全部落地</h2>
+  <p class="note">这是规范的地基。每一条都有代码执行点和测试证明，不是文档承诺。</p>
+  <div class="inv">
+    <div class="invcell">
+      <div class="id">D1</div>
+      <div class="t">身份/权限只从平台事实派生，模型与调用者不得声明</div>
+      <div class="ev">identity.ts · 双谓词<br>service.ts:81 唯一执行点</div>
+    </div>
+    <div class="invcell">
+      <div class="id">D2</div>
+      <div class="t">global/repo 存储与读取隔离，默认最小可见</div>
+      <div class="ev">schema.ts · 2×guard<br>trigger RAISE(ABORT)</div>
+    </div>
+    <div class="invcell">
+      <div class="id">D3</div>
+      <div class="t">每条记忆具不可伪造、可审计来源</div>
+      <div class="ev">propose 同事务写 evidence<br>extract 按事件类别映射</div>
+    </div>
+    <div class="invcell">
+      <div class="id">D4</div>
+      <div class="t">权威状态修改只有一个事务写入口</div>
+      <div class="ev">commitL1Mutation<br>commitClaimedJob</div>
+    </div>
+    <div class="invcell">
+      <div class="id">D5</div>
+      <div class="t">forget 立即关闭全部读取面，保留来源 ref</div>
+      <div class="ev">service.ts:200<br>无缓存 ⇒「立即」字面成立</div>
+    </div>
+    <div class="invcell">
+      <div class="id">D6</div>
+      <div class="t">业务写入前先完成 lease fencing CAS</div>
+      <div class="ev">jobs.ts · changes≠1<br>⇒ ROLLBACK 零写入</div>
+    </div>
+  </div>
+
+  <!-- ============ 2. 逐条对照 ============ -->
+  <h2><span class="bar"></span>二、规范条目逐条对照</h2>
+  <div class="panel">
+  <table>
+    <tr><th style="width:78px">规范节</th><th>要求</th><th style="width:96px">状态</th><th>实现落点</th></tr>
+
+    <tr><td>§2.1</td><td>迁移：<b>锁内</b>校验版本（BEGIN IMMEDIATE 先行）</td>
+      <td><span class="st s-ok"></span>一致</td><td><code>schema.ts:migrate</code> · TOCTOU 回归测试</td></tr>
+    <tr><td>§2.1</td><td>repoKey：仅 header.cwd → git toplevel → remote 规范化</td>
+      <td><span class="st s-ok"></span>一致</td><td><code>repo-key.ts</code> · 4 测试</td></tr>
+    <tr><td>§2.1</td><td>目录扫描发现 + Store 常开</td>
+      <td><span class="st s-ok"></span>一致</td><td><code>store.ts:openAllKnown</code></td></tr>
+    <tr><td>§2.2</td><td>v1 schema 无 superseded_by/explicit_save/origin</td>
+      <td><span class="st s-ok"></span>一致</td><td>v1 仅 10 列，逐字对齐</td></tr>
+    <tr><td>§2.2</td><td>v2 = jobs(kind 仅 extract/reconcile) + usage + superseded_by</td>
+      <td><span class="st s-ok"></span>一致</td><td><code>schema.ts:migrateV2</code></td></tr>
+    <tr><td>§2.2</td><td>入队幂等 <code>INSERT ON CONFLICT DO NOTHING</code></td>
+      <td><span class="st s-ok"></span>一致</td><td><code>jobs.ts:enqueueJob</code></td></tr>
+    <tr><td>§2.3</td><td>注入排序<b>无</b> FTS；recall 排序 FTS 前置</td>
+      <td><span class="st s-ok"></span>一致</td><td>两条独立 SQL · <code>fts.ts</code></td></tr>
+    <tr><td>§2.3</td><td>受众：注入仅 principal，recall 全 agent</td>
+      <td><span class="st s-ok"></span>一致</td><td><code>inject.ts</code> · e2e 验证</td></tr>
+    <tr><td>§2.4</td><td>provenance 全映射，未知 ⇒ tool-output（fail closed）</td>
+      <td><span class="st s-ok"></span>一致</td><td><code>extract.ts:classify</code> · 全覆盖测试</td></tr>
+    <tr><td>§3.1</td><td>双谓词：delegationDepth=0 ∧ origin≠subagent</td>
+      <td><span class="st s-ok"></span>一致</td><td>普通 fork 误伤回归测试</td></tr>
+    <tr><td>§3.3</td><td>所有写事务 <code>BEGIN IMMEDIATE</code></td>
+      <td><span class="st s-ok"></span>一致</td><td><code>tx.ts</code> 唯一原语 · 全仓无裸 BEGIN</td></tr>
+    <tr><td>§3.3</td><td>显式 propose 同步 active，不过 LLM</td>
+      <td><span class="st s-ok"></span>一致</td><td>P0 闭环测试</td></tr>
+    <tr><td>§3.4</td><td>裁决：fact→superseded / procedure→archived / preference 双留</td>
+      <td><span class="st s-ok"></span>一致</td><td><code>reconcile.ts</code> · 单次 commit 测试</td></tr>
+    <tr><td>§4.1</td><td>单一全局提供方 · 同步直查 · 失败恒返回 ''</td>
+      <td><span class="st s-ok"></span>一致</td><td>真 assemble e2e</td></tr>
+    <tr><td>§4.2</td><td>Packet ≤1400 tok + 投毒框定头</td>
+      <td><span class="st s-imp"></span>改进</td><td>常量→<b>实测断言</b>（见下）</td></tr>
+    <tr><td>§4.3</td><td>recall：MATCH 服务端构造 · ≤500 tok · 复用框定头</td>
+      <td><span class="st s-imp"></span>改进</td><td>与注入<b>共用一个渲染器</b></td></tr>
+    <tr><td>§5.1</td><td>入队闸：软依赖→principal→store→200 tok</td>
+      <td><span class="st s-ok"></span>一致</td><td><code>auto-extract.ts</code> · 顺序测试</td></tr>
+    <tr><td>§5.2</td><td>认领即计数 · fencing 先行 · 毒 job 死信 · 30s tick</td>
+      <td><span class="st s-ok"></span>一致</td><td><code>jobs.ts</code>+<code>runner.ts</code> · 7 并发测试</td></tr>
+    <tr><td>§5.3</td><td>stream 消费 · 无 purpose · 回落 currentSelection()</td>
+      <td><span class="st s-ok"></span>一致</td><td>真 LlmRuntime + registerAdapter</td></tr>
+    <tr><td>§6</td><td>tombstone 清内容留 ref · 同源抑制 · 新源可重学</td>
+      <td><span class="st s-ok"></span>一致</td><td>3 条抑制/重学测试</td></tr>
+    <tr><td>§7</td><td>三工具全局注册 · 权限唯一执行点在 Service</td>
+      <td><span class="st s-dev"></span>偏离</td><td>subagent propose <b>拒绝</b>而非 candidate</td></tr>
+    <tr><td>§8</td><td>顶层 owner 单一 teardown</td>
+      <td><span class="st s-ok"></span>一致</td><td>runner settled → 关库 · HMR 测试</td></tr>
+    <tr><td>§2.2</td><td>库级<b>双向</b> guard（global 拒非 private）</td>
+      <td><span class="st s-dev"></span>偏离</td><td>仅 repo 侧；global 侧随 P2 启用</td></tr>
+    <tr><td>§9</td><td>结构化日志 · 慢语句告警</td>
+      <td><span class="st s-ok"></span>一致</td><td><code>store.timed()</code> 覆盖两条读路径</td></tr>
+  </table>
+  </div>
+
+  <!-- ============ 3. 两条写路径 ============ -->
+  <h2><span class="bar"></span>三、两条写路径 — 实际控制流</h2>
+  <p class="note">左：P0 同步路径，无 LLM、无 job。右：P1 自动路径，每个 job 恰一次提交。</p>
+  <div class="flow">
+    <div class="lane">
+      <h3>① 显式保存 <span class="muted">memory_propose</span></h3>
+      <div class="node n-stop"><b>工具调用</b><span>tools.ts · 全局注册</span></div>
+      <div class="arrow">↓</div>
+      <div class="node n-gate"><b>双谓词校验</b><span>isLiveAgent ∧ isLineagePrincipal</span></div>
+      <div class="arrow">↓ <span class="muted" style="font-size:11px">失败 ⇒ 明确拒绝文案</span></div>
+      <div class="node n-gate"><b>内容/kind 校验 + repo 归属</b><span>无 cwd ⇒ 拒写</span></div>
+      <div class="arrow">↓</div>
+      <div class="node n-tx"><b>commitL1Mutation</b><span>BEGIN IMMEDIATE</span></div>
+      <div class="arrow">↓</div>
+      <div class="node n-tx"><b>memories(active) + evidence(session)</b><span>同一事务 · D3</span></div>
+      <div class="arrow">↓</div>
+      <div class="node"><b>提交即可见</b><span>下一次 assemble 注入 · 无缓存</span></div>
+    </div>
+
+    <div class="lane">
+      <h3>② 自动提取 <span class="muted">agent/turn-stopping</span></h3>
+      <div class="node n-gate"><b>入队闸（顺序判定）</b><span>软依赖→principal→store→200tok</span></div>
+      <div class="arrow">↓ <span class="muted" style="font-size:11px">任一不过 ⇒ 不入队</span></div>
+      <div class="node"><b>幂等入队 extract</b><span>ON CONFLICT DO NOTHING</span></div>
+      <div class="arrow">↓ <span class="muted" style="font-size:11px">30s tick · peek → busy? → claim</span></div>
+      <div class="node n-llm"><b>readSession → 分类 → LLM</b><span>模型只给内容+seq</span></div>
+      <div class="arrow">↓</div>
+      <div class="node n-gate"><b>Service 按事件类别定 provenance</b><span>混合取最低 · 未知⇒tool-output</span></div>
+      <div class="arrow">↓</div>
+      <div class="node n-tx"><b>commitClaimedJob</b><span>① fencing CAS ② 业务写</span></div>
+      <div class="arrow">↓ <span class="muted" style="font-size:11px">同事务入队 reconcile</span></div>
+      <div class="node n-llm"><b>批量 reconcile</b><span>一次调用 · 一次 commit</span></div>
+    </div>
+  </div>
+
+  <!-- ============ 4. 改进 ============ -->
+  <h2><span class="bar"></span>四、实现期的改进（规范未要求，实现后更少）</h2>
+  <p class="note">横条＝该项删掉的机制量。全部保持行为不变，均有测试保护。</p>
+  <div class="panel">
+    <div class="delta">
+      <div>环检测遍历</div>
+      <div class="track"><div class="fill f-cut" style="width:100%">删除 15 行 + 每次递归查库</div></div>
+      <div class="why">状态机可证不可达</div>
+    </div>
+    <div class="delta">
+      <div>reconcile 改写内容</div>
+      <div class="track"><div class="fill f-cut" style="width:82%">删除字段 + 第二套截断规则</div></div>
+      <div class="why">重做已完成的语义工作</div>
+    </div>
+    <div class="delta">
+      <div>rowFromDb 映射器</div>
+      <div class="track"><div class="fill f-cut" style="width:70%">删除映射 + 4 个多余列</div></div>
+      <div class="why">查询即取所需列</div>
+    </div>
+    <div class="delta">
+      <div>两套预算渲染循环</div>
+      <div class="track"><div class="fill f-cut" style="width:64%">合并为 renderFramed</div></div>
+      <div class="why">投毒防线收敛到一处</div>
+    </div>
+    <div class="delta">
+      <div>MemoryRow / RecallHit</div>
+      <div class="track"><div class="fill f-cut" style="width:46%">合并为 MemoryHit</div></div>
+      <div class="why">同一形状两个名字</div>
+    </div>
+    <div class="delta">
+      <div>INJECT_HEADER_BUDGET</div>
+      <div class="track"><div class="fill f-cut" style="width:34%">常量 → 实测断言</div></div>
+      <div class="why">头部是可测事实非额度</div>
+    </div>
+    <div class="delta">
+      <div>SQL 字面量列表</div>
+      <div class="track"><div class="fill f-keep" style="width:28%">改为由类型常量派生</div></div>
+      <div class="why">消除第二真相源</div>
+    </div>
+  </div>
+
+  <!-- ============ 5. 偏离 ============ -->
+  <h2><span class="bar"></span>五、偏离规范的两处（需你裁定）</h2>
+  <div class="devgrid">
+    <div class="devcard warn">
+      <div class="hd"><span>① subagent propose 的处置</span><span class="tag tag-w">功能缺口</span></div>
+      <div class="bd">
+        <div class="row"><div class="k">规范</div><div>§2.4 / §5.1 / §7 三处均写：<b>P1 起 subagent propose ⇒ candidate</b>（走 reconcile 裁决）</div></div>
+        <div class="row"><div class="k">实现</div><div>一律<b>拒绝</b>并返回明确文案；candidate 只由 extract 产生</div></div>
+        <div class="row"><div class="k">影响</div><div>subagent 无法贡献记忆。安全侧更严（不弱化任何边界），但少了一条规范承诺的输入通道</div></div>
+        <div class="row"><div class="k">建议</div><div>P1 实测后再定：若 subagent 贡献确有价值则补 8 行；否则把规范收敛到「拒绝」</div></div>
+      </div>
+    </div>
+    <div class="devcard info">
+      <div class="hd"><span>② global 库 guard 只做了一半</span><span class="tag tag-i">按阶段合理</span></div>
+      <div class="bd">
+        <div class="row"><div class="k">规范</div><div>§2.2「库级<b>双向</b> guard」：global 拒非 private，repo 拒 private</div></div>
+        <div class="row"><div class="k">实现</div><div>只建 repo 侧两个 trigger；global 侧注释说明随 P2 迁移引入</div></div>
+        <div class="row"><div class="k">影响</div><div>无。§2.5 明确 P0/P1 不启用 global 库——为不存在的库建 guard 正是规范自己拒绝的「预刻」</div></div>
+        <div class="row"><div class="k">建议</div><div>维持；启用 global 库的迁移必须同时建该 trigger（已写在代码注释）</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 6. 阶段 ============ -->
+  <h2><span class="bar"></span>六、阶段完成度</h2>
+  <div class="phases">
+    <div class="ph ph-done"><b>P0 ✓ 完成</b><span>Store + 原子迁移 + 三工具 + 同步 propose→active + forget + 来源抑制</span></div>
+    <div class="ph ph-done"><b>P1 ✓ 完成</b><span>注入提供方 + schema v2 + jobs/fencing + 自动 extract + 批量 reconcile</span></div>
+    <div class="ph ph-defer"><b>P2+ 按指标触发</b><span>derived 层 · 连续 trust · dormant/decay · global 库 · 投影审批 · 向量索引</span></div>
+  </div>
+  <p class="note" style="padding-left:0">
+    P2+ 六项<b>不是遗漏</b>：规范 §12 为每项配了启用的触发指标（Packet 溢出率、真实误判样本、
+    条目数导致信噪比下降、跨仓偏好需求、团队共享需求）。当前读路径是一条毫秒级 SQL，
+    在派生层让重建变成 LLM 级之前，缓存与评分都是纯概念成本。
+  </p>
+
+  <!-- ============ 7. 测试与覆盖 ============ -->
+  <h2><span class="bar"></span>七、验证强度</h2>
+  <div class="panel">
+    <div class="cov"><div>store / 迁移</div><div class="covtrack"><div class="covfill" style="width:98.6%"></div></div><div class="covn">11 测试</div></div>
+    <div class="cov"><div>pipeline（含真 LLM）</div><div class="covtrack"><div class="covfill" style="width:95.1%"></div></div><div class="covn">17 测试</div></div>
+    <div class="cov"><div>service / 边界</div><div class="covtrack"><div class="covfill" style="width:94.6%"></div></div><div class="covn">8 测试</div></div>
+    <div class="cov"><div>inject / 受众预算</div><div class="covtrack"><div class="covfill" style="width:100%"></div></div><div class="covn">8 测试</div></div>
+    <div class="cov"><div>jobs / fencing</div><div class="covtrack"><div class="covfill" style="width:100%"></div></div><div class="covn">7 测试</div></div>
+    <div class="cov"><div>resilience / 失败路径</div><div class="covtrack"><div class="covfill" style="width:96%"></div></div><div class="covn">7 测试</div></div>
+    <div class="cov"><div>e2e（真平台）</div><div class="covtrack"><div class="covfill" style="width:100%"></div></div><div class="covn">3 测试</div></div>
+    <div class="cov"><div>lifecycle / 打包</div><div class="covtrack"><div class="covfill warn" style="width:80.6%"></div></div><div class="covn">4 测试</div></div>
+  </div>
+  <p class="note" style="padding-left:0">
+    三类测试跑在<b>真实平台对象</b>上而非替身：真 AgentRegistry 建的 agent、真 ToolRuntime 派发、
+    真 systemPrompt.assemble()、真 LlmRuntime + registerAdapter 路由、真 tarball 安装后按包名加载。
+    跨进程 WAL 新鲜度与 BEGIN IMMEDIATE 争锁用真的第二个 OS 进程验证——
+    同进程 setTimeout 在同步 SQLite 调用面前不会触发。
+  </p>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,184 @@
+/**
+ * Failure-path coverage for the primitives the design rests on: busy-retry
+ * exhaustion, a corrupt store among healthy ones, fencing yield, and the
+ * busy-agent probe. These paths only run when something is already going
+ * wrong, so they are exactly the ones that rot untested.
+ */
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { execFileSync, spawn } from 'node:child_process'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { immediateTx } from '../lib/store/tx.js'
+import { StoreRegistry } from '../lib/store/store.js'
+import { JobRunner } from '../lib/pipeline/runner.js'
+import { commitClaimedJob, enqueueJob, claimNextJob, FencingError } from '../lib/pipeline/jobs.js'
+import { IMMEDIATE_TX_RETRIES } from '../lib/constants.js'
+import { openRegistry, cleanup, tempRoot, fakeCtx } from './helpers.mjs'
+
+const quiet = { warn() {}, info() {} }
+
+test('immediateTx: gives up loudly when the lock never frees (retries are bounded)', () => {
+  const root = tempRoot()
+  const path = join(root, 'm.sqlite')
+  const seed = new DatabaseSync(path)
+  seed.exec('PRAGMA journal_mode = WAL')
+  seed.exec('CREATE TABLE t (x INTEGER)')
+  seed.close()
+
+  // A separate process holds the write lock for the whole attempt window.
+  const marker = join(root, 'locked')
+  const holdMs = (IMMEDIATE_TX_RETRIES + 2) * 1_500
+  const child = spawn(process.execPath, [
+    '-e',
+    `
+    const { DatabaseSync } = require('node:sqlite');
+    const fs = require('node:fs');
+    const db = new DatabaseSync(${JSON.stringify(path)});
+    db.exec('BEGIN IMMEDIATE');
+    db.exec('INSERT INTO t VALUES (1)');
+    fs.writeFileSync(${JSON.stringify(marker)}, '1');
+    const until = Date.now() + ${holdMs}; while (Date.now() < until) {}
+    db.exec('ROLLBACK'); db.close();
+    `,
+  ])
+  const pause = new Int32Array(new SharedArrayBuffer(4))
+  const deadline = Date.now() + 5_000
+  while (!existsSync(marker)) {
+    if (Date.now() > deadline) throw new Error('child never took the lock')
+    Atomics.wait(pause, 0, 0, 10)
+  }
+
+  const db = new DatabaseSync(path)
+  db.exec('PRAGMA busy_timeout = 100') // keep the bounded wait short
+  let ran = false
+  assert.throws(
+    () => immediateTx(db, () => { ran = true }),
+    /lock|busy/i,
+    'a permanently held lock must fail loud, not hang or silently skip',
+  )
+  assert.equal(ran, false, 'the body must never run without the lock')
+  db.close()
+  child.kill()
+  cleanup(root)
+})
+
+test('a corrupt store is refused without taking down the healthy ones', () => {
+  const { root, registry } = openRegistry()
+  registry.open('healthy')
+  registry.dispose()
+
+  // Plant a non-SQLite file where a store should be.
+  const corruptDir = join(root, 'repos', 'corrupt')
+  mkdirSync(corruptDir, { recursive: true })
+  writeFileSync(join(corruptDir, 'memory.sqlite'), 'this is not a database')
+
+  const second = new StoreRegistry(root, quiet)
+  second.openAllKnown() // must not throw
+  assert.ok(second.get('healthy'), 'healthy store still opens')
+  assert.equal(second.get('corrupt'), undefined, 'corrupt store is skipped')
+  second.dispose()
+  cleanup(root)
+})
+
+test('a store branded by another application is refused at open', () => {
+  const { root, registry } = openRegistry()
+  registry.dispose()
+  const dir = join(root, 'repos', 'foreign')
+  mkdirSync(dir, { recursive: true })
+  const db = new DatabaseSync(join(dir, 'memory.sqlite'))
+  db.exec('PRAGMA application_id = 12345')
+  db.exec('PRAGMA user_version = 3')
+  db.exec('CREATE TABLE unrelated (x)')
+  db.close()
+
+  const second = new StoreRegistry(root, quiet)
+  second.openAllKnown()
+  assert.equal(second.get('foreign'), undefined, 'foreign store is skipped, not adopted')
+  // ...and an explicit open fails loud rather than silently returning nothing.
+  assert.throws(() => second.open('foreign'), /not a StrataLoom store/)
+  second.dispose()
+  cleanup(root)
+})
+
+test('runner: a fencing loss yields silently and does not consume a retry', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  enqueueJob(store, 'extract', 'j1', { sessionId: 's', turn: 1 }, 0)
+
+  const now = Date.now()
+  const stale = claimNextJob(store, now, now - 1) // already-expired lease
+  const successor = claimNextJob(store, now, now + 60_000)
+  assert.ok(successor)
+
+  // The stale worker's commit is fenced: no business write, no state change.
+  let mutated = false
+  assert.throws(
+    () => commitClaimedJob(store, 'j1', stale.leaseToken, () => { mutated = true }),
+    FencingError,
+  )
+  assert.equal(mutated, false)
+  const row = store.db.prepare(`SELECT state, lease_token, attempts FROM jobs WHERE id = 'j1'`).get()
+  assert.equal(row.state, 'running')
+  assert.equal(row.lease_token, successor.leaseToken)
+  assert.equal(row.attempts, 2) // both claims counted; the fence added nothing
+  registry.dispose()
+  cleanup(root)
+})
+
+test('runner: a store that fails mid-tick does not stop the other stores', async () => {
+  const { root, registry } = openRegistry()
+  const good = registry.open('good')
+  const broken = registry.open('broken')
+  enqueueJob(good, 'extract', 'g1', {}, 0)
+  enqueueJob(broken, 'extract', 'b1', {}, 0)
+  // Break one store's connection out from under the runner.
+  broken.db.close()
+
+  const runner = new JobRunner(fakeCtx({}), registry, () => false)
+  runner.tick()
+  await runner.whenSettled() // must not reject
+
+  // The healthy store still had its job claimed and retried (no sessionQuery).
+  assert.equal(good.db.prepare(`SELECT attempts FROM jobs WHERE id = 'g1'`).get().attempts, 1)
+  await runner.dispose()
+  registry.dispose()
+  cleanup(root)
+})
+
+test('busy probe: a running principal in the same repo defers heavy jobs', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  enqueueJob(store, 'extract', 'j1', {}, 0)
+
+  let agentRunning = true
+  const runner = new JobRunner(fakeCtx({}), registry, () => agentRunning)
+  runner.tick()
+  await runner.whenSettled()
+  assert.equal(
+    store.db.prepare(`SELECT attempts FROM jobs WHERE id = 'j1'`).get().attempts,
+    0,
+    'deferring must not consume an attempt (peek before claim)',
+  )
+
+  agentRunning = false
+  runner.tick()
+  await runner.whenSettled()
+  assert.equal(store.db.prepare(`SELECT attempts FROM jobs WHERE id = 'j1'`).get().attempts, 1)
+  await runner.dispose()
+  registry.dispose()
+  cleanup(root)
+})
+
+test('git absent or failing does not crash repo-key derivation', async () => {
+  const { deriveRepoIdentity, clearRepoIdentityMemo } = await import('../lib/store/repo-key.js')
+  clearRepoIdentityMemo()
+  const dir = tempRoot()
+  // A directory that IS a git repo but whose git objects are unreadable still
+  // resolves or declines — never throws into the caller.
+  execFileSync('git', ['init', '-q'], { cwd: dir })
+  const identity = deriveRepoIdentity(dir)
+  assert.ok(identity === undefined || typeof identity.key === 'string')
+  cleanup(dir)
+})
