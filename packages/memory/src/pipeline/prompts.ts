@@ -4,6 +4,11 @@
  * it was enqueued for.
  * @module @strataloom/dsh-memory/pipeline/prompts
  */
+import {
+  EXTRACT_BODY_TARGET_CHARS,
+  EXTRACT_TITLE_TARGET_CHARS,
+  ROLLUP_TARGET_CHARS,
+} from '../constants.ts'
 
 /** Bumped whenever a template's semantics change. */
 export const PROMPT_VERSION = 1
@@ -27,7 +32,7 @@ Rules:
 - a candidate must be useful BEYOND this session (facts about the repo,
   user preferences, working procedures) — no task-progress notes, no
   one-off values, no secrets/credentials/tokens (omit them entirely);
-- title: one imperative line ≤120 chars; body: ≤800 chars, self-contained;
+- title: one imperative line ≤${EXTRACT_TITLE_TARGET_CHARS} chars; body: ≤${EXTRACT_BODY_TARGET_CHARS} chars, self-contained;
 - sourceSeqs: the transcript event seq numbers the candidate came from
   (copy the seq labels verbatim; they select trust downstream);
 - output the JSON object only — no markdown fence, no commentary.`
@@ -61,7 +66,7 @@ Rules (by kind):
 export const rollupSystemPrompt = (): string =>
   `You compress a repository's stored memories into ONE compact briefing.
 
-Return PLAIN TEXT (no JSON, no markdown fence), at most 900 characters.
+Return PLAIN TEXT (no JSON, no markdown fence), at most ${ROLLUP_TARGET_CHARS} characters.
 
 Rules:
 - preserve every distinct fact, preference, and procedure; drop only wording;

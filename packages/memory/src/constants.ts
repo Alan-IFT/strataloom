@@ -8,8 +8,12 @@
 /** SQLite `application_id`: 'STLM'. */
 export const APPLICATION_ID = 0x53_54_4c_4d
 
-/** Current schema version (v1 = P0 core, v2 = P1 jobs/usage/superseded_by). */
-export const TARGET_USER_VERSION = 4
+/**
+ * Current schema version (v1 = P0 core, v2 = P1 jobs/usage/superseded_by,
+ * v3 = L0 + global store, v4 = decay/derived, v5 = derived invalidation as a
+ * data property rather than a write-path responsibility).
+ */
+export const TARGET_USER_VERSION = 5
 
 /** Per-connection busy timeout — waits happen at BEGIN IMMEDIATE (spec §3.3). */
 export const BUSY_TIMEOUT_MS = 2_000
@@ -97,6 +101,32 @@ export const LLM_MAX_TOKENS = 1_000
 export const TITLE_MAX_CHARS = 200
 /** Body length cap (fail loud beyond — propose validation). */
 export const BODY_MAX_CHARS = 2_000
+
+/**
+ * What the extract prompt ASKS the model for. Deliberately tighter than the
+ * hard caps above: an auto-distilled memory should be terser than what a human
+ * may deliberately save, and asking for the hard limit invites output that
+ * lands exactly on the truncation boundary.
+ *
+ * They live here, beside the caps they must stay below, because a target and
+ * its ceiling are one decision. `prompts.ts` interpolates them rather than
+ * restating the numbers, so the two cannot drift apart silently — and the
+ * invariant (target ≤ cap) is checked once, below.
+ */
+export const EXTRACT_TITLE_TARGET_CHARS = 120
+export const EXTRACT_BODY_TARGET_CHARS = 800
+/** What the rollup prompt asks for; it replaces the whole injectable set. */
+export const ROLLUP_TARGET_CHARS = 900
+
+/* A target above its own truncation point would ask the model for text we
+   would then cut. Cheap to assert at load; impossible to forget later. */
+if (
+  EXTRACT_TITLE_TARGET_CHARS > TITLE_MAX_CHARS ||
+  EXTRACT_BODY_TARGET_CHARS > BODY_MAX_CHARS ||
+  ROLLUP_TARGET_CHARS > BODY_MAX_CHARS
+) {
+  throw new Error('strataloom: a prompt target exceeds the hard cap it must stay below')
+}
 
 /**
  * Token estimation is chars/4 everywhere (spec §4.3: budgets are truncation

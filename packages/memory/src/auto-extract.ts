@@ -22,7 +22,7 @@ import { captureTurn } from './store/conversations.ts'
 import { enqueueJob, jobId } from './pipeline/jobs.ts'
 import { PAYLOAD_VERSION, PROMPT_VERSION } from './pipeline/prompts.ts'
 import type { ExtractPayload } from './pipeline/extract.ts'
-import { ENQUEUE_MIN_TURN_TOKENS } from './constants.ts'
+import { ENQUEUE_MIN_TURN_TOKENS, estimateTokens } from './constants.ts'
 
 /** Install the turn-stopping listener (agent-level hook, principal-gated). */
 export const installAutoExtract = (ctx: Context, memory: MemoryService): void => {
@@ -41,7 +41,7 @@ export const installAutoExtract = (ctx: Context, memory: MemoryService): void =>
       const turnTokens = events.reduce(
         (sum, event) =>
           event.provenance === 'human' || event.provenance === 'parent-agent'
-            ? sum + Math.ceil(event.text.length / 4)
+            ? sum + estimateTokens(event.text)
             : sum,
         0,
       )

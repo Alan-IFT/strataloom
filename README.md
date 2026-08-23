@@ -82,6 +82,14 @@ verified by adversarial tests rather than asserted in prose:
   state; those are derived from which store the write lands in;
 - injected memories are framed as reference data, and search input is escaped
   as literal text, so stored content cannot become instructions;
+- the injected packet is delivered as a prompt *variable value*, which the
+  platform substitutes verbatim and never rescans — so a memory containing
+  `{{…}}` (a CI matrix, a template) stays data instead of becoming prompt
+  syntax, and is preserved exactly rather than escaped;
+- all three read exits turn stored content into text through one function,
+  which renders one memory as one list item — so stored text cannot use its own
+  newlines to step outside its entry and speak to the model directly, and the
+  token budget prices the exact string the model receives;
 - sharing to the repository needs human approval **and** passes a credential
   scan before anyone is asked;
 - every authoritative write goes through one transaction entry, so a process
@@ -92,7 +100,7 @@ verified by adversarial tests rather than asserted in prose:
 ```bash
 cd packages/memory
 npm install           # once
-npm run verify        # typecheck + 103 tests
+npm run verify        # typecheck + 114 tests
 ```
 
 Tests run against the real platform where it matters: a real agent registry,

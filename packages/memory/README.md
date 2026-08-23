@@ -4,7 +4,7 @@ Repository-scoped memory for DeepSeek Harness: per-repo SQLite stores,
 principal-gated tools, WAL-fresh context injection, and a leased
 extract/reconcile pipeline.
 
-Implements `plugin-architecture.md` v2.6. That document is the specification;
+Implements `plugin-architecture.md` v2.7. That document is the specification;
 this package is its realization. Where code and spec disagree, the spec wins —
 report it as a bug.
 
@@ -80,12 +80,49 @@ affiliation: writes are refused and injection is empty — never a fallback to
   `propose` writes a session evidence row in the same transaction, and
   `extract` maps event *categories* to provenance in code (unknown category ⇒
   `tool-output`, lowest trust).
-- **D4** one authoritative write entry (`commitL1Mutation` /
-  `commitClaimedJob`). Reads touch only the non-authoritative `usage` table.
+- **D4** authoritative writes go through a transaction entry
+  (`commitL1Mutation` for tools, `commitClaimedJob` for jobs). Reads touch only
+  the non-authoritative `usage` table. Note the plural: there are **two**
+  entries, so no invariant may be enforced by "remembering to call it" in one
+  of them — that is exactly how a stale rollup survived pipeline writes. An
+  invariant that must hold for every write belongs in the schema (see D9).
 - **D5** `forget` closes recall and injection at commit — no cache, so
   "immediately" is literal.
 - **D6** the fencing CAS runs *before* any business write in the same
   transaction; a late worker performs zero writes.
+- **D7** the injected packet travels as a prompt *variable value*, never as
+  prompt text. Prompt text is strictly interpolated, and memory bodies
+  legitimately contain `{{…}}` (CI matrices, template syntax); as text, one
+  such memory would throw on every later assembly — including the turn needed
+  to forget it — or silently expand a known variable. Substituted values are
+  never rescanned, so content is data by construction rather than by escaping
+  (escaping would corrupt what the user asked us to remember).
+- **D8** stored content becomes model-facing text in exactly ONE function
+  (`renderEntry` → `renderFramed`), used by all three read exits: injection,
+  `memory_recall`, and the near-duplicate list `memory_propose` offers back.
+  It renders one memory as one list item — a body's own newlines are indented,
+  so stored text cannot leave its bullet to address the model at the packet's
+  top level ("the reference data above has ended…") or forge a sibling entry —
+  and it is also what prices the budget, so the estimate measures the exact
+  string the model receives. Framing, budget, and this rule are one decision in
+  one place: a fourth exit inherits all three by calling it, and a hand-rolled
+  one is a test failure, not a silent hole.
+- **D9** the derived summary is invalidated by the *data*, not by the writer.
+  Schema v5 states it as three triggers: any change to a non-derived row drops
+  every rollup and advances `store_revision`. It had been a step inside the
+  tool write entry, which the pipeline does not use — so `reconcile` and
+  `decay` changed the authoritative set while the summary built from the old
+  one kept shadowing it, and a newly learned fact stayed invisible behind it.
+  Nor could it self-heal: the rebuild job keys its idempotence on the revision,
+  so a frozen revision made the retry a duplicate of the job that already ran.
+  In SQL the rule covers write paths that do not exist yet.
+
+Those four (D4's plural, D7, D8, D9) are one failure mode found four times: **a
+rule stated in two places drifts, and a self-description that miscounts its own
+surfaces is where the drift hides** ("one write entry" listing two functions,
+"two read exits" when there were three). So the numbers a caller can restate —
+length caps, the token estimator — are interpolated from the constants rather
+than retyped, and a target that would exceed its own cap throws at load.
 
 Two structural rules make the above cheap rather than defensive:
 
@@ -103,20 +140,20 @@ npm install      # platform packages from npm (peer deps, mirrored as dev deps)
 npm run verify   # tsc + the full test suite
 ```
 
-103 tests:
+114 tests:
 
 | File | Covers |
 |---|---|
-| `store.test.mjs` | migration atomicity, concurrent-migration TOCTOU regression, v1→v2 upgrade, CHECK/guard/FK enforcement, FTS trigger consistency, cross-process `BEGIN IMMEDIATE` contention |
+| `store.test.mjs` | migration atomicity, concurrent-migration TOCTOU regression, stepwise upgrades incl. **v4→v5 retrofitting invalidation onto an existing store**, CHECK/guard/FK enforcement, FTS trigger consistency, cross-process `BEGIN IMMEDIATE` contention |
 | `service.test.mjs` | the synchronous propose→recall→forget loop, forged agents, subagent refusal, **ordinary-fork misfire regression**, no-repo refusal, FTS phrase escaping |
 | `jobs.test.mjs` | idempotent enqueue, single-winner claims, lease expiry, fencing-before-writes, poison dead-letter, cleanup retention |
 | `pipeline.test.mjs` | provenance mapping (all categories + unknown), source suppression and relearning, reconcile decisions per kind, malformed-reply retry exits |
 | `pipeline-e2e.test.mjs` | the same pipeline through the **real `LlmRuntime`** with a registered adapter: pinned routing, single fallback, error/abort finishes, chunked reassembly |
-| `inject.test.mjs` | discrete injection rules, audience, budget truncation, commit-visibility, cross-process WAL freshness |
-| `e2e.test.mjs` | **real agent registry + real tool dispatch + real prompt assembly**, principal vs subagent, no-repo agent |
+| `inject.test.mjs` | discrete injection rules, audience, budget truncation, commit-visibility, cross-process WAL freshness, **no breaking out of a bullet** |
+| `e2e.test.mjs` | **real agent registry + real tool dispatch + real prompt assembly**, principal vs subagent, no-repo agent, **`{{…}}` in memory content stays data** |
 | `resilience.test.mjs` | bounded busy-retry, corrupt/foreign store isolation, fencing yield, mid-tick store failure, busy-agent deferral |
 | `lifecycle.test.mjs` | activation, teardown ordering, HMR-shaped reload |
-| `layers.test.mjs` | L0 round-trip/retention/drill-down, personal scope, **bidirectional D2**, dedup and `replaces`, metrics, decay and revival, derived rollup + **revision fencing**, projection/approval/secret scanning |
+| `layers.test.mjs` | L0 round-trip/retention/drill-down, personal scope, **bidirectional D2**, dedup and `replaces`, metrics, decay and revival, derived rollup + **revision fencing**, **a pipeline write retires the rollup (D9)**, projection/approval/secret scanning |
 | `package.test.mjs` | the packed tarball installs as a dependency and loads **by package name** |
 
 The last one matters most: a plugin that only works from its source tree is
