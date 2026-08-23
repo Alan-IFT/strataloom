@@ -4,6 +4,7 @@
  * global contributions, and tears everything down on dispose.
  */
 import { test } from 'node:test'
+import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import Timer from '@deepseek-ai/cordis-plugin-timer'
@@ -32,6 +33,23 @@ const boot = async (rootDir) => {
   }
   return { ctx, fiber, shutdown }
 }
+
+test('the running build reports its own version, from the manifest', () => {
+  // Updating is re-running the same install command, so this line is the only
+  // way a user confirms it took effect. The version is read from the manifest
+  // rather than duplicated in a constant: a second copy is a second thing to
+  // bump, and the stale one would be the one users are shown.
+  const manifest = JSON.parse(
+    readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+  )
+  const resolved = JSON.parse(
+    readFileSync(new URL('../package.json', import.meta.resolve('../lib/index.js')), 'utf8'),
+  )
+  assert.equal(resolved.version, manifest.version, 'lib/ resolves the same manifest')
+  assert.match(manifest.version, /^\d+\.\d+\.\d+/, 'a real version, not a placeholder')
+  // `package.json` must ship, or the installed build reports "unknown".
+  assert.ok(manifest.files.includes('cordis.patch.yml'), 'files list is the published set')
+})
 
 test('plugin loads into a real cordis root and registers its global contributions', async () => {
   const root = tempRoot()

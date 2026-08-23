@@ -32,12 +32,16 @@ One command, no clone and no build:
 
 ```bash
 dsh plugin --profile web add \
-  https://github.com/Alan-IFT/strataloom/releases/latest/download/strataloom-dsh-memory-0.1.0.tgz
+  https://github.com/Alan-IFT/strataloom/releases/latest/download/strataloom-dsh-memory.tgz
 ```
 
 That single `add` is the whole installation: the package ships its own bundle
 patch, so `dsh` registers it as a profile layer and it loads on the next
 start. Nothing to hand-edit. Restart the harness afterwards.
+
+**Updating is the same command** — the asset name carries no version, so that
+URL always resolves to the current release. Stored memories are untouched;
+the schema migrates itself on first open.
 
 Installing from a checkout, or publishing a release: see
 [INSTALL.md](INSTALL.md).
@@ -105,7 +109,7 @@ verified by adversarial tests rather than asserted in prose:
 ```bash
 cd packages/memory
 npm install           # once
-npm run verify        # typecheck + 124 tests
+npm run verify        # typecheck + 125 tests
 ```
 
 Tests run against the real platform where it matters: a real agent registry,

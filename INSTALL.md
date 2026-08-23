@@ -8,10 +8,37 @@ One command, no clone and no build:
 
 ```bash
 dsh plugin --profile web add \
-  https://github.com/Alan-IFT/strataloom/releases/latest/download/strataloom-dsh-memory-0.1.0.tgz
+  https://github.com/Alan-IFT/strataloom/releases/latest/download/strataloom-dsh-memory.tgz
 ```
 
 Then restart the harness.
+
+## Update
+
+The same command. `latest/download/` redirects to the newest release, and the
+asset name carries no version, so that one URL always means "current".
+
+```bash
+dsh plugin --profile web add \
+  https://github.com/Alan-IFT/strataloom/releases/latest/download/strataloom-dsh-memory.tgz
+```
+
+Restart, then confirm from the log line the plugin prints at startup:
+
+```
+strataloom 0.2.0 ready (data: /home/you/.dsh/strataloom)
+```
+
+**Your memories are not touched.** They live in `~/.dsh/strataloom/`, outside
+the plugin directory, and an update only replaces code. If the new build needs
+a newer database layout it migrates each store on first open, inside one
+transaction — a store is never left half-migrated, and a store newer than the
+running build is refused rather than downgraded.
+
+There is deliberately no automatic update check: it would be this plugin's
+first outbound request, and would need an offline story, a timeout, a
+frequency nobody can justify, and a reason to send install counts anywhere.
+Watch the repository's releases instead.
 
 That single `add` is the whole installation. `dsh plugin` forwards its
 arguments to pnpm inside the profile, and reconciles the profile manifest
@@ -34,7 +61,7 @@ For a checkout you are modifying:
 ```bash
 cd packages/memory
 npm install        # platform packages come from npm; nothing else is needed
-npm run verify     # typecheck + 124 tests — do this before installing
+npm run verify     # typecheck + 125 tests — do this before installing
 npm pack           # -> strataloom-dsh-memory-0.1.0.tgz
 dsh plugin --profile web add ./strataloom-dsh-memory-0.1.0.tgz
 ```

@@ -12,6 +12,7 @@
  * one recovery path.
  * @module @strataloom/dsh-memory
  */
+import { readFileSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis-plugin-timer' // ctx.interval augmentation
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
@@ -24,6 +25,21 @@ import { installAutoExtract } from './auto-extract.ts'
 import { TICK_INTERVAL_MS } from './constants.ts'
 
 export const name = 'strataloom-memory'
+
+/**
+ * This build's version, read from the package manifest at load rather than
+ * duplicated in a constant — a second copy is a second thing to bump, and the
+ * one that goes stale is the one users are shown. Falls back to `unknown`
+ * because a manifest that cannot be read is not a reason to refuse to start.
+ */
+const VERSION: string = (() => {
+  try {
+    const manifest = new URL('../package.json', import.meta.url)
+    return (JSON.parse(readFileSync(manifest, 'utf8')) as { version?: string }).version ?? 'unknown'
+  } catch {
+    return 'unknown'
+  }
+})()
 
 /**
  * Hard dependencies only (cordis `Inject` is an array of service names; a
@@ -42,6 +58,14 @@ export interface Config {
 
 export function apply(ctx: Context, config: Config = {}): void {
   const rootDir = config.rootDir ?? dshHomePath('strataloom')
+  // Say which build is running, and where its data lives. Updating is
+  // re-running the same install command, so the one thing a user cannot
+  // otherwise confirm is whether it took effect — and if memories seem to have
+  // vanished, the answer is almost always that `rootDir` is not where they
+  // looked. Deliberately NOT a version check: that would be this plugin's
+  // first outbound request, and would need an offline story, a timeout, a
+  // frequency nobody can justify, and a reason to send installs somewhere.
+  ctx.logger.info(`strataloom ${VERSION} ready (data: ${rootDir})`)
   const stores = new StoreRegistry(rootDir, ctx.logger)
   const memory = new MemoryService(ctx, stores)
 
