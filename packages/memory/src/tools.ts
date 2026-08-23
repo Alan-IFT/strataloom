@@ -7,7 +7,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { MemoryService } from './service.ts'
+import { MemoryAccessError, MemoryInputError, type MemoryService } from './service.ts'
 import type { MemoryId, MemoryKind, MemoryScope } from './types.ts'
 import { MEMORY_KINDS, MEMORY_SCOPES } from './types.ts'
 import { renderFramed } from './recall/inject.ts'
@@ -37,6 +37,33 @@ const KIND_DESCRIPTION =
 const requireAgent = <T>(agent: T | undefined): T => {
   if (agent === undefined) throw new Error('this tool requires an owning agent session')
   return agent
+}
+
+/**
+ * Run a tool body, translating infrastructure failures into something the
+ * model can act on.
+ *
+ * `MemoryInputError`/`MemoryAccessError` are deliberate, already-phrased
+ * answers ("only the principal agent may save") and pass through untouched.
+ * Anything else is a disk, permission, or database fault: the model can
+ * neither fix nor route around it, and the raw text would hand it an
+ * internal path to reason about. Report it as unavailability, and put the
+ * real cause in the operator's log where it belongs.
+ * @param ctx - context supplying the logger.
+ * @param what - the operation name used in the log line.
+ * @param body - the tool's own work.
+ */
+const asToolFailure = async <T>(ctx: Context, what: string, body: () => Promise<T>): Promise<T> => {
+  try {
+    return await body()
+  } catch (error) {
+    if (error instanceof MemoryInputError || error instanceof MemoryAccessError) throw error
+    ctx.logger.warn(`strataloom: ${what} failed:`, error)
+    throw new Error(
+      'the memory store is unavailable right now, so this did not happen; ' +
+        'continue without it and tell the user if it keeps failing',
+    )
+  }
 }
 
 /** Register all three tools; returns nothing — disposal rides the plugin fiber. */
@@ -87,6 +114,7 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
       isConcurrencySafe: () => true,
       async execute(args, exec) {
         const agent = requireAgent(exec.agent)
+        return asToolFailure(ctx, 'recall', async () => {
         if (args.sourceOf !== undefined) {
           const turns = await memory.source(
             args.sourceOf as string as MemoryId,
@@ -112,6 +140,7 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
           agent,
         )
         return { hits: result.hits.map((hit) => ({ ...hit })) }
+        })
       },
     }),
   )
@@ -174,6 +203,7 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
       },
       async execute(args, exec) {
         const agent = requireAgent(exec.agent)
+        return asToolFailure(ctx, 'propose', async () => {
         const { id, similar } = await memory.propose(
           {
             title: args.title,
@@ -187,6 +217,7 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
           agent,
         )
         return { id, similar: similar.map((hit) => ({ ...hit })) }
+        })
       },
     }),
   )
@@ -224,12 +255,14 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
       },
       async execute(args, exec) {
         const agent = requireAgent(exec.agent)
+        return asToolFailure(ctx, 'forget', async () => {
         if (args.share === true) {
           const shared = await memory.share(args.id as string as MemoryId, agent)
           return { id: shared.id, suppressedRefs: 0, note: shared.note }
         }
         const report = await memory.forget(args.id as string as MemoryId, agent)
         return { id: report.id, suppressedRefs: report.suppressedRefs, note: report.note }
+        })
       },
     }),
   )

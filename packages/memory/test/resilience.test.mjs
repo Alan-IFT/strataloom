@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -16,10 +16,13 @@ const packageLib = join(dirname(dirname(fileURLToPath(import.meta.url))), 'lib')
 import { DatabaseSync } from 'node:sqlite'
 import { immediateTx } from '../lib/store/tx.js'
 import { StoreRegistry } from '../lib/store/store.js'
+import { MemoryService } from '../lib/service.js'
+import { registerTools } from '../lib/tools.js'
+import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import { JobRunner } from '../lib/pipeline/runner.js'
 import { commitClaimedJob, enqueueJob, claimNextJob, FencingError } from '../lib/pipeline/jobs.js'
 import { IMMEDIATE_TX_RETRIES } from '../lib/constants.js'
-import { openRegistry, cleanup, tempRoot, fakeCtx } from './helpers.mjs'
+import { openRegistry, cleanup, tempRoot, fakeAgent, fakeCtx } from './helpers.mjs'
 
 const quiet = { warn() {}, info() {} }
 
@@ -237,4 +240,52 @@ test('concurrent processes can open the same store and all their writes land', a
   store.db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('integrity-check')`)
   registry.dispose()
   cleanup(root)
+})
+
+test('an unusable store reads as unavailability, not as a filesystem error', async () => {
+  // A read-only home is the realistic shape of "the store broke": the model
+  // can neither fix nor route around it, so a raw EACCES with an internal
+  // path is noise it may try to reason about. Deliberate refusals must still
+  // survive — those ARE the answer.
+  const root = tempRoot()
+  const home = join(root, 'ro-home')
+  mkdirSync(home)
+  const repo = join(root, 'repo')
+  mkdirSync(repo)
+  execFileSync('git', ['init', '-q'], { cwd: repo })
+  chmodSync(home, 0o500)
+  try {
+    clearRepoIdentityMemo()
+    const registry = new StoreRegistry(home, quiet)
+    const memory = Object.setPrototypeOf(
+      Reflect.construct(function () {}, []),
+      MemoryService.prototype,
+    )
+    const agent = fakeAgent({ id: 'p', cwd: repo })
+    const ctx = fakeCtx({ agents: [agent] })
+    memory.ctx = ctx
+    memory.stores = registry
+
+    const registered = []
+    const toolCtx = {
+      ...ctx,
+      tools: { register: (tool) => registered.push(tool) },
+      systemPrompt: { section: () => {}, context: () => {} },
+    }
+    registerTools(toolCtx, memory)
+    const propose = registered.find((tool) => tool.name === 'memory_propose')
+
+    await assert.rejects(
+      propose.execute({ title: 't', body: 'b', kind: 'fact' }, { agent }),
+      (error) => {
+        assert.match(error.message, /unavailable/, 'phrased as unavailability')
+        assert.doesNotMatch(error.message, /EACCES|mkdir|\/tmp/, 'no internal detail leaks')
+        return true
+      },
+    )
+    registry.dispose()
+  } finally {
+    chmodSync(home, 0o700)
+    cleanup(root)
+  }
 })
