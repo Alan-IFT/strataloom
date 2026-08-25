@@ -26,6 +26,30 @@ repo="Alan-IFT/strataloom"
 # Stable name: the same URL means "current" forever (see decision 2 above).
 asset="strataloom-dsh-memory.tgz"
 
+# Refuse to re-publish a version that already has a release.
+#
+# The install URL is deliberately version-free so that one command means
+# "current" forever — but pnpm keys its store on the URL AND the package
+# version, so overwriting an existing version's asset leaves every installed
+# copy untouched: `add` reports success, reuses the cached unpack, and the new
+# code never arrives. Measured, not theorised: publishing twice as 0.1.0 left
+# a profile running the previous build while claiming to be up to date.
+#
+# The version is therefore the update signal, and forgetting to bump it is a
+# silent no-op for every user. Fail here instead.
+if gh release view "$tag" >/dev/null 2>&1; then
+  cat >&2 <<EOF
+error: $tag is already released.
+
+The install URL carries no version, so pnpm decides what to re-download from
+the package version alone. Re-publishing $version would leave existing
+installs on the old build while reporting success.
+
+Bump "version" in packages/memory/package.json, then run this again.
+EOF
+  exit 1
+fi
+
 # Check authentication BEFORE doing anything with side effects. Without this,
 # an expired token makes `gh release view` fail, which reads as "no release
 # yet", which pushes the tag — and only then does `gh release create` fail,
@@ -91,17 +115,17 @@ mv -f "$packed" "$asset"
 url="https://github.com/${repo}/releases/latest/download/${asset}"
 
 echo "==> releasing $tag"
-if gh release view "$tag" >/dev/null 2>&1; then
-  gh release upload "$tag" "$asset" --clobber
-else
-  # `gh release create --target` tags on the server, so there is no local tag
-  # to push and nothing to strand if the call fails. It also keeps the tag and
-  # the release atomic from the user's point of view: either both exist or
-  # neither does.
-  gh release create "$tag" "$asset" \
-    --target "$(git rev-parse HEAD)" \
-    --title "$tag" \
-    --notes "Install or update — the same command either way:
+# Always a fresh release: re-publishing an existing version is refused above,
+# because it would be a no-op for everyone already installed.
+#
+# `gh release create --target` tags on the server, so there is no local tag to
+# push and nothing to strand if the call fails. It also keeps the tag and the
+# release atomic from the user's point of view: either both exist or neither
+# does.
+gh release create "$tag" "$asset" \
+  --target "$(git rev-parse HEAD)" \
+  --title "$tag" \
+  --notes "Install or update — the same command either way:
 
 \`\`\`bash
 dsh plugin --profile <name> add $url
@@ -111,7 +135,6 @@ Then restart the harness. Stored memories in \`~/.dsh/strataloom/\` are kept
 across updates; the schema migrates itself on first open.
 
 Requires Node >= 22 (\`node:sqlite\`)."
-fi
 
 rm -f "$asset"
 

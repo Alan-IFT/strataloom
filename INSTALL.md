@@ -62,8 +62,8 @@ For a checkout you are modifying:
 cd packages/memory
 npm install        # platform packages come from npm; nothing else is needed
 npm run verify     # typecheck + 126 tests — do this before installing
-npm pack           # -> strataloom-dsh-memory-0.1.0.tgz
-dsh plugin --profile web add ./strataloom-dsh-memory-0.1.0.tgz
+npm pack           # -> strataloom-dsh-memory-<version>.tgz
+dsh plugin --profile web add ./strataloom-dsh-memory-<version>.tgz
 ```
 
 The plugin declares the harness packages as *peer* dependencies (the profile
