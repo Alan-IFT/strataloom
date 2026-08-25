@@ -109,7 +109,7 @@ recall 竞争的弱检索规则；实测预算内可容纳 5 块而上限 6，�
 
 ```bash
 cd packages/memory
-npm run verify        # tsc + 126 测试
+npm run verify        # tsc + 127 测试
 ```
 
 - Node ≥ 22（用 `node:sqlite`）。

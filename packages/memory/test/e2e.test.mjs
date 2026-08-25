@@ -317,3 +317,47 @@ test('e2e: parallel tool calls from one agent all commit correctly', async () =>
   await shutdown()
   cleanup(root)
 })
+
+test('e2e: an optional string/enum argument sent as "" behaves as if omitted', async () => {
+  // Many callers cannot distinguish "leave this optional field out" from
+  // "send it as an empty string" — observed directly against a real agent
+  // import: `memory_recall` got `sourceOf: ""` when only `query` was meant,
+  // and `memory_propose` got `replaces: ""` on a plain new save. Before the
+  // fix this read as "operate on the memory whose id is empty", which
+  // `kind`/`scope` could not even reach: their `enum` rejected "" at the
+  // wire-schema layer before `execute` ran at all.
+  clearRepoIdentityMemo()
+  const repo = makeRepo()
+  const root = tempRoot()
+  const { ctx, shutdown } = await boot(root)
+  const principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
+  const agent = principal.agent
+
+  // recall: sourceOf as "" must search, not fail as "no memory with id ''"
+  const bare = await callTool(ctx, agent, 'memory_recall', { query: 'nothing yet' })
+  const blank = await callTool(ctx, agent, 'memory_recall', { query: 'nothing yet', sourceOf: '', kind: '' })
+  assert.equal(bare.isError, false)
+  assert.equal(blank.isError, false)
+  assert.deepEqual(blank.value.hits, bare.value.hits, '"" behaves exactly like omitting the field')
+
+  // propose: replaces/scope as "" must be a plain new save, not "replace ''"
+  const saved = await callTool(ctx, agent, 'memory_propose', {
+    title: 'blank optionals', body: 'saved with replaces and scope both ""',
+    kind: 'fact', replaces: '', scope: '',
+  })
+  assert.equal(saved.isError, false)
+  assert.match(saved.content[0].text, /^Saved repository memory/, 'scope:"" still defaults to repo')
+
+  // A GENUINELY invalid value must still be refused — dropping `enum` from
+  // the wire schema must not silently accept nonsense.
+  const badKind = await callTool(ctx, agent, 'memory_recall', { query: 'x', kind: 'bogus' })
+  const badScope = await callTool(ctx, agent, 'memory_propose', { title: 't', body: 'b', kind: 'fact', scope: 'bogus' })
+  assert.equal(badKind.isError, true)
+  assert.match(badKind.error.message, /unknown kind/)
+  assert.equal(badScope.isError, true)
+  assert.match(badScope.error.message, /unknown scope/)
+
+  await principal.dispose?.()
+  await shutdown()
+  cleanup(root)
+})

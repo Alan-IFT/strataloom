@@ -70,7 +70,7 @@ For a checkout you are modifying:
 ```bash
 cd packages/memory
 npm install        # platform packages come from npm; nothing else is needed
-npm run verify     # typecheck + 126 tests — do this before installing
+npm run verify     # typecheck + 127 tests — do this before installing
 npm pack           # -> strataloom-dsh-memory-<version>.tgz
 dsh plugin --profile web add ./strataloom-dsh-memory-<version>.tgz
 ```

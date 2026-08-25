@@ -9,7 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { MemoryAccessError, MemoryInputError, type MemoryService } from './service.ts'
 import type { MemoryId, MemoryKind, MemoryScope } from './types.ts'
-import { kindGuidance, MEMORY_KINDS, MEMORY_SCOPES } from './types.ts'
+import { kindGuidance, MEMORY_KINDS } from './types.ts'
 import { renderFramed } from './recall/inject.ts'
 import { PROJECTION_DIR } from './projection.ts'
 import {
@@ -18,6 +18,19 @@ import {
   SOURCE_TURN_LIMIT,
   TITLE_MAX_CHARS,
 } from './constants.ts'
+
+/**
+ * Many callers cannot distinguish "omit this optional field" from "send it as
+ * an empty string" — every one of the four optional string/enum parameters
+ * below (`sourceOf`, `replaces`, `kind`, `scope`) was observed to arrive as
+ * `""` rather than being left out, which then read as a real, empty id or an
+ * invalid enum value instead of "not provided". One normalizer at the tool
+ * boundary, applied to every optional string argument, so the ambiguity is
+ * resolved once instead of once per parameter (and once per place a future
+ * parameter is added).
+ */
+const orUndefined = (value: string | undefined): string | undefined =>
+  value === undefined || value === '' ? undefined : value
 
 /**
  * The wire shape of one memory in a tool result — the schema counterpart of
@@ -99,7 +112,12 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
         },
         kind: {
           type: 'string',
-          enum: [...MEMORY_KINDS],
+          // No `enum` here on purpose: this parameter is OPTIONAL, and a caller
+          // that cannot omit an optional field sends `""` instead — with an
+          // enum, the wire-level validator rejects that before `execute` ever
+          // runs, so `orUndefined` below never gets a chance to treat it as
+          // "no filter". `service.recall` re-validates the real value anyway,
+          // so nothing unchecked reaches the store.
           description: `Optional filter: ${KIND_DESCRIPTION}.`,
         },
         sourceOf: {
@@ -129,10 +147,12 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
       isConcurrencySafe: () => true,
       async execute(args, exec) {
         const agent = requireAgent(exec.agent)
+        const sourceOf = orUndefined(args.sourceOf)
+        const kind = orUndefined(args.kind)
         return asToolFailure(ctx, 'recall', async () => {
-        if (args.sourceOf !== undefined) {
+        if (sourceOf !== undefined) {
           const turns = await memory.source(
-            args.sourceOf as string as MemoryId,
+            sourceOf as string as MemoryId,
             agent,
             SOURCE_TURN_LIMIT,
           )
@@ -151,7 +171,7 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
           throw new Error('memory_recall needs either `query` or `sourceOf`')
         }
         const result = await memory.recall(
-          { query: args.query, ...(args.kind !== undefined ? { kind: args.kind as MemoryKind } : {}) },
+          { query: args.query, ...(kind !== undefined ? { kind: kind as MemoryKind } : {}) },
           agent,
         )
         return { hits: result.hits.map((hit) => ({ ...hit })) }
@@ -184,7 +204,9 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
         kind: { type: 'string', required: true, enum: [...MEMORY_KINDS], description: KIND_DESCRIPTION },
         scope: {
           type: 'string',
-          enum: [...MEMORY_SCOPES],
+          // No `enum`, same reason as memory_recall's `kind` above: optional
+          // fields get sent as `""`, and an enum would reject that before
+          // `orUndefined` runs. `execute` re-validates the real value.
           description:
             "'repo' (default) = true of this codebase. 'personal' = how the user wants " +
             'to be worked with (language, tone, depth, format), carried to every repository.',
@@ -231,16 +253,16 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
       },
       async execute(args, exec) {
         const agent = requireAgent(exec.agent)
+        const scope = orUndefined(args.scope)
+        const replaces = orUndefined(args.replaces)
         return asToolFailure(ctx, 'propose', async () => {
         const { id, similar } = await memory.propose(
           {
             title: args.title,
             body: args.body,
             kind: args.kind as MemoryKind,
-            ...(args.scope !== undefined ? { scope: args.scope as MemoryScope } : {}),
-            ...(args.replaces !== undefined
-              ? { replaces: args.replaces as string as MemoryId }
-              : {}),
+            ...(scope !== undefined ? { scope: scope as MemoryScope } : {}),
+            ...(replaces !== undefined ? { replaces: replaces as string as MemoryId } : {}),
           },
           agent,
         )

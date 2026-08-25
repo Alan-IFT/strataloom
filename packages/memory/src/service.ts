@@ -31,7 +31,7 @@ import type {
   RecallQuery,
   RecallResult,
 } from './types.ts'
-import { LAYER, MEMORY_KINDS } from './types.ts'
+import { LAYER, MEMORY_KINDS, MEMORY_SCOPES } from './types.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -262,6 +262,9 @@ export class MemoryService extends Service {
     }
     if (!MEMORY_KINDS.includes(candidate.kind)) {
       throw new MemoryInputError(`unknown kind ${JSON.stringify(candidate.kind)}`)
+    }
+    if (candidate.scope !== undefined && !MEMORY_SCOPES.includes(candidate.scope)) {
+      throw new MemoryInputError(`unknown scope ${JSON.stringify(candidate.scope)}`)
     }
     // Scope is the caller's declared intent; visibility is derived from the
     // store that intent selects, never accepted from the caller (D1/D2).
