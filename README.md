@@ -39,9 +39,10 @@ That single `add` is the whole installation: the package ships its own bundle
 patch, so `dsh` registers it as a profile layer and it loads on the next
 start. Nothing to hand-edit. Restart the harness afterwards.
 
-**Updating is the same command** — the asset name carries no version, so that
-URL always resolves to the current release. Stored memories are untouched;
-the schema migrates itself on first open.
+**Updating** needs one extra step — see [`INSTALL.md`](INSTALL.md#update) for
+why `add` alone is a silent no-op against a URL pnpm has already resolved.
+Stored memories are untouched either way; the schema migrates itself on first
+open.
 
 Installing from a checkout, or publishing a release: see
 [INSTALL.md](INSTALL.md).

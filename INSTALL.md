@@ -15,10 +15,19 @@ Then restart the harness.
 
 ## Update
 
-The same command. `latest/download/` redirects to the newest release, and the
-asset name carries no version, so that one URL always means "current".
+`latest/download/` redirects to the newest release, and the asset name carries
+no version, so the URL always means "current" — but pnpm resolves a URL
+dependency once and pins that resolution in the lockfile. Running the install
+command again is a no-op if the URL string has not changed: pnpm sees the same
+specifier, trusts the lockfile's `integrity`, and never re-fetches. Measured,
+not assumed — running `add` again on a real profile silently kept a previous
+build in place while reporting success.
+
+Remove, then add, so pnpm treats it as a new dependency instead of reusing a
+pinned resolution:
 
 ```bash
+dsh plugin --profile web remove @strataloom/dsh-memory
 dsh plugin --profile web add \
   https://github.com/Alan-IFT/strataloom/releases/latest/download/strataloom-dsh-memory.tgz
 ```

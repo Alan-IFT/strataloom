@@ -109,11 +109,19 @@ recall 竞争的弱检索规则；实测预算内可容纳 5 块而上限 6，�
 
 ```bash
 cd packages/memory
-npm run verify        # tsc + 114 测试
+npm run verify        # tsc + 126 测试
 ```
 
 - Node ≥ 22（用 `node:sqlite`）。
-- 本机 `npm` 缓存有权限问题，`npx tsc` 会失败；测试可直接
-  `node --test --test-force-exit "test/*.test.mjs"`。
+- 本机 `npm`/`pnpm` 缓存有权限问题（沙箱不可写 `~/.npm`），需
+  `npm_config_cache=/tmp/npmcache` 之类重定向；不是代码或用户机器的问题。
+- 测试自身干净退出（已修复过一次遗漏 dispose 的泄漏），不需要
+  `--test-force-exit`——如果需要它才能退出，说明某处忘了 dispose。
+- **pnpm 更新陷阱**：稳定安装 URL（`releases/latest/download/...`）能保证
+  服务端「这个 URL 永远指向最新版」，但 pnpm 把 URL 依赖的 resolution
+  **钉在锁文件里**，同一 specifier 不会触发重新拉取——`add` 甚至
+  `update --force` 都只是无害地重跑一遍，实际文件不变。唯一可靠的更新
+  路径是先 `remove` 再 `add`（已写进 `INSTALL.md`）。这是实测发现的，不是
+  猜测：一次真实发布因此让已安装的 profile 停留在旧版本却报告成功。
 - 全量测试约 1.6 秒；跑单文件时加 `--test-force-exit`（有常驻 interval）。
 - 数据位置：`~/.dsh/strataloom/`（`global.sqlite` + `repos/<key>/`）。

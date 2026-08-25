@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Publish a release whose asset is directly installable AND updatable:
+# Publish a release whose asset is directly installable, and updatable via
+# INSTALL.md's remove-then-add (see that file for why plain `add` twice is a
+# silent no-op: pnpm pins a URL dependency's resolution in the lockfile and
+# does not re-fetch just because the server-side content changed).
 #
-#   dsh plugin --profile <name> add  https://.../releases/latest/download/strataloom-dsh-memory.tgz
-#   dsh plugin --profile <name> add  <the same URL>      # this is also the update
+#   dsh plugin --profile <name> add https://.../releases/latest/download/strataloom-dsh-memory.tgz
 #
-# Two decisions make that one URL work for both:
+# Two decisions make that URL keep working release after release:
 #
 # 1. The asset is a packed tarball with `lib/` already built. Installing from
 #    the git URL instead would need pnpm to run our `prepare` script, and pnpm
@@ -125,9 +127,16 @@ echo "==> releasing $tag"
 gh release create "$tag" "$asset" \
   --target "$(git rev-parse HEAD)" \
   --title "$tag" \
-  --notes "Install or update — the same command either way:
+  --notes "Install:
 
 \`\`\`bash
+dsh plugin --profile <name> add $url
+\`\`\`
+
+Update (plain \`add\` again is a no-op — pnpm pins the resolved URL):
+
+\`\`\`bash
+dsh plugin --profile <name> remove @strataloom/dsh-memory
 dsh plugin --profile <name> add $url
 \`\`\`
 
@@ -139,5 +148,8 @@ Requires Node >= 22 (\`node:sqlite\`)."
 rm -f "$asset"
 
 echo
-echo "install and update both use:"
+echo "install:"
+echo "  dsh plugin --profile <name> add $url"
+echo "update (remove first — plain add again is a no-op):"
+echo "  dsh plugin --profile <name> remove @strataloom/dsh-memory"
 echo "  dsh plugin --profile <name> add $url"
