@@ -145,7 +145,7 @@ npm install      # platform packages from npm (peer deps, mirrored as dev deps)
 npm run verify   # tsc + the full test suite
 ```
 
-133 tests:
+134 tests:
 
 | File | Covers |
 |---|---|

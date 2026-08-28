@@ -14,7 +14,7 @@ import { captureTurn, readTurn, pruneConversations } from '../lib/store/conversa
 import { collectTurnEvents } from '../lib/transcript.js'
 import { buildContextProvider, renderFramed } from '../lib/recall/inject.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
-import { L0_RETENTION_MS } from '../lib/constants.js'
+import { L0_RETENTION_MS, ROLLUP_TRANSCRIPT_CHARS } from '../lib/constants.js'
 import { collectMetrics } from '../lib/metrics.js'
 import { RECALL_NO_MATCH } from '../lib/tools.js'
 import { runDecayJob } from '../lib/pipeline/decay.js'
@@ -942,6 +942,58 @@ test('a rebuild queued for a superseded revision is fenced without an LLM call',
   assert.equal(built, false, 'fenced')
   assert.equal(called, false, 'no tokens burned on a stale snapshot')
   assert.equal(store.db.prepare(`SELECT state FROM jobs WHERE id = 'rb1'`).get().state, 'done')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('a rollup bounds the prompt it builds from an unbounded overflow', async () => {
+  // The live failure this closes: the derived layer is triggered BY an
+  // overflow, so its input grew with the very condition that triggers it.
+  // A store with 27 mostly-Chinese memories produced a 12574-character
+  // prompt, which together with the reply it invites finished as
+  // `max-tokens` — after the output cap had already been raised once.
+  // Raising it again would work around the same cause twice; the input is
+  // what was never bounded, unlike `extract`, which always had a cap.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  for (let i = 0; i < 40; i++) {
+    await service.propose(
+      { title: `记忆条目 ${i}`, body: '正文'.repeat(200), kind: 'fact' },
+      principal,
+    )
+  }
+
+  let sent = ''
+  ctx.get = (name) =>
+    name === 'llm'
+      ? {
+          stream: ({ messages }) => {
+            sent = messages[0].content[0].text
+            return {
+              async *[Symbol.asyncIterator]() {
+                yield { type: 'text-delta', text: JSON.stringify({ scenarios: [{ title: '场景', body: '正文' }] }) }
+                yield { type: 'finish', reason: { kind: 'stop' } }
+              },
+            }
+          },
+        }
+      : undefined
+
+  const revision = readRevision(store)
+  enqueueJob(store, 'rebuild', 'rb-cap', { expectedRevision: revision, provider: 'p', model: 'm' }, 0)
+  await runRebuildJob(
+    ctx, store, claimNextJob(store, Date.now(), Date.now() + 60_000),
+    { expectedRevision: revision, provider: 'p', model: 'm' }, new AbortController().signal,
+  )
+
+  const fed = JSON.parse(sent).memories
+  assert.ok(fed.length > 0, 'a rollup of nothing is a failed rollup, not a smaller one')
+  assert.ok(fed.length < 40, 'the prompt must not grow with the overflow')
+  const chars = fed.reduce((n, m) => n + m.title.length + m.body.length, 0)
+  assert.ok(
+    chars <= ROLLUP_TRANSCRIPT_CHARS + 800,
+    `prompt content ${chars} must stay near the ${ROLLUP_TRANSCRIPT_CHARS} budget`,
+  )
   registry.dispose()
   cleanup(root)
 })

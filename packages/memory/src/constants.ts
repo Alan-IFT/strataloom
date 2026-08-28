@@ -91,6 +91,26 @@ export const DECAY_MIN_ACTIVE = 50
 /** Memories fed into one rollup (spec §12 derived layer). */
 export const ROLLUP_SOURCE_LIMIT = 200
 
+/**
+ * Character cap on the memories handed to one rollup — the input-side twin of
+ * `EXTRACT_TRANSCRIPT_CHARS`, which `rollup` never had.
+ *
+ * The derived layer exists BECAUSE the injectable set overflows its
+ * 1300-token budget, so its trigger is bounded while the prompt built from it
+ * was not: the larger the overflow, the larger the request, without limit.
+ * Measured on a live store — 27 memories became a 12574-character prompt
+ * (4769 of them Chinese, so ~6.7k tokens), and together with the ~5.9k
+ * characters the prompt invites back it finished as `max-tokens`. Raising the
+ * output cap again would work around the same root cause a second time;
+ * bounding the input removes it.
+ *
+ * Rows arrive in packet order (provenance, then recency), so a rollup that
+ * hits this cap summarises the memories the packet itself would have injected
+ * first — the truncation follows the ordering that already exists rather than
+ * inventing a second one.
+ */
+export const ROLLUP_TRANSCRIPT_CHARS = 6_000
+
 /** Decay runs at most once per this interval, per store. */
 export const DECAY_INTERVAL_MS = 86_400_000
 
@@ -124,18 +144,23 @@ export const RECONCILE_EXISTING_LIMIT = 30
  * against a runaway reply, not a budget. The real cost control is the input
  * side (transcript and source limits) and the fact that these jobs are rare.
  *
- * 4000 was still too small, and the guard below said otherwise because it
- * priced the worst reply at `chars/4 * 2` while its own comment records that
- * CJK is nearer ONE token per character — a 2x understatement in exactly the
- * language this store holds. Measured, not reasoned: of four `rebuild` jobs
- * ever run, the two with small inputs finished on attempt 1, and the one
- * summarising 27 mostly-Chinese memories burned all six attempts, while
- * extract/reconcile/decay went 68/0 across the same routes and days. The
- * rollup prompt invites 6 x (60 + 900 + 30) = 5940 characters, which is ~5940
- * tokens of Chinese against a 4000 cap: the reply arrived truncated, and a
- * truncated reply is unparseable rather than merely short.
+ * 4000 was too small, and the guard said otherwise because it priced the
+ * worst reply at `chars/4 * 2` while its own comment records that CJK is
+ * nearer ONE token per character — a 2x understatement in exactly the language
+ * this store holds. Measured: of four `rebuild` jobs ever run, the two with
+ * small inputs finished on attempt 1, while the one summarising 27
+ * mostly-Chinese memories burned all six, and extract/reconcile/decay went
+ * 68/0 across the same routes and days.
+ *
+ * 8000 was still too small, and this time the store said so directly: after
+ * the restart the revived rollup recorded `stream finished as max-tokens` in
+ * `jobs.last_error`. Whether a route counts `maxTokens` against the completion
+ * or the whole exchange is not visible from here, so the value now covers the
+ * worst EXCHANGE — bounded input plus invited reply, priced as CJK on both
+ * sides — and the assertion below derives that sum rather than trusting a
+ * number typed here.
  */
-export const LLM_MAX_TOKENS = 8_000
+export const LLM_MAX_TOKENS = 12_000
 
 /** Title length cap (fail loud beyond — propose validation). */
 export const TITLE_MAX_CHARS = 200
@@ -186,6 +211,24 @@ if (
   PERSONA_TARGET_CHARS > BODY_MAX_CHARS
 ) {
   throw new Error('strataloom: a prompt target exceeds the hard cap it must stay below')
+}
+
+/* The cap must also survive a provider that counts `maxTokens` against the
+   WHOLE exchange rather than the completion alone. Which of the two a route
+   means is not something this plugin can see, and a live rollup finished as
+   `max-tokens` with room to spare on the output side — so the honest budget is
+   the worst input plus the worst reply, priced as CJK on both sides. Bounding
+   the input (ROLLUP_TRANSCRIPT_CHARS) is what makes that sum finite at all;
+   before it, the input grew with the overflow that triggered the job.
+*/
+const worstExchangeChars =
+  ROLLUP_TRANSCRIPT_CHARS +
+  ROLLUP_MAX_SCENARIOS * (ROLLUP_TITLE_TARGET_CHARS + ROLLUP_TARGET_CHARS + 30)
+if (LLM_MAX_TOKENS < worstExchangeChars) {
+  throw new Error(
+    `strataloom: LLM_MAX_TOKENS (${LLM_MAX_TOKENS}) cannot hold the worst exchange ` +
+      `(${worstExchangeChars} CJK tokens of prompt plus reply)`,
+  )
 }
 
 /* The same rule one level up: the output cap must fit what the prompts invite.

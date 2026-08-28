@@ -45,10 +45,11 @@ import {
   PERSONA_SOURCE_LIMIT,
   ROLLUP_MAX_SCENARIOS,
   ROLLUP_SOURCE_LIMIT,
+  ROLLUP_TRANSCRIPT_CHARS,
   TITLE_MAX_CHARS,
   BODY_MAX_CHARS,
 } from '../constants.ts'
-import { LAYER } from '../types.ts'
+import { LAYER, type MemoryHit } from '../types.ts'
 import { queryInjectableSet } from '../store/fts.ts'
 import { packetTokens } from '../recall/inject.ts'
 
@@ -170,7 +171,7 @@ export const runRebuildJob = async (
     ctx,
     route,
     rollupSystemPrompt(),
-    JSON.stringify({ memories: sources }),
+    JSON.stringify({ memories: withinTranscriptBudget(sources) }),
     signal,
   )
   const scenarios = parseScenarios(parseStrictJson(reply))
@@ -194,6 +195,28 @@ export const runRebuildJob = async (
     }
   })
   return true
+}
+
+/**
+ * Take memories in packet order until the transcript budget is spent.
+ *
+ * The rollup is triggered by an overflow, so its input grows with the very
+ * condition that triggers it — an unbounded prompt built from an unbounded
+ * excess. Cutting here rather than asking the model to cope keeps the request
+ * inside what any route can answer, and the order is the packet's own
+ * (provenance, then recency), so what survives is what would have been
+ * injected first. At least one memory always goes through: a rollup of
+ * nothing is not a smaller rollup, it is a failed one.
+ */
+const withinTranscriptBudget = (rows: readonly MemoryHit[]): MemoryHit[] => {
+  const out: MemoryHit[] = []
+  let spent = 0
+  for (const row of rows) {
+    spent += row.title.length + row.body.length
+    if (spent > ROLLUP_TRANSCRIPT_CHARS && out.length > 0) break
+    out.push(row)
+  }
+  return out
 }
 
 /** One scenario block as the model returns it, already bounded. */

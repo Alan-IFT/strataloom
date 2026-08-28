@@ -1,48 +1,57 @@
 # 当前状态
 
-> 最后更新：2026-08-28 · 按真实运行数据修了三处设计缺陷（v0.3.0 / schema v9）
+> 最后更新：2026-08-28 · 重启已验收；rollup 输入无界已修（v0.3.2 / schema v9）
 > **每次工作结束时更新本页**，它是新会话的唯一入口。
 
-## ⚠️ 待办：重启 harness 才会生效
+## 重启后的真实结果（已验收）
 
-**v0.3.1** 已发布并装入 `web` profile（已核对装的确是 0.3.1、`LLM_MAX_TOKENS
-= 8000`），但**当前 harness 进程仍加载着旧代码**，故线上库仍停在
-`user_version = 7`。迁移只在 store 首次打开时执行——**重启 harness** 后自动
-完成，无需手工改库。
+迁移全部生效（8 库 v7→v9）。逐条对照预期：
 
-重启后用一条命令验收：
+- **L3 画像已真实生成**：global 得到 1 条 `derived=3`，内容做到了设计要求的
+  **外推**（概括出「先排除便宜原因再上昂贵机制」这类可迁移判断，而非罗列
+  偏好），`visibility=private` 正确，永不投影；
+- **中文检索生效**：`取舍`（2 字词）命中 3 条、`工程取舍` 命中 2 条——修复前
+  这两个都是 0 命中；
+- **死信复活生效**：Ops 的 rebuild 由 `failed` 复活并重新执行；
+- **诊断分类生效**：global 那行旧死信被正确标为 `obsolete`（revision 3 vs
+  当前 8），未误报成 `stuck`。
+
+**并且它暴露了下一个真实缺陷**（见下节）。这正是 `jobs.last_error` 的价值：
+第一次让失败原因**自己说话**，而不是靠事后推断。
+
+## rollup 的输入无界（第六轮修复，v0.3.2）
+
+Ops 的 rollup 复活后仍失败，`last_error` 直接给出原因：
+`stream finished as max-tokens`——**上限已提到 8000 仍不够**。
+
+核算真实数据后，根因不是调参：**派生层由「注入集溢出 1300 token」触发，而由此
+构建的提示词没有任何上限**——溢出越多，请求越大，无界增长。实测该库 27 条
+记忆生成 12574 字符提示词（4769 汉字，≈6.7k token），加上邀请的 ~5.9k 输出，
+任何合理上限都装不下。
+
+`extract` 一直有 `EXTRACT_TRANSCRIPT_CHARS` 限制输入，**`rollup` 从来没有**。
+补上这个缺失的孪生边界（`ROLLUP_TRANSCRIPT_CHARS = 6000`），按 packet 既有
+顺序（provenance → 新近）截断，故留下的正是本就会被优先注入的那些，**不新增
+第二套排序**。实测输入从 ~7018 token 降到 ~3561。
+
+**同时补全不变量**：原守卫只保证「上限 ≥ 输出」，但 `maxTokens` 是否含输入
+取决于 provider——这不可见，也不该赌。现改为保证「上限 ≥ 最坏输入 + 最坏
+输出」，两侧均按 CJK 定价。该守卫当场证明 8000 装不下（需 11940），**由它算出
+正确值**而非再拍一个数，故上限定为 12000。
+
+> 若只再提上限而不限输入，就是同一根因的第三次绕行。**边界补在输入侧**，
+> 上限只是随之而来的算术结果。
+
+验收命令（仓库根目录下运行）：
 
 ```bash
 node scripts/inspect.mjs --days 3650
 ```
 
-预期：`3e857510` 的 `stuck` 消失并出现 derived（L2 场景块）；`global` 出现
-1 条 derived（L3 画像）；中文检索可用（试 `memory_recall` 查「取舍」）。
-
-> **global 会保留一行 `obsolete`，那不是失败。** 它是 revision 3 时死掉的
-> 那个 job，而 store 已到 revision 8——该 id 再也不会被重新算出，属于等待
-> cleanup 的不可达垃圾（failed 行保留 30 天）。`inspect.mjs` 现在按
-> 「payload 里的 revision 是否仍等于当前 revision」把二者分开：**仍相等才叫
-> `stuck`（真卡住），不等则叫 `obsolete`（已被快照甩开）**。否则一次健康的
-> 重启会看起来像失败，而诊断工具误报比不报更糟。
-
-**逐条在真实数据副本上用「已安装的版本」预演过，不是推断**：
-
-- 8 个库全部 v7→v9，零条未索引；
-- `3e857510` 的死信 `failed→pending` **原地复活**（revision 未变、id 相同）；
-  global 因 revision 已从 3 前进到 8，会入队一个**全新** job，旧死信自然作废；
-- 拿 `3e857510` **真实的 27 行输入**跑 rollup，并让模型返回提示词允许的
-  最坏中文回复（5571 字符 / 4926 汉字）：job `done`、写入 **6 条场景块**。
-  同一份回复在旧的 4000 上限下必然截断——这正是它当初 5 连败的原因；
-- 截断路径的诊断也验过：报 `stream finished as max-tokens`，而非误导性的
-  「JSON 无效」，且该文案会被 v8 存进 `last_error`；
-- **最接近重启的一次预演**（第五轮）：用**真实的 `JobRunner`** 跑两个卡住库的
-  副本（先 `migrate` 模拟开库，再连跑 tick），结果 global 得到 1 条
-  `derived=3` 画像、ops 得到 6 条 `derived=2` 场景块，ops 的死信原地复活为
-  `done`（attempts=1），全程只发了 2 次 LLM 调用。这比逐个 handler 的验证
-  更强：它跑的是 `maintain()` + `tick()` 的真实调度路径。
-
-若 L3 再次失败，`inspect.mjs` 这次会直接打印原因，不再是 `cause not recorded`。
+> `global` 保留的那行 `obsolete` 不是失败：它是 revision 3 时死掉的 job，而
+> store 已到 8——该 id 再也算不出来，属于等 cleanup 的不可达垃圾（failed 行
+> 保留 30 天）。`inspect.mjs` 按「payload 的 revision 是否仍等于当前 revision」
+> 区分：相等才是 `stuck`（真卡住并打印 `last_error`），不等则是 `obsolete`。
 
 ### 两条死信是**两个不同的原因**（第三轮查清，推翻了第二轮的「都是路由」）
 
@@ -93,7 +102,7 @@ node scripts/inspect.mjs --days 3650
 
 ## 一句话
 
-插件**可用且已验证**（133 测试全绿，含真平台 e2e 与打包安装契约）。
+插件**可用且已验证**（134 测试全绿，含真平台 e2e 与打包安装契约）。
 **4×4 架构（D10）已全部落地**，且这次由**真实数据**证实而非仅由测试断言：
 两个仓库各有 5–6 个真实 L2 场景块。详见
 [`design/4x4-memory.md`](design/4x4-memory.md)。
@@ -239,7 +248,7 @@ recall 竞争的弱检索规则；实测预算内可容纳 5 块而上限 6，�
 
 ```bash
 cd packages/memory
-npm run verify        # tsc + 133 测试
+npm run verify        # tsc + 134 测试
 ```
 
 - Node ≥ 22（用 `node:sqlite`）。
