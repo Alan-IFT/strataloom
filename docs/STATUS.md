@@ -1,7 +1,30 @@
 # 当前状态
 
-> 最后更新：2026-08-28 · 按真实运行数据修了三处设计缺陷（schema v9）
+> 最后更新：2026-08-28 · 按真实运行数据修了三处设计缺陷（v0.3.0 / schema v9）
 > **每次工作结束时更新本页**，它是新会话的唯一入口。
+
+## ⚠️ 待办：重启 harness 才会生效
+
+v0.3.0 已发布并装入 `web` profile（已核对装的确是 0.3.0 且含 v9 代码），但
+**当前 harness 进程仍加载着旧代码**，故线上库仍停在 `user_version = 7`。
+迁移只在 store 首次打开时执行——**重启 harness** 后自动完成，无需手工改库。
+
+重启后用一条命令验收：
+
+```bash
+node scripts/inspect.mjs --days 3650
+```
+
+预期：两条 `stuck` 消失；`global` 出现 1 条 derived（L3 画像）、`3e857510`
+出现 derived（L2 场景块）；中文检索可用（试 `memory_recall` 查「取舍」）。
+
+**已在真实数据的副本上用「已安装的 0.3.0」预演过**，不是推断：8 个库全部
+v7→v9 且零条未索引；`3e857510` 的死信 `failed→pending` 原地复活（revision 未
+变，id 相同）；global 因 revision 已从 3 前进到 8，会入队一个**全新** job，
+旧死信自然作废——即 L3 有两条恢复路径，而 Ops 的 L2 正是靠本轮修复才动得了。
+
+若 L3 再次失败，`inspect.mjs` 这次会直接打印原因（v8 的 `jobs.last_error`），
+不再是 `cause not recorded`。
 
 ## 一句话
 
