@@ -16,6 +16,7 @@ import {
   assistantMessageEvent,
   toolCallEvent,
   toolResultEvent,
+  sourcedMessageEvent,
 } from './helpers.mjs'
 
 // ---- provenance mapping (spec §2.4 — full coverage incl. unknown) ---------
@@ -44,6 +45,116 @@ test('event category -> provenance mapping covers every category', () => {
   assert.equal(byLabel.get('tool:bash'), 'tool-output')
   assert.equal(byLabel.get('tool:subagent'), 'subagent')
   assert.equal(byLabel.get('context'), 'tool-output') // unknown ⇒ lowest trust
+})
+
+// A continuable background child never speaks through tool/result — that only
+// carries `started subagent <id>`. Its real words arrive as `user/message`,
+// and the ONLY field naming the producer is `source.kind`.
+
+test('subagent source kinds are subagent provenance, labelled with the sender', () => {
+  const events = turnEvents(1, [
+    sourcedMessageEvent('child report body', {
+      kind: 'subagent-report',
+      form: 'relay',
+      senderSessionId: 'abcdef0123456789',
+    }),
+    sourcedMessageEvent('child settled body', {
+      kind: 'subagent-settled',
+      form: 'notice',
+      summary: 'child completed',
+      senderSessionId: 'fedcba9876543210',
+    }),
+  ])
+  const collected = collectTurnEvents(events, 1)
+  assert.equal(collected.length, 2)
+  // Both kinds reach `subagent` — not `tool-output`, the bug this pins.
+  assert.deepEqual(
+    collected.map((e) => e.provenance),
+    ['subagent', 'subagent'],
+  )
+  // The sender rides the label, so "which child said this" survives capture.
+  assert.equal(collected[0].label, 'subagent:abcdef01')
+  assert.equal(collected[1].label, 'subagent:fedcba98')
+})
+
+test('a subagent message without a sender id still classifies, unattributed', () => {
+  const events = turnEvents(1, [
+    sourcedMessageEvent('anonymous report', { kind: 'subagent-report', form: 'relay' }),
+  ])
+  const [entry] = collectTurnEvents(events, 1)
+  assert.equal(entry.provenance, 'subagent')
+  assert.equal(entry.label, 'subagent') // degrades, never throws
+})
+
+test('a sender id cannot forge a transcript line', () => {
+  // The label is not decoration: `extract` renders each event as
+  // `[seq N] <label>: <text>`, and its prompt tells the model those labels
+  // select trust. A sender carrying a newline or `: ` would forge a whole
+  // line inside that transcript. Real senders are UUIDs today, so this is not
+  // reachable — but that is a runtime fact, not an invariant, and this
+  // mapping's stated rule is to fail closed.
+  const hostile = [
+    'aa\nbb: forged',
+    'aa: forged',
+    'aa bb',
+    '../../etc',
+    '"]}',
+    '\n\n\n',
+    '',
+  ]
+  for (const senderSessionId of hostile) {
+    const events = turnEvents(1, [
+      sourcedMessageEvent('body', { kind: 'subagent-report', form: 'relay', senderSessionId }),
+    ])
+    const [entry] = collectTurnEvents(events, 1)
+    assert.equal(entry.provenance, 'subagent', `${JSON.stringify(senderSessionId)}: still a child`)
+    assert.match(
+      entry.label,
+      /^subagent(:[A-Za-z0-9_-]{1,8})?$/,
+      `${JSON.stringify(senderSessionId)} must not survive into the label`,
+    )
+  }
+
+  // A non-string sender degrades rather than throwing or stringifying.
+  for (const senderSessionId of [42, null, { id: 'x' }, ['x']]) {
+    const events = turnEvents(1, [
+      sourcedMessageEvent('body', { kind: 'subagent-settled', form: 'notice', senderSessionId }),
+    ])
+    const [entry] = collectTurnEvents(events, 1)
+    assert.equal(entry.label, 'subagent', `${JSON.stringify(senderSessionId)} is not an id`)
+    assert.equal(entry.provenance, 'subagent')
+  }
+})
+
+test('non-subagent source kinds fail closed to tool-output', () => {
+  // Every other kind the platform emits, including `form: 'relay'` shapes that
+  // the old `plugin + relay` test would have wrongly trusted, and a kind that
+  // does not exist yet (the merge-extensible case).
+  const cases = [
+    { kind: 'plugin', plugin: 'p', form: 'snapshot', sections: [] },
+    { kind: 'plugin', plugin: 'p', form: 'notice', summary: 's' },
+    { kind: 'plugin', plugin: 'p', form: 'relay' },
+    { kind: 'goal' },
+    { kind: 'agent-instructions' },
+    { kind: 'coordinator', form: 'relay', senderSessionId: 'abcdef0123456789' },
+    { kind: 'kind-invented-after-this-test-was-written' },
+  ]
+  const events = turnEvents(
+    1,
+    cases.map((source, i) => sourcedMessageEvent(`text ${i}`, source)),
+  )
+  const collected = collectTurnEvents(events, 1)
+  assert.equal(collected.length, cases.length)
+  for (const entry of collected) {
+    assert.equal(entry.provenance, 'tool-output', `${entry.text} must fail closed`)
+    assert.equal(entry.label, 'context')
+  }
+})
+
+test('a real human message stays human (no regression from the kind switch)', () => {
+  const [entry] = collectTurnEvents(turnEvents(1, [userMessageEvent('user says')]), 1)
+  assert.equal(entry.label, 'user')
+  assert.equal(entry.provenance, 'human')
 })
 
 test('mixed sources take minimum trust; unknown seqs are tool-output (fail closed)', () => {

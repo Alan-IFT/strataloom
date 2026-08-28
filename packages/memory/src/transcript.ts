@@ -21,8 +21,42 @@ export interface TranscriptEvent {
   readonly provenance: Provenance
 }
 
-/** Tool names whose results are subagent relays, not plain tool output. */
+/**
+ * Tool names whose results carry a child agent's own words.
+ *
+ * Only true in FOREGROUND delegation (`backgroundMode: one-shot`, or an
+ * explicit `run_in_background: false`): there the tool resolves to
+ * `{ kind: 'foreground', output }` and renders the child's output blocks
+ * verbatim, so the tool result IS the subagent speaking. Under the
+ * continuable background mode the same tool renders only a receipt
+ * (`started subagent <id>`), which this set then over-trusts by one step —
+ * accepted, because the receipt is runtime-authored boilerplate carrying no
+ * child text, while dropping the set would silently demote every foreground
+ * child's answer to `tool-output`.
+ */
 const SUBAGENT_TOOL_NAMES = new Set(['subagent', 'subagent_fork'])
+
+/**
+ * Message-source kinds that mean "another agent addressed this session".
+ *
+ * The truth source for identity is `kind`, never `form`. `form` is a
+ * presentation shape — `relay`, `notice`, `snapshot` — that unrelated
+ * producers reuse, so testing it both admits strangers (any plugin may emit
+ * `relay`) and misses the real thing (a settlement notice is `notice`).
+ * `kind` is the only field the platform guarantees to name the producer.
+ *
+ * Both kinds are `subagent`, not `human`, and are deliberately kept apart
+ * upstream: `subagent-report` is content the child chose to send, while
+ * `subagent-settled` is the runtime's account of how the child ended. They
+ * share a trust level because neither is the principal human speaking.
+ */
+const SUBAGENT_SOURCE_KINDS: ReadonlySet<string> = new Set([
+  'subagent-report',
+  'subagent-settled',
+])
+
+/** How much of a sender's session id identifies it in a label. */
+const SENDER_ID_PREFIX = 8
 
 const textOf = (content: readonly { type: string; text?: string }[]): string =>
   content
@@ -30,6 +64,28 @@ const textOf = (content: readonly { type: string; text?: string }[]): string =>
     .map((block) => block.text)
     .join('\n')
 
+/**
+ * Label a child's message with WHICH child sent it, so "who said this" stays
+ * recoverable from L0 alone. The sender id rides the existing `label` column
+ * rather than a new one: attribution is part of naming the row, and a second
+ * column would let label and sender disagree.
+ * @param source - the classified message source, possibly carrying a sender.
+ * @returns `subagent:<id prefix>`, degrading to `subagent` when unattributed.
+ */
+const subagentLabel = (source: object): string => {
+  const sender = 'senderSessionId' in source ? source.senderSessionId : undefined
+  if (typeof sender !== 'string') return 'subagent'
+  // Strip anything not id-shaped BEFORE it can reach a prompt. The label is
+  // not decoration: `extract` renders an event as `[seq N] <label>: <text>`,
+  // and its prompt tells the model those seq labels select trust downstream.
+  // A sender carrying a newline or `: ` could therefore forge a whole
+  // transcript line, and this is the first label that is neither a fixed
+  // literal nor a tool name. Every sender is a UUID today and none of that is
+  // reachable — but "the ids happen to be safe right now" is a runtime fact,
+  // not an invariant, and this module's rule is to fail closed.
+  const id = sender.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, SENDER_ID_PREFIX)
+  return id === '' ? 'subagent' : `subagent:${id}`
+}
 
 /**
  * Event category → provenance (spec §2.4). This mapping IS the injection
@@ -47,10 +103,18 @@ const classify = (
     case 'user/message': {
       const source = event.data.source
       const text = textOf(event.data.content)
+      // Discriminate on `kind` alone (see SUBAGENT_SOURCE_KINDS): the previous
+      // `plugin` + `form === 'relay'` test named a combination no plugin
+      // actually emits (the type permits it; a survey of real sessions found
+      // it zero times), so it was dead code, and every real child report fell
+      // through to `tool-output`, indistinguishable from bash stdout.
       if (source.kind === 'user') return { label: 'user', text, provenance: 'human' }
-      if (source.kind === 'plugin' && 'form' in source && source.form === 'relay') {
-        return { label: 'subagent-relay', text, provenance: 'subagent' }
+      if (SUBAGENT_SOURCE_KINDS.has(source.kind)) {
+        return { label: subagentLabel(source), text, provenance: 'subagent' }
       }
+      // Everything else — plugin, goal, agent-instructions, coordinator, and
+      // any kind added after this was written — is lowest trust. Unknown means
+      // unproven, so the default must be the floor, not a guess.
       return { label: 'context', text, provenance: 'tool-output' }
     }
     case 'assistant/message':

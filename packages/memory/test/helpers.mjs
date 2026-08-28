@@ -86,6 +86,16 @@ export const userMessageEvent = (text) => ({
   data: { id: 'm', role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } },
 })
 
+/**
+ * A `user/message` carrying an arbitrary platform source shape. Continuable
+ * subagents deliver their real content this way — not through tool/result —
+ * so every source-kind classification test builds its event here.
+ */
+export const sourcedMessageEvent = (text, source) => ({
+  type: 'user/message',
+  data: { id: 'm', role: 'user', content: [{ type: 'text', text }], source },
+})
+
 export const assistantMessageEvent = (turn, text) => ({
   type: 'assistant/message',
   data: {
