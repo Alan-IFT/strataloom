@@ -60,6 +60,32 @@ interface RawCandidate {
   sourceSeqs: number[]
 }
 
+/**
+ * Parse an extract reply, treating "nothing to remember" as an ANSWER rather
+ * than a malformed one.
+ *
+ * The prompt asks for `{"candidates":[]}` when a turn holds nothing durable,
+ * and most turns hold nothing durable — so a model that answers in prose
+ * instead ("no reusable lessons here") is being cooperative, not broken.
+ * Sending that through the strict-JSON path made it a retry, and retrying a
+ * semantic judgement re-asks the same question of the same text: it cannot
+ * succeed. Measured on a live store — one turn of shell and file-read output
+ * burned all six attempts and dead-lettered with "model reply is not valid
+ * JSON", while the turns either side of it, on the same route and model,
+ * finished on attempt 1.
+ *
+ * Only THIS prompt gets the empty reading, and only when no object is present
+ * at all. A reply that does contain an object still goes through the strict
+ * parser, so a genuinely malformed one still fails loudly — `rollup` and
+ * `persona` keep the strict path entirely, because for them an unparseable
+ * reply means the work did not happen.
+ */
+const parseExtractReply = (reply: string): unknown => {
+  const text = reply.trim()
+  if (text === '' || !text.includes('{')) return { candidates: [] }
+  return parseStrictJson(text)
+}
+
 const parseCandidates = (raw: unknown): RawCandidate[] => {
   const root = raw as { candidates?: unknown }
   if (root === null || typeof root !== 'object' || !Array.isArray(root.candidates)) {
@@ -124,7 +150,7 @@ export const runExtractJob = async (
 
   const route: PinnedRoute = { provider: payload.provider, model: payload.model }
   const reply = await callPipelineLlm(ctx, route, extractSystemPrompt(), transcript, signal)
-  const candidates = parseCandidates(parseStrictJson(reply))
+  const candidates = parseCandidates(parseExtractReply(reply))
 
   const bySeq = new Map(turnEvents.map((event) => [event.seq, event]))
   const now = Date.now()

@@ -1,7 +1,7 @@
 # StrataLoom — DSH 插件架构（v2.8 · 实现规范 · **已实现**）
 
 > **实现状态**：P0 + P1 + P2 全部落地于 `packages/memory`
-> （`@strataloom/dsh-memory`），134 个测试全绿，含真平台 e2e 与打包安装契约。
+> （`@strataloom/dsh-memory`），135 个测试全绿，含真平台 e2e 与打包安装契约。
 > schema 至 v9。实现闭环见 §13 前三节。
 > §12 仅余两项**经评审拒绝**的能力（连续 trust 公式、向量索引）未实现。
 >

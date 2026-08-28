@@ -264,6 +264,47 @@ test('extract: malformed model JSON throws (retry exit, no half-products)', asyn
   cleanup(root)
 })
 
+test('extract: a prose "nothing to remember" settles, a malformed object still retries', async () => {
+  // Live failure this closes: one turn of shell and file-read output
+  // dead-lettered with "model reply is not valid JSON" after six attempts,
+  // while the turns either side of it — same route, same model — finished on
+  // attempt 1. The prompt asks for {"candidates":[]} when a turn holds nothing
+  // durable, and most turns hold nothing durable, so a model answering that in
+  // prose is cooperating. Retrying it re-asks the same question of the same
+  // text and can never succeed.
+  for (const reply of ['', 'No reusable lessons in this turn.', '  ']) {
+    const { root, registry } = openRegistry()
+    const store = registry.open('k1')
+    seedL0(store, turnEvents(1, [userMessageEvent('long enough content to extract')]))
+    enqueueJob(store, 'extract', 'e1', extractPayload, 0)
+    const ctx = fakeCtx({ services: { llm: { stream: () => textStream(reply) } } })
+    await runExtractJob(ctx, store, claim(store), extractPayload, new AbortController().signal)
+    assert.equal(
+      store.db.prepare(`SELECT state FROM jobs WHERE id = 'e1'`).get().state,
+      'done',
+      `an empty answer settles the job: ${JSON.stringify(reply)}`,
+    )
+    assert.equal(store.db.prepare(`SELECT count(*) c FROM memories`).get().c, 0)
+    registry.dispose()
+    cleanup(root)
+  }
+
+  // But a reply that DOES contain an object is held to the strict parser: a
+  // broken structure means the work did not happen, and that still retries.
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  seedL0(store, turnEvents(1, [userMessageEvent('long enough content to extract')]))
+  enqueueJob(store, 'extract', 'e2', extractPayload, 0)
+  const ctx = fakeCtx({ services: { llm: { stream: () => textStream('{"candidates": [,]}') } } })
+  await assert.rejects(
+    runExtractJob(ctx, store, claim(store), extractPayload, new AbortController().signal),
+    PipelineLlmError,
+    'a malformed object is still a failure, not an empty answer',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
 // ---- reconcile: batch decisions in one commit -----------------------------
 
 const insertCandidate = (store, id, kind, title) =>
