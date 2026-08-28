@@ -187,6 +187,43 @@ test('real routing: a reply cut at the output cap fails loud, not as bad JSON', 
   await shutdown()
 })
 
+test('the output cap covers the worst reply the prompts invite, priced as CJK', async () => {
+  // The live failure this locks down: of four rebuild jobs ever run, the two
+  // with small inputs finished on attempt 1 and the one summarising 27 mostly
+  // Chinese memories burned all six attempts, while extract/reconcile/decay
+  // went 68/0 over the same routes and days. The rollup prompt invites
+  // 6 x (60 + 900 + 30) = 5940 characters; in Chinese that is ~5940 tokens
+  // against a cap that was 4000, so the reply came back truncated — and a
+  // truncated reply is unparseable, not merely short.
+  //
+  // The old guard hid this: it priced the worst case as `chars/4 * 2`, which
+  // is still half the real CJK cost, so it passed while the cap was too small.
+  // Asserting the RULE rather than the numbers means raising a target without
+  // raising the cap fails here instead of in production.
+  const {
+    LLM_MAX_TOKENS,
+    ROLLUP_MAX_SCENARIOS,
+    ROLLUP_TARGET_CHARS,
+    ROLLUP_TITLE_TARGET_CHARS,
+    EXTRACT_MAX_CANDIDATES,
+    EXTRACT_TITLE_TARGET_CHARS,
+    EXTRACT_BODY_TARGET_CHARS,
+    PERSONA_TARGET_CHARS,
+  } = await import('../lib/constants.js')
+
+  const worstReplyChars = Math.max(
+    ROLLUP_MAX_SCENARIOS * (ROLLUP_TITLE_TARGET_CHARS + ROLLUP_TARGET_CHARS + 30),
+    EXTRACT_MAX_CANDIDATES * (EXTRACT_TITLE_TARGET_CHARS + EXTRACT_BODY_TARGET_CHARS + 60),
+    PERSONA_TARGET_CHARS + 60,
+  )
+  // One token per character is the honest CJK price; `chars/4` is a Latin
+  // estimate and belongs to packet budgeting, not to this guard.
+  assert.ok(
+    LLM_MAX_TOKENS >= worstReplyChars,
+    `LLM_MAX_TOKENS (${LLM_MAX_TOKENS}) must cover ${worstReplyChars} CJK tokens`,
+  )
+})
+
 test('real routing: an unregistered provider fails without a fallback service', async () => {
   const { ctx, shutdown } = await bootLlm({ pinned: { kind: 'reply', text: '{}' } })
   await assert.rejects(

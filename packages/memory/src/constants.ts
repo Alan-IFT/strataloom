@@ -123,10 +123,19 @@ export const RECONCILE_EXISTING_LIMIT = 30
  * The value is generous rather than tight on purpose: this is a guardrail
  * against a runaway reply, not a budget. The real cost control is the input
  * side (transcript and source limits) and the fact that these jobs are rare.
- * `chars/4` also understates CJK, where a character is closer to one token, so
- * a cap derived from character targets needs headroom to stay honest.
+ *
+ * 4000 was still too small, and the guard below said otherwise because it
+ * priced the worst reply at `chars/4 * 2` while its own comment records that
+ * CJK is nearer ONE token per character — a 2x understatement in exactly the
+ * language this store holds. Measured, not reasoned: of four `rebuild` jobs
+ * ever run, the two with small inputs finished on attempt 1, and the one
+ * summarising 27 mostly-Chinese memories burned all six attempts, while
+ * extract/reconcile/decay went 68/0 across the same routes and days. The
+ * rollup prompt invites 6 x (60 + 900 + 30) = 5940 characters, which is ~5940
+ * tokens of Chinese against a 4000 cap: the reply arrived truncated, and a
+ * truncated reply is unparseable rather than merely short.
  */
-export const LLM_MAX_TOKENS = 4_000
+export const LLM_MAX_TOKENS = 8_000
 
 /** Title length cap (fail loud beyond — propose validation). */
 export const TITLE_MAX_CHARS = 200
@@ -180,16 +189,24 @@ if (
 }
 
 /* The same rule one level up: the output cap must fit what the prompts invite.
-   Priced on the worst reply each prompt permits, with JSON scaffolding, and
-   doubled because `chars/4` understates CJK — where the truncation was
-   actually observed. Asserting it here means a future prompt that asks for
-   more fails at load instead of failing as "not valid JSON" in production. */
+   Priced on the worst reply each prompt permits, with JSON scaffolding.
+
+   The character targets are a budget for CONTENT, and this store's content is
+   largely Chinese, where a character costs about one token rather than the
+   quarter `estimateTokens` assumes. So the worst case is priced at one token
+   per character instead of `chars/4` with a doubling bolted on: that fudge
+   read as headroom while still understating the real worst case by 2x, and it
+   let a cap through that truncated the one rollup with a large Chinese input.
+   Pricing the honest way makes the assertion mean what it says, and a future
+   prompt that asks for more fails at load rather than as "not valid JSON" in
+   production. The estimator keeps `chars/4` — it guards packet budgets, where
+   over-estimating CJK would evict memories that would have fit. */
 const worstReplyChars = Math.max(
   ROLLUP_MAX_SCENARIOS * (ROLLUP_TITLE_TARGET_CHARS + ROLLUP_TARGET_CHARS + 30),
   EXTRACT_MAX_CANDIDATES * (EXTRACT_TITLE_TARGET_CHARS + EXTRACT_BODY_TARGET_CHARS + 60),
   PERSONA_TARGET_CHARS + 60,
 )
-if (LLM_MAX_TOKENS < Math.ceil(worstReplyChars / 4) * 2) {
+if (LLM_MAX_TOKENS < worstReplyChars) {
   throw new Error(
     `strataloom: LLM_MAX_TOKENS (${LLM_MAX_TOKENS}) is below what the prompts ask for; ` +
       'a capped reply arrives truncated and unparseable',
