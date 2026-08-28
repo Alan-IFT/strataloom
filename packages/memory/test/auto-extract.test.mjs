@@ -8,6 +8,7 @@ import { MemoryService } from '../lib/service.js'
 import { installAutoExtract } from '../lib/auto-extract.js'
 import { JobRunner } from '../lib/pipeline/runner.js'
 import { enqueueJob } from '../lib/pipeline/jobs.js'
+import { PROMPT_VERSION } from '../lib/pipeline/prompts.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import {
   openRegistry,
@@ -107,7 +108,10 @@ test('L0 capture is unconditional; only the extract enqueue is gated', () => {
   const payload = JSON.parse(store.db.prepare(`SELECT payload FROM jobs`).get().payload)
   assert.equal(payload.sessionId, 'p')
   assert.equal(payload.turn, 1)
-  assert.equal(payload.promptVersion, 1)
+  // Pinned to the CURRENT version, read from the module: the property under
+  // test is "the enqueue records which prompt contract it was queued for",
+  // and a literal here would fail on every legitimate prompt bump instead.
+  assert.equal(payload.promptVersion, PROMPT_VERSION)
   registry.dispose()
   cleanup(root)
 })

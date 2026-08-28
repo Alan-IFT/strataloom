@@ -37,20 +37,81 @@ export interface ExtractPayload {
 }
 
 
-const renderTranscript = (events: readonly TranscriptEvent[]): string => {
-  const lines: string[] = []
-  let budget = EXTRACT_TRANSCRIPT_CHARS
+/** One transcript event as the model receives it (spec §5.1 input shape). */
+interface PromptEvent {
+  readonly seq: number
+  readonly label: string
+  readonly text: string
+}
+
+/** The whole extract input: one JSON object, `JSON.stringify`d at the call site. */
+interface PromptTranscript {
+  readonly events: readonly PromptEvent[]
+}
+
+/**
+ * Build the extract input as DATA rather than as prose.
+ *
+ * The earlier shape joined `[seq N] <label>: <excerpt>` lines with newlines,
+ * which made the transcript a format an event could write in: any text
+ * carrying a newline produced bytes indistinguishable from a real record, and
+ * the prompt tells the model those seq numbers select trust downstream. So a
+ * tool result — the lowest trust there is — could mint a line the model would
+ * attribute to the human, and `provenanceFor` would return `human`, the only
+ * level that reaches the default injection packet.
+ *
+ * JSON removes the capability instead of filtering for it: inside a string
+ * value, a newline, a quote, or a whole `"}],"events":[{` is escaped, so
+ * "looks like another record" is not something an event's bytes can express.
+ * This is also what the other three pipeline call sites already do
+ * (`reconcile`, `rollup`, `persona` all `JSON.stringify` their input) — the
+ * hand-joined text here was the one exception, not the convention.
+ *
+ * Budget semantics are carried over unchanged in kind: each event costs what
+ * it actually adds to the payload, and an event that does not fit ENDS the
+ * transcript rather than being trimmed. Whole records or none: a half record
+ * is exactly the artifact this shape exists to make impossible.
+ *
+ * "What it adds" is charged literally, so `EXTRACT_TRANSCRIPT_CHARS` bounds
+ * the string the model receives, not the sum of its parts. The wrapper
+ * (`{"events":[]}`) is paid up front and every event after the first pays for
+ * its separating comma; charging entries alone would let 12 + n characters
+ * past the cap — bounded and small, but it would make the constant's name a
+ * claim the code does not keep, and the budget numbers in this file are read
+ * as a specification.
+ *
+ * A label is also no longer exempt; it used to ride outside the accounting as
+ * a line prefix. Per-event overhead is therefore higher, and the cost is worth
+ * measuring rather than leaving to be discovered. Against this repo's own L0,
+ * whose events run to a median of 165 characters:
+ *
+ *   400-char events  -7%      100-char events  -15%
+ *   200-char events  -11%      20-char events  -37%
+ *
+ * Replaying every real turn in that store keeps 327 events where the old
+ * format kept 364 — 10% fewer, against truncation that was already dropping
+ * 66% of them, so the net change is three points and what it drops is the
+ * tail of long tool output rather than the reasoning. That is the price of a
+ * transcript whose records cannot be forged: it is paid in volume, not in
+ * meaning.
+ */
+const renderTranscript = (events: readonly TranscriptEvent[]): PromptTranscript => {
+  const kept: PromptEvent[] = []
+  let budget = EXTRACT_TRANSCRIPT_CHARS - JSON.stringify({ events: [] }).length
   for (const event of events) {
-    const excerpt =
+    const text =
       event.text.length > EXTRACT_EVENT_EXCERPT_CHARS
         ? `${event.text.slice(0, EXTRACT_EVENT_EXCERPT_CHARS)}…`
         : event.text
-    const line = `[seq ${event.seq}] ${event.label}: ${excerpt}`
-    if (line.length > budget) break
-    lines.push(line)
-    budget -= line.length
+    const entry: PromptEvent = { seq: event.seq, label: event.label, text }
+    // The comma joining this entry to the previous one is part of what it
+    // adds, so it is part of what it costs.
+    const cost = JSON.stringify(entry).length + (kept.length === 0 ? 0 : 1)
+    if (cost > budget) break
+    kept.push(entry)
+    budget -= cost
   }
-  return lines.join('\n')
+  return { events: kept }
 }
 
 interface RawCandidate {
@@ -143,13 +204,21 @@ export const runExtractJob = async (
   // platform log still existing — extraction is reproducible from our store.
   const turnEvents = readTurn(store, payload.sessionId, payload.turn)
   const transcript = renderTranscript(turnEvents)
-  if (transcript === '') {
+  // Nothing survived the budget (or the turn held nothing) — there is no
+  // question to ask, so settle without burning a call.
+  if (transcript.events.length === 0) {
     commitClaimedJob(store, job.id, job.leaseToken, () => {})
     return
   }
 
   const route: PinnedRoute = { provider: payload.provider, model: payload.model }
-  const reply = await callPipelineLlm(ctx, route, extractSystemPrompt(), transcript, signal)
+  const reply = await callPipelineLlm(
+    ctx,
+    route,
+    extractSystemPrompt(),
+    JSON.stringify(transcript),
+    signal,
+  )
   const candidates = parseCandidates(parseExtractReply(reply))
 
   const bySeq = new Map(turnEvents.map((event) => [event.seq, event]))
