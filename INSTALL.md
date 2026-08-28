@@ -35,7 +35,7 @@ dsh plugin --profile web add \
 Restart, then confirm from the log line the plugin prints at startup:
 
 ```
-strataloom 0.3.0 ready (data: /home/you/.dsh/strataloom)
+strataloom 0.3.1 ready (data: /home/you/.dsh/strataloom)
 ```
 
 **Your memories are not touched.** They live in `~/.dsh/strataloom/`, outside
