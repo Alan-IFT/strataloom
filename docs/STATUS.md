@@ -16,8 +16,15 @@
 node scripts/inspect.mjs --days 3650
 ```
 
-预期：两条 `stuck` 消失；`global` 出现 1 条 derived（L3 画像）、`3e857510`
-出现 derived（L2 场景块）；中文检索可用（试 `memory_recall` 查「取舍」）。
+预期：`3e857510` 的 `stuck` 消失并出现 derived（L2 场景块）；`global` 出现
+1 条 derived（L3 画像）；中文检索可用（试 `memory_recall` 查「取舍」）。
+
+> **global 会保留一行 `obsolete`，那不是失败。** 它是 revision 3 时死掉的
+> 那个 job，而 store 已到 revision 8——该 id 再也不会被重新算出，属于等待
+> cleanup 的不可达垃圾（failed 行保留 30 天）。`inspect.mjs` 现在按
+> 「payload 里的 revision 是否仍等于当前 revision」把二者分开：**仍相等才叫
+> `stuck`（真卡住），不等则叫 `obsolete`（已被快照甩开）**。否则一次健康的
+> 重启会看起来像失败，而诊断工具误报比不报更糟。
 
 **逐条在真实数据副本上用「已安装的版本」预演过，不是推断**：
 
@@ -28,7 +35,12 @@ node scripts/inspect.mjs --days 3650
   最坏中文回复（5571 字符 / 4926 汉字）：job `done`、写入 **6 条场景块**。
   同一份回复在旧的 4000 上限下必然截断——这正是它当初 5 连败的原因；
 - 截断路径的诊断也验过：报 `stream finished as max-tokens`，而非误导性的
-  「JSON 无效」，且该文案会被 v8 存进 `last_error`。
+  「JSON 无效」，且该文案会被 v8 存进 `last_error`；
+- **最接近重启的一次预演**（第五轮）：用**真实的 `JobRunner`** 跑两个卡住库的
+  副本（先 `migrate` 模拟开库，再连跑 tick），结果 global 得到 1 条
+  `derived=3` 画像、ops 得到 6 条 `derived=2` 场景块，ops 的死信原地复活为
+  `done`（attempts=1），全程只发了 2 次 LLM 调用。这比逐个 handler 的验证
+  更强：它跑的是 `maintain()` + `tick()` 的真实调度路径。
 
 若 L3 再次失败，`inspect.mjs` 这次会直接打印原因，不再是 `cause not recorded`。
 

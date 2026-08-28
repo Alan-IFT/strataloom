@@ -79,11 +79,32 @@ for (const [label, file] of stores) {
   const hasLastError = db
     .prepare(`SELECT count(*) AS n FROM pragma_table_info('jobs') WHERE name = 'last_error'`)
     .get().n > 0
+  // A dead letter whose snapshot has moved on is NOT stuck work: its id is
+  // derived from the revision it was queued for, so that id is never computed
+  // again and the row is unreachable garbage awaiting cleanup. Reporting it as
+  // stuck would send someone chasing a job the store has already left behind —
+  // and would make a healthy restart look like a failed one.
+  const revision = Number(
+    db.prepare(`SELECT v FROM meta WHERE k = 'store_revision'`).get()?.v ?? 0,
+  )
   const stuck = db.prepare(
-    `SELECT kind, attempts, ${hasLastError ? 'last_error' : 'NULL AS last_error'} FROM jobs
+    `SELECT kind, attempts, payload, ${hasLastError ? 'last_error' : 'NULL AS last_error'} FROM jobs
      WHERE state = 'failed' ORDER BY completed_at DESC LIMIT 5`,
   ).all()
   for (const job of stuck) {
+    let queuedFor
+    try {
+      queuedFor = JSON.parse(job.payload).expectedRevision
+    } catch {
+      queuedFor = undefined
+    }
+    if (queuedFor !== undefined && queuedFor !== revision) {
+      console.log(
+        `   obsolete   ${job.kind} failed at revision ${queuedFor}, store is now at ` +
+          `${revision} — superseded, cleanup will drop it`,
+      )
+      continue
+    }
     console.log(
       `   stuck      ${job.kind} dead-lettered after ${job.attempts} claims — ` +
         `${job.last_error ?? 'cause not recorded (failed before schema v8)'}`,
