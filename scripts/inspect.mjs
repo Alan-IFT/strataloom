@@ -70,6 +70,26 @@ for (const [label, file] of stores) {
   console.log(`   memories   ${memories.active ?? 0} active, ${memories.derivedRows ?? 0} derived (${memories.total ?? 0} rows total)`)
   console.log(`   recall     ${recall.calls ?? 0} calls in ${days}d, ${recall.misses ?? 0} missed  (${pct(recall.misses ?? 0, recall.calls ?? 0)})`)
 
+  // Stuck work, and WHY. A dead letter whose cause must be reconstructed from
+  // rotated logs is a dead letter nobody fixes, so the reason rides the row
+  // (schema v8) and surfaces here beside the counts.
+  // `last_error` arrives with schema v8. This tool must keep working against a
+  // store the running plugin has not upgraded yet — a diagnostic that crashes
+  // on the stores you most need to look at is worse than no diagnostic.
+  const hasLastError = db
+    .prepare(`SELECT count(*) AS n FROM pragma_table_info('jobs') WHERE name = 'last_error'`)
+    .get().n > 0
+  const stuck = db.prepare(
+    `SELECT kind, attempts, ${hasLastError ? 'last_error' : 'NULL AS last_error'} FROM jobs
+     WHERE state = 'failed' ORDER BY completed_at DESC LIMIT 5`,
+  ).all()
+  for (const job of stuck) {
+    console.log(
+      `   stuck      ${job.kind} dead-lettered after ${job.attempts} claims — ` +
+        `${job.last_error ?? 'cause not recorded (failed before schema v8)'}`,
+    )
+  }
+
   // The trend, not the instant: phase 4 is gated on a direction, and one
   // snapshot cannot show one.
   const weekly = db.prepare(

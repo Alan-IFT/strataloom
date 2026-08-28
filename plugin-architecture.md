@@ -1,9 +1,31 @@
-# StrataLoom — DSH 插件架构（v2.7 · 实现规范 · **已实现**）
+# StrataLoom — DSH 插件架构（v2.8 · 实现规范 · **已实现**）
 
 > **实现状态**：P0 + P1 + P2 全部落地于 `packages/memory`
-> （`@strataloom/dsh-memory`），127 个测试全绿，含真平台 e2e 与打包安装契约。
-> schema 至 v5。实现闭环见 §13 前三节。
+> （`@strataloom/dsh-memory`），132 个测试全绿，含真平台 e2e 与打包安装契约。
+> schema 至 v9。实现闭环见 §13 前三节。
 > §12 仅余两项**经评审拒绝**的能力（连续 trust 公式、向量索引）未实现。
+>
+> **v2.8（真实数据驱动的三处修正）**：积累真实使用数据后复盘，暴露三处**设计**
+> 缺陷——它们的共同教训是「机制正确 ≠ 产品有效」：132 个测试全绿的同时，L3
+> 画像已连续五天不可用而无人知晓。
+>
+> 1. **§2.2 入队语义**：原文 `ON CONFLICT DO NOTHING` 配合**确定性 job id**，
+>    使 dead-letter 变成**永久否决**——失败行把后续每次触发都吸收掉。实测：
+>    global 画像 job 在 revision 3 死信后跨 5 个维护轮从未重建，而同期 decay
+>    正常运行。改为 `DO UPDATE ... WHERE state='failed'`：pending/running/done
+>    照旧吸收，仅 failed 被新触发复活。恢复规则只写在唯一入队点，故所有 job
+>    kind（含未来的）共享一条规则，无需 per-kind 重试计数器。
+> 2. **§2.2 `jobs.last_error`（schema v8）**：失败原因原本只存在于会轮转的
+>    日志里，而 dead-letter 往往数日后才被发现——那正是最需要原因的时刻。
+>    写在唯一失败出口，故覆盖所有 job kind；截断且不含 prompt/回复。
+> 3. **§2.2 索引形态（schema v9）**：`unicode61` 对标点之间的 CJK 只产出一个
+>    token，故中文只有整段相等才命中，任何改写都落空。改为 CJK **bigram**
+>    索引（`trigram` 经实测否决——它会让 `CI`/`Go`/`L3`/`v9` 这类 <3 字符
+>    标识符搜不到）。详见 §2.2 的 v9 修订说明。
+>
+> 附带修正：迁移期间 `temp_store` 固定为 MEMORY——`DROP TABLE` 会让 SQLite
+> 去找**临时文件**，其位置取决于环境（沙箱中可能无处可写）。迁移应只依赖它
+> 拿到的那个库。
 >
 > **v2.7（注入投递面修正）**：§4.1 原文规定 packet 作为 `systemPrompt.context()`
 > 的**文本**投递。该规定本身是缺陷——prompt 文本被严格插值，而记忆正文天然
@@ -239,6 +261,18 @@ CREATE TRIGGER mem_au AFTER UPDATE OF title, body ON memories BEGIN
 END;
 ```
 
+> **v9 修订（2026-08-28，实测驱动）**：索引改为 `fts5(title, body, cjk)`，不再是
+> external-content，三个同步触发器随之改为「删行 + 插行」，并在插入时把 CJK
+> 展开为**重叠二元组**写入 `cjk` 列。原因：`unicode61` 对标点之间的 CJK 只产出
+> 一个 token，故中文只有整段相等才命中，任何改写都落空（真实库实测
+> `分词器`/`工程取舍`/`真相源`/`连续词组` 全 0）。
+> **`trigram` 被否决**：它修中文却让 `CI`/`Go`/`L3`/`v9` 这类 <3 字符标识符搜不到
+> （本语料 163 个）并跨词误命中；自定义 tokenizer 需编译 C 扩展，违反零依赖。
+> bigram 方案保留 `unicode61`（英文、短语转义、`rank`、近重复探测原样不动），
+> 且能命中 `取舍` 这类二字词。展开规则用 SQL 写在**唯一的触发器定义**里，四个
+> 写入口自动继承；读侧 `toFtsPhrase` 按同一规则展开查询，两侧一致由测试锁定。
+> 仍是**一条 FTS 查询、一个 `rank`**，未新增与 `memory_recall` 竞争的检索规则。
+
 **v1 相对 v2.5 净删三列**（各自违反"列随写入方"或另有更廉价的等价物）：
 
 - `explicit_save` 删除——它与 provenance 完全共变（显式保存 ⇔
@@ -261,9 +295,19 @@ END;
 - `jobs` 表：id / kind CHECK **('extract','reconcile')**（只刻本阶段写入方，
   rebuild/decay/compact 随 §12 各自的迁移扩展）/ payload /
   state CHECK ('pending','running','done','failed') / attempts（=「被认领次数」）/
-  run_after / created_at / lease_token / lease_until / completed_at。
-  **入队 = `INSERT ... ON CONFLICT(id) DO NOTHING`**（幂等键即主键，
-  重复入队天然吸收，无 check-then-insert 竞态）；
+  run_after / created_at / lease_token / lease_until / completed_at /
+  `last_error`（随 v8 加入：失败原因写在**唯一失败出口**，故覆盖所有 job kind。
+  日志会轮转，而 dead-letter 往往数日后才被发现——那正是最需要原因的时刻。
+  截断且不含 prompt/回复，故记忆内容不外泄到运维面）。
+  **入队 = `INSERT ... ON CONFLICT(id) DO UPDATE ... WHERE state = 'failed'`**
+  （幂等键即主键，无 check-then-insert 竞态）。`pending`/`running` 仍被吸收
+  （已排上队），`done` 仍被吸收（该 snapshot 已完成）；**只有 `failed` 被新的
+  触发复活**（重置 state/attempts/run_after/lease/completed_at/last_error）。
+  v2.7 原文写 `DO NOTHING`，那让**确定性 job id 把 dead-letter 变成永久否决**：
+  实测 global 画像 job 在 revision 3 死信后，跨 5 个维护轮从未重建，而同期
+  decay 正常。dead-letter 的含义是**终止这一次尝试**，不是否决这项工作；
+  恢复规则写在唯一入队点，故所有 job kind（含未来的）共享一条规则，
+  无需 per-kind 重试计数器或新列，重试节流由触发器自身的周期承担。
 - `usage` 表（memory_id PK→memories ON DELETE CASCADE/retrieved/last_hit_at）；
 - `memories` 增 `superseded_by TEXT REFERENCES memories(id)`
   （环检测应用层断言；写入方 reconcile 此阶段到位）。
@@ -942,7 +986,7 @@ SQLite 断言当时以一次性脚本固化（6/6 过），现已全部转为常
 | repoKey 输入源与规范化未定义（回退 process.cwd() 会张冠李戴） | §2.1：仅 `header.cwd`（平台已验证），缺失 ⇒ 拒写＋空注入；git toplevel realpath → remote 规范化 → hash |
 | "当前默认路由"无取值点 | §5.3：`ctx.agentDefaultModel.currentSelection()`（实查存在），服务缺失走重试出口 |
 | jobs.kind 预刻 P2 值（rebuild/decay/compact）——与"列随写入方"自相矛盾 | §2.2 澄清：jobs.kind 是特性注册表非领域状态空间，v2 只刻 extract/reconcile，扩展成本由启用特性的迁移支付；"枚举一次定型"限定于 memories 四枚举 |
-| 入队/幂等/计量三处口径未定 | 入队 = `INSERT ON CONFLICT DO NOTHING`（幂等键即主键）；软依赖缺失入口不入队（替代 6 次认领后 dead-letter）；token 一律 chars/4（护栏非计费，不引 tokenizer） |
+| 入队/幂等/计量三处口径未定 | 入队 = `INSERT ON CONFLICT(id) DO UPDATE ... WHERE state='failed'`（幂等键即主键；pending/running/done 吸收，failed 复活——见 §2.2，v2.7 的 `DO NOTHING` 已按实测更正）；软依赖缺失入口不入队（替代 6 次认领后 dead-letter）；token 一律 chars/4（护栏非计费，不引 tokenizer） |
 | 两处一致性声明不彻底 | §4.1 如实补：cwd→repoKey memo 是无失效缓存（remote 中途变更即陈旧，重启即愈，接受）；WAL 依赖同机共享内存，网络文件系统上前提不成立（已知限制，不检测） |
 | recall 工具出口无投毒框定 | §4.3：复用 §4.2 同一个渲染器（含框定头），读出口共用一道防线（v2.7 更正为三条出口：注入 / recall / propose 近重复列表） |
 

@@ -1,6 +1,7 @@
 /**
- * Job lifecycle (spec §5.2, D6): idempotent enqueue (`INSERT ON CONFLICT DO
- * NOTHING`, the idempotence key IS the primary key), claim-increments-attempts
+ * Job lifecycle (spec §5.2, D6): idempotent enqueue (the idempotence key IS
+ * the primary key, so a repeat is absorbed — except that a dead-lettered row
+ * is revived by a fresh trigger, see `enqueueJob`), claim-increments-attempts
  * (poison-job line), and `commitClaimedJob` — the ONLY success commit path,
  * with the fencing CAS BEFORE any business write.
  * @module @strataloom/dsh-memory/pipeline/jobs
@@ -10,6 +11,7 @@ import type { OpenStore } from '../store/store.ts'
 import {
   DONE_RETENTION_MS,
   FAILED_RETENTION_MS,
+  JOB_ERROR_MAX_CHARS,
   MAX_CLAIMS,
   RETRY_BACKOFF_MS,
 } from '../constants.ts'
@@ -39,6 +41,22 @@ export const jobId = (kind: JobKind, ...parts: readonly (string | number)[]): st
  * Idempotent enqueue. Re-triggering the same key is absorbed by the primary
  * key — no check-then-insert race (spec §2.2). Runs in its own immediate
  * transaction unless the caller is already inside one (pass `inTx`).
+ *
+ * With ONE exception, which the conflict clause states rather than any caller:
+ * a `failed` row is REVIVED by a fresh trigger. Dead-lettering answers "stop
+ * retrying this attempt", not "never do this work again" — but with a
+ * deterministic id the two collapse, and absorbing the retrigger turns a dead
+ * letter into a permanent veto for as long as the row survives (30 days, or
+ * forever if cleanup never runs). Observed live: the global store's L3
+ * portrait job dead-lettered at one snapshot and stayed unbuilt across five
+ * days of maintenance passes that each re-enqueued it into `DO NOTHING`.
+ *
+ * `pending`/`running` are still absorbed (the work is already scheduled) and
+ * so is `done` (it finished for this snapshot). Only the terminal-but-unfinished
+ * state reopens, which keeps the recovery rule in the one place every job kind
+ * already goes through — no per-kind retry counter, no new column, no
+ * "remember to revive" branch in a handler. The trigger's own cadence
+ * (the maintenance interval) is the retry throttle, so no new threshold.
  */
 export const enqueueJob = (
   store: OpenStore,
@@ -53,7 +71,17 @@ export const enqueueJob = (
       .prepare(
         `INSERT INTO jobs (id, kind, payload, state, attempts, run_after, created_at)
          VALUES (?, ?, ?, 'pending', 0, ?, ?)
-         ON CONFLICT(id) DO NOTHING`,
+         ON CONFLICT(id) DO UPDATE SET
+           payload      = excluded.payload,
+           state        = 'pending',
+           attempts     = 0,
+           run_after    = excluded.run_after,
+           created_at   = excluded.created_at,
+           lease_token  = NULL,
+           lease_until  = NULL,
+           completed_at = NULL,
+           last_error   = NULL
+         WHERE jobs.state = 'failed'`,
       )
       .run(id, kind, JSON.stringify(payload), runAfter, Date.now())
   }
@@ -143,6 +171,13 @@ export const commitClaimedJob = (
  * Failure/retry exit — same lease-conditional CAS shape (spec §5.2). A lost
  * lease makes this a no-op (the successor owns the job now). `dead` forces
  * the dead-letter state regardless of attempts.
+ *
+ * `cause` is stored on the row because this is the ONLY exit a failing job
+ * takes, so recording it here covers every job kind and every future one.
+ * Logs answered this before and logs rotate: a dead letter found days later
+ * had no recoverable reason, which is exactly when the reason is needed.
+ * The text is truncated and carries no prompt or reply — a cause, not a
+ * transcript, so no memory content leaks into an operator surface.
  */
 export const failClaimedJob = (
   store: OpenStore,
@@ -150,24 +185,36 @@ export const failClaimedJob = (
   leaseToken: string,
   attempts: number,
   dead: boolean,
+  cause?: unknown,
 ): void => {
+  const reason = describeCause(cause)
   store.tx(() => {
     if (dead || attempts > MAX_CLAIMS) {
       store.db
         .prepare(
-          `UPDATE jobs SET state = 'failed', completed_at = ?, lease_token = NULL, lease_until = NULL
+          `UPDATE jobs SET state = 'failed', completed_at = ?, lease_token = NULL,
+             lease_until = NULL, last_error = COALESCE(?, last_error)
            WHERE id = ? AND state = 'running' AND lease_token = ?`,
         )
-        .run(Date.now(), jobId_, leaseToken)
+        .run(Date.now(), reason, jobId_, leaseToken)
     } else {
       store.db
         .prepare(
-          `UPDATE jobs SET state = 'pending', lease_token = NULL, lease_until = NULL, run_after = ?
+          `UPDATE jobs SET state = 'pending', lease_token = NULL, lease_until = NULL,
+             run_after = ?, last_error = COALESCE(?, last_error)
            WHERE id = ? AND state = 'running' AND lease_token = ?`,
         )
-        .run(Date.now() + RETRY_BACKOFF_MS * attempts, jobId_, leaseToken)
+        .run(Date.now() + RETRY_BACKOFF_MS * attempts, reason, jobId_, leaseToken)
     }
   })
+}
+
+/** One line naming the failure: `ErrorName: message`, bounded. */
+const describeCause = (cause: unknown): string | null => {
+  if (cause === undefined || cause === null) return null
+  const text =
+    cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)
+  return text.replace(/\s+/g, ' ').trim().slice(0, JOB_ERROR_MAX_CHARS) || null
 }
 
 /** Low-frequency cleanup (spec §5.2: done>7d, failed>30d; P1 tick-driven). */

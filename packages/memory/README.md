@@ -4,7 +4,7 @@ Repository-scoped memory for DeepSeek Harness: per-repo SQLite stores,
 principal-gated tools, WAL-fresh context injection, and a leased
 extract/reconcile pipeline.
 
-Implements `plugin-architecture.md` v2.7. That document is the specification;
+Implements `plugin-architecture.md` v2.8. That document is the specification;
 this package is its realization. Where code and spec disagree, the spec wins —
 report it as a bug.
 
@@ -145,7 +145,7 @@ npm install      # platform packages from npm (peer deps, mirrored as dev deps)
 npm run verify   # tsc + the full test suite
 ```
 
-127 tests:
+132 tests:
 
 | File | Covers |
 |---|---|
@@ -171,6 +171,15 @@ not a deliverable, and no other test here would notice.
 *rejected* in review, not postponed: the trust formula's thresholds had no
 data behind them, and vector search would add a model dependency to a
 question FTS already answers.
+
+That last claim was tested rather than assumed, and it survived — but only
+after the index was fixed. Chinese memories were unfindable by any re-wording,
+which reads exactly like the case for embeddings; the actual cause was
+`unicode61` emitting one token per CJK run. Schema v9 indexes CJK **bigrams**
+alongside the untouched `unicode61` columns, which fixes Chinese without the
+regression `trigram` would have caused (short identifiers like `CI`, `Go`,
+`L3`, `v9` stop matching under trigram). The lesson generalizes: a miss that a
+re-wording fixes is a **tokenizer** miss before it is an embedding argument.
 
 Also absent by design: a read cache (the read path is one SQL statement, so a
 cache would be pure conceptual cost), and automatic extraction into the

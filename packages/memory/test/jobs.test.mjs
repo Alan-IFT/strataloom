@@ -33,6 +33,59 @@ test('idempotent enqueue: same key absorbed, different key inserted', () => {
   cleanup(root)
 })
 
+test('a dead-lettered job is revived by the next trigger; pending/done still absorb', () => {
+  // Regression for a live failure: the global store's L3 portrait job
+  // dead-lettered at revision 3 and stayed unbuilt while five later
+  // maintenance passes re-enqueued the same deterministic id into a
+  // `DO NOTHING`. Dead-letter must end an attempt, not the work itself.
+  const { root, registry, store } = setup()
+  const id = jobId('rebuild', 'k1', 3)
+  const payload = { expectedRevision: 3, provider: 'p', model: 'm' }
+  enqueueJob(store, 'rebuild', id, payload, 0)
+
+  let job
+  for (let i = 0; i <= MAX_CLAIMS; i++) {
+    const now = Date.now()
+    job = claimNextJob(store, now, now - 1) // expired lease ⇒ reclaimable
+  }
+  failClaimedJob(store, id, job.leaseToken, job.attempts, true)
+  assert.equal(store.db.prepare(`SELECT state FROM jobs WHERE id = ?`).get(id).state, 'failed')
+
+  // The next maintenance pass re-triggers the SAME id (unchanged snapshot).
+  const runAfter = Date.now() + 5_000
+  enqueueJob(store, 'rebuild', id, payload, runAfter)
+  const revived = store.db
+    .prepare(`SELECT state, attempts, run_after, completed_at, lease_token FROM jobs WHERE id = ?`)
+    .get(id)
+  assert.equal(revived.state, 'pending', 'a dead letter is not a permanent veto')
+  assert.equal(revived.attempts, 0, 'the retry budget is restored')
+  assert.equal(revived.run_after, runAfter)
+  assert.equal(revived.completed_at, null)
+  assert.equal(revived.lease_token, null)
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM jobs WHERE id = ?`).get(id).c,
+    1,
+    'reviving must not duplicate the work',
+  )
+
+  // A job already scheduled absorbs the retrigger exactly as before.
+  enqueueJob(store, 'rebuild', id, { expectedRevision: 99 }, 0)
+  assert.deepEqual(
+    JSON.parse(store.db.prepare(`SELECT payload FROM jobs WHERE id = ?`).get(id).payload),
+    payload,
+    'a pending job is not rewritten by a repeat trigger',
+  )
+
+  // And a finished snapshot is still not redone.
+  const now = Date.now() + 10_000
+  const claimed = claimNextJob(store, now, now + 10_000)
+  commitClaimedJob(store, id, claimed.leaseToken, () => {})
+  enqueueJob(store, 'rebuild', id, payload, 0)
+  assert.equal(store.db.prepare(`SELECT state FROM jobs WHERE id = ?`).get(id).state, 'done')
+  registry.dispose()
+  cleanup(root)
+})
+
 test('two workers claim: exactly one wins; attempts increments on claim', () => {
   const { root, registry, store } = setup()
   enqueueJob(store, 'extract', 'j1', {}, 0)
@@ -125,6 +178,34 @@ test('retry exit reschedules with backoff under lease protection', () => {
   // a worker with a stale token cannot flip it back
   failClaimedJob(store, 'j1', 'stale-token', 99, true)
   assert.equal(store.db.prepare(`SELECT state FROM jobs WHERE id = 'j1'`).get().state, 'pending')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('a failing job records its cause; the dead-letter pass keeps the real one', () => {
+  // Why a job is stuck must outlive the log line that said so — the L3
+  // portrait dead letter had no recoverable cause days later.
+  const { root, registry, store } = setup()
+  enqueueJob(store, 'rebuild', 'j1', {}, 0)
+  const now = Date.now()
+  const first = claimNextJob(store, now, now + 10_000)
+  failClaimedJob(store, 'j1', first.leaseToken, first.attempts, false, new TypeError('bad reply'))
+  assert.equal(
+    store.db.prepare(`SELECT last_error FROM jobs WHERE id='j1'`).get().last_error,
+    'TypeError: bad reply',
+  )
+
+  // The dead-letter pass never ran the handler, so it has no diagnosis and
+  // must not erase the one that explains the failure.
+  const last = claimNextJob(store, Date.now() + 200_000, Date.now() + 210_000)
+  failClaimedJob(store, 'j1', last.leaseToken, last.attempts, true)
+  const dead = store.db.prepare(`SELECT state, last_error FROM jobs WHERE id='j1'`).get()
+  assert.equal(dead.state, 'failed')
+  assert.equal(dead.last_error, 'TypeError: bad reply', 'the cause survives dead-lettering')
+
+  // A revived job starts clean rather than carrying a stale explanation.
+  enqueueJob(store, 'rebuild', 'j1', {}, 0)
+  assert.equal(store.db.prepare(`SELECT last_error FROM jobs WHERE id='j1'`).get().last_error, null)
   registry.dispose()
   cleanup(root)
 })

@@ -119,13 +119,47 @@ export const queryInjectionRows = (store: OpenStore): MemoryHit[] =>
     return derived.length > 0 ? derived : queryInjectableSet(store, INJECT_TOP_N)
   })
 
+/** The CJK range the index bigram-expands. Mirrors `schema.ts`. */
+const CJK_RUN = /[\u3400-\u9fff]+/g
+const HAS_CJK = /[\u3400-\u9fff]/
+
+/** Overlapping bigrams of each CJK run — the read side of what the index stores. */
+export const cjkBigrams = (text: string): string[] => {
+  const out: string[] = []
+  for (const run of text.match(CJK_RUN) ?? []) {
+    if (run.length === 1) {
+      out.push(run)
+      continue
+    }
+    for (let index = 0; index < run.length - 1; index++) {
+      out.push(run.slice(index, index + 2))
+    }
+  }
+  return out
+}
+
 /**
- * Escape user text into one FTS5 phrase: double internal quotes, wrap in
- * quotes. The query is data, never syntax (server-side MATCH construction,
- * spec §4.3).
+ * Turn user text into an FTS5 query. The input is data, never syntax
+ * (server-side MATCH construction, spec §4.3) — every part is quoted, so a
+ * query containing `AND`, `OR` or `*` stays literal text.
+ *
+ * Latin is ONE quoted phrase, exactly as before. Chinese is expanded into the
+ * same overlapping bigrams the index stores and AND-ed, because `unicode61`
+ * emits one token per punctuation-delimited CJK run — which made every
+ * re-wording of a stored Chinese memory unfindable. That is ONE rule with two
+ * sides: the write side is SQL in `schema.ts`, this is the read side, and a
+ * test asserts the two agree on the same input.
  */
-export const toFtsPhrase = (query: string): string =>
-  `"${query.replaceAll('"', '""')}"`
+export const toFtsPhrase = (query: string): string => {
+  const quote = (text: string): string => `"${text.replaceAll('"', '""')}"`
+  if (!HAS_CJK.test(query)) return quote(query)
+  const parts = cjkBigrams(query)
+  // A mixed query still has to match its Latin words, which are indexed whole.
+  for (const word of query.split(/[^\p{L}\p{N}]+/u)) {
+    if (word !== '' && !HAS_CJK.test(word)) parts.push(word)
+  }
+  return parts.length === 0 ? quote(query) : parts.map(quote).join(' AND ')
+}
 
 /**
  * Recall query: 1 FTS pass + 1 primary fetch, joined here in a single
@@ -173,11 +207,16 @@ export const querySimilarRows = (
   kind: MemoryKind,
   limit: number,
 ): MemoryHit[] => {
-  const terms = title
-    .toLowerCase()
-    .split(/[^\p{L}\p{N}]+/u)
-    .filter((word) => word.length > 2)
-    .map((word) => `"${word.replaceAll('"', '""')}"`)
+  // Latin words as before; Chinese contributes its bigrams, because a CJK
+  // title is a single "word" to the splitter and would otherwise probe with
+  // nothing — near-duplicate detection would silently stop working in Chinese.
+  const terms = [
+    ...title
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter((word) => word.length > 2 && !HAS_CJK.test(word)),
+    ...cjkBigrams(title),
+  ].map((word) => `"${word.replaceAll('"', '""')}"`)
   if (terms.length === 0) return []
   return store.timed('propose-similar', () =>
     store.db

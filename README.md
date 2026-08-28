@@ -58,8 +58,7 @@ model routes the harness already has.
 | [`docs/`](docs/README.md) | **Start here when picking the work up.** Document map, current status, design, and decision records. |
 | [`docs/STATUS.md`](docs/STATUS.md) | Where the project stands and what is next. |
 | [`packages/memory/`](packages/memory) | The plugin: `@strataloom/dsh-memory`. Start at its [README](packages/memory/README.md). |
-| [`plugin-architecture.md`](plugin-architecture.md) | The specification. Where code and spec disagree, the spec normally wins — but the spec can be wrong too (v2.7 corrected six such places); fix the spec, don't bend the code back. |
-| [`implementation-report.html`](implementation-report.html) | Visual comparison of design vs. implementation (snapshot, may lag). |
+| [`plugin-architecture.md`](plugin-architecture.md) | The specification. Where code and spec disagree, the spec normally wins — but the spec can be wrong too (v2.7 corrected six such places, v2.8 three more); fix the spec, don't bend the code back. |
 
 ## Why the design looks like this
 
@@ -110,7 +109,7 @@ verified by adversarial tests rather than asserted in prose:
 ```bash
 cd packages/memory
 npm install           # once
-npm run verify        # typecheck + 127 tests
+npm run verify        # typecheck + 132 tests
 ```
 
 Tests run against the real platform where it matters: a real agent registry,

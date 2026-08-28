@@ -1,14 +1,51 @@
 # 当前状态
 
-> 最后更新：2026-08-23 · 4×4 全部到位 · 真实 LLM 冒烟通过 · `/memory` 可见性命令
+> 最后更新：2026-08-28 · 按真实运行数据修了三处设计缺陷（schema v9）
 > **每次工作结束时更新本页**，它是新会话的唯一入口。
 
 ## 一句话
 
-插件**可用且已验证**（124 测试全绿，含真平台 e2e 与打包安装契约）。
-**4×4 架构（D10）已全部落地**：四层 L0/L1/L2/L3 与四类
-Coding/Repo/Personal/Procedure 皆到位。详见
+插件**可用且已验证**（132 测试全绿，含真平台 e2e 与打包安装契约）。
+**4×4 架构（D10）已全部落地**，且这次由**真实数据**证实而非仅由测试断言：
+两个仓库各有 5–6 个真实 L2 场景块。详见
 [`design/4x4-memory.md`](design/4x4-memory.md)。
+
+## 本轮修复：真实数据暴露的三处设计缺陷
+
+积累数据后复盘，共同教训是**机制正确 ≠ 产品有效**——测试全绿的同时，
+L3 画像已经连续五天不可用而无人知晓。
+
+1. **dead-letter 等于永久否决**（最严重）。job id 是确定性的，失败行被同 id
+   的重新入队 `ON CONFLICT DO NOTHING` 吸收。实测：global 画像 job 在
+   revision 3 死信后，跨 5 个维护轮从未重建，而同期 decay 一直在跑。
+   修法在**唯一入队点**：failed 行遇新触发即复活（pending/running/done 照旧
+   吸收）。不为 L3 加特判，故 Ops 仓卡住的 L2 rebuild 被同一处修好。
+2. **失败不可归因**。原因只存在于会轮转的日志里，等有人来查时已消失。
+   现记于 `jobs.last_error`（v8），写在唯一失败出口故覆盖所有 job kind，
+   `inspect.mjs` 直接显示；截断且不含 prompt/回复，不泄漏记忆内容。
+3. **中文按整段匹配**（v9）。默认分词器对标点之间的 CJK 只产出**一个 token**，
+   查询须等于整段才命中，任何自然改写都落空。
+
+   先试 `trigram`，**被实测否决**：它修好中文却让 `CI`/`Go`/`L3`/`v9` 这类
+   <3 字符标识符从能搜变成搜不到（本语料有 163 个），还会让 `cat` 命中
+   `concatenate`。参照业界演进（[hermes-agent 先 trigram+LIKE 回退、后改
+   CJK bigram 索引](https://github.com/NousResearch/hermes-agent/pull/65544)；
+   [sqlite-better-trigram](https://github.com/streetwriters/sqlite-better-trigram)
+   需编译 C 扩展，违反本项目零依赖约束），最终采用 **CJK bigram 索引**：
+   保留 `unicode61`（英文与既有语义原样不动），把 CJK 的重叠二元组写进索引的
+   `cjk` 列。真实记忆验收：`分词器` 0→2、`工程取舍` 0→3、`真相源` 0→3、
+   `连续词组` 0→2，**`取舍`（2 字词，trigram 做不到）2→3**，而 `L3`/`v9`/
+   `dead-letter` 保持命中。仍是**一条 FTS 查询、一个 `rank`**，不新增检索规则。
+
+   bigram 规则用 SQL 写在**唯一的同步触发器**里，故 propose/extract/两处
+   rebuild 四个写入口自动继承；写侧（schema）与读侧（fts.ts）由测试锁定一致。
+
+   这也是 ADR 0005 的**便宜那一半**：改写即中的未命中，先是分词问题，然后才
+   轮到 embedding——代价是一次索引重建，不是模型依赖。
+
+顺带修正的隐患：迁移期间 `temp_store` 固定为 MEMORY。`DROP TABLE` 会让
+SQLite 去找**临时文件**，位置取决于环境；v9 曾因此在沙箱报 "unable to open
+database file"。迁移只应依赖它拿到的那个库。
 
 ## 下一步
 
@@ -22,6 +59,11 @@ Coding/Repo/Personal/Procedure 皆到位。详见
 **开工的正当条件**：比率显著 **且** 抽读 L0 确认存在「未命中 → 改写查询 →
 命中同一条」的实例。详见
 [`decisions/0005-recall-miss-rate-is-a-screening-signal.md`](decisions/0005-recall-miss-rate-is-a-screening-signal.md)。
+
+> **2026-08-28 校准**：上述 B 类（有但措辞没对上）在中文里**先是分词问题**。
+> 已按 v9 用 CJK bigram 索引消除这层损耗并在真实记忆上验证，代价是一次索引
+> 重建而非 embedding 依赖。因此重估 embedding 前，应先用**现在的**索引重新
+> 采集——v9 之前的未命中率混入了分词损耗，不能直接用于该判断。
 
 **查看数据**（无需 sqlite3，无需新增存储）：
 
@@ -109,7 +151,7 @@ recall 竞争的弱检索规则；实测预算内可容纳 5 块而上限 6，�
 
 ```bash
 cd packages/memory
-npm run verify        # tsc + 127 测试
+npm run verify        # tsc + 132 测试
 ```
 
 - Node ≥ 22（用 `node:sqlite`）。

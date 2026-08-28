@@ -27,6 +27,118 @@ export class MigrationError extends Error {
 }
 
 /**
+ * CJK codepoint range used to decide which characters need bigram treatment.
+ * CJK Extension A through the unified ideographs (U+3400–U+9FFF), which covers
+ * the Chinese this store actually holds.
+ */
+const CJK_FIRST = 0x3400
+const CJK_LAST = 0x9fff
+
+/**
+ * SQL that expands the CJK inside `expr` into overlapping BIGRAMS.
+ *
+ * The default `unicode61` tokenizer emits ONE token per run of CJK between
+ * punctuation, so a query matched only when it equalled a whole run: every
+ * natural re-wording (a substring of what is stored) returned nothing.
+ * Measured on the memories actually stored here — 分词器, 中文记忆, 空格分词,
+ * 真相源, 工程取舍 all scored 0.
+ *
+ * `trigram` fixes the Chinese and BREAKS short Latin: `CI`, `Go`, `L3`, `v9`
+ * become unsearchable (this corpus contains 163 distinct sub-3-character
+ * tokens), and it matches across word boundaries, so `cat` starts hitting
+ * `concatenate`. Bigram-indexing the CJK into its own column keeps
+ * `unicode61` — and therefore every Latin token and the existing phrase,
+ * escaping and `rank` semantics — exactly as it was, while making Chinese
+ * reachable down to two characters (`取舍`, which trigram cannot match either).
+ *
+ * It is written as SQL rather than a JS helper on purpose. The four write
+ * paths (propose, extract, and both rebuild kinds) all reach the index through
+ * ONE trigger set, so stating the rule there gives every writer — including
+ * ones not yet written — the same treatment. A JS helper would be the same
+ * rule copied four times, and a registered SQL function would silently mean
+ * "every connection must remember to register it or writes fail".
+ */
+const cjkBigrams = (expr: string): string => `
+  (SELECT coalesce(group_concat(bg, ' '), '') FROM (
+     WITH RECURSIVE pos(i, txt) AS (
+       SELECT 1, ${expr}
+       UNION ALL SELECT i + 1, txt FROM pos WHERE i < length(txt) - 1
+     )
+     SELECT substr(txt, i, 2) AS bg FROM pos
+     WHERE unicode(substr(txt, i, 1)) BETWEEN ${CJK_FIRST} AND ${CJK_LAST}
+        OR unicode(substr(txt, i + 1, 1)) BETWEEN ${CJK_FIRST} AND ${CJK_LAST}
+  ))`
+
+/**
+ * Whether the index is still FTS5 external-content (pre-v9). Asked of the
+ * schema rather than tracked as a version number, so migrations that run
+ * BEFORE v9 keep using the contentless-table commands that were correct then
+ * and the ones after use the plain table — one probe instead of a version
+ * comparison duplicated at each call site.
+ */
+const ftsIsExternalContent = (db: DatabaseSync): boolean => {
+  const row = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE name = 'memories_fts'`)
+    .get() as { sql: string } | undefined
+  return row !== undefined && row.sql.includes('content=memories')
+}
+
+/** Repopulate the index from `memories`, whichever shape it currently has. */
+const refillFtsIndex = (db: DatabaseSync): void => {
+  if (ftsIsExternalContent(db)) {
+    db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')`)
+    return
+  }
+  db.exec(`
+    DELETE FROM memories_fts;
+    INSERT INTO memories_fts(rowid, title, body, cjk)
+      SELECT rowid, title, body, ${cjkBigrams("title || ' ' || body")} FROM memories;
+  `)
+}
+
+/**
+ * The three triggers that keep the index in step with `memories` — the ONE
+ * place the bigram rule is stated, so every write path inherits it.
+ */
+const recreateFtsTriggers = (db: DatabaseSync): void => {
+  // Match the index that EXISTS right now. A migration older than v9 rebuilds
+  // `memories` while the index is still external-content and has no `cjk`
+  // column, so emitting today's trigger there would fail at CREATE time.
+  if (ftsIsExternalContent(db)) {
+    db.exec(`
+      CREATE TRIGGER mem_ai AFTER INSERT ON memories BEGIN
+        INSERT INTO memories_fts(rowid, title, body) VALUES (new.rowid, new.title, new.body);
+      END;
+      CREATE TRIGGER mem_ad AFTER DELETE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, title, body)
+        VALUES ('delete', old.rowid, old.title, old.body);
+      END;
+      CREATE TRIGGER mem_au AFTER UPDATE OF title, body ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, title, body)
+        VALUES ('delete', old.rowid, old.title, old.body);
+        INSERT INTO memories_fts(rowid, title, body) VALUES (new.rowid, new.title, new.body);
+      END;
+    `)
+    return
+  }
+  const row = cjkBigrams("new.title || ' ' || new.body")
+  db.exec(`
+    CREATE TRIGGER mem_ai AFTER INSERT ON memories BEGIN
+      INSERT INTO memories_fts(rowid, title, body, cjk)
+      VALUES (new.rowid, new.title, new.body, ${row});
+    END;
+    CREATE TRIGGER mem_ad AFTER DELETE ON memories BEGIN
+      DELETE FROM memories_fts WHERE rowid = old.rowid;
+    END;
+    CREATE TRIGGER mem_au AFTER UPDATE OF title, body ON memories BEGIN
+      DELETE FROM memories_fts WHERE rowid = old.rowid;
+      INSERT INTO memories_fts(rowid, title, body, cjk)
+      VALUES (new.rowid, new.title, new.body, ${row});
+    END;
+  `)
+}
+
+/**
  * Every trigger attached to `memories`, in one place.
  *
  * `DROP TABLE` takes a table's triggers with it, so any migration that
@@ -46,21 +158,8 @@ const createMemoryTriggers = (db: DatabaseSync): void => {
       DELETE FROM memories WHERE derived != ${LAYER.RAW};
       INSERT INTO meta (k, v) VALUES ('store_revision', '1')
         ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT);`
+  recreateFtsTriggers(db)
   db.exec(`
-    -- FTS external-content sync (v1).
-    CREATE TRIGGER mem_ai AFTER INSERT ON memories BEGIN
-      INSERT INTO memories_fts(rowid, title, body) VALUES (new.rowid, new.title, new.body);
-    END;
-    CREATE TRIGGER mem_ad AFTER DELETE ON memories BEGIN
-      INSERT INTO memories_fts(memories_fts, rowid, title, body)
-      VALUES ('delete', old.rowid, old.title, old.body);
-    END;
-    CREATE TRIGGER mem_au AFTER UPDATE OF title, body ON memories BEGIN
-      INSERT INTO memories_fts(memories_fts, rowid, title, body)
-      VALUES ('delete', old.rowid, old.title, old.body);
-      INSERT INTO memories_fts(rowid, title, body) VALUES (new.rowid, new.title, new.body);
-    END;
-
     -- D2, data-driven: 'private' is allowed in the global store and only there (v3).
     CREATE TRIGGER guard_visibility_insert BEFORE INSERT ON memories
       WHEN (new.visibility = 'private')
@@ -149,8 +248,8 @@ const rebuildMemories = (db: DatabaseSync, ...overrides: readonly string[]): voi
     DROP TABLE memories;
     ALTER TABLE memories_rebuilt RENAME TO memories;
     CREATE INDEX memories_decay ON memories(status, updated_at);
-    INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
   `)
+  refillFtsIndex(db)
   createMemoryTriggers(db)
 }
 
@@ -195,6 +294,10 @@ const migrateV1 = (db: DatabaseSync): void => {
 
     CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
 
+    -- The tokenizer OF THIS ERA, kept verbatim. A migration reproduces the
+    -- store as it was; writing today's choice here would make the upgrade
+    -- untestable, because the "before" would already be the "after". v9
+    -- re-tokenizes.
     CREATE VIRTUAL TABLE memories_fts USING fts5(
       title, body, content=memories, content_rowid=rowid);
     CREATE TRIGGER mem_ai AFTER INSERT ON memories BEGIN
@@ -433,6 +536,51 @@ const migrateV7 = (db: DatabaseSync): void => {
   )
 }
 
+/**
+ * user_version = 8: a failed job records WHY it failed.
+ *
+ * A dead letter used to be unattributable after the fact: the reason lived
+ * only in a log line, and logs rotate. Live proof — the global store's L3
+ * portrait job burned five attempts and its cause was already unrecoverable
+ * when someone came to ask. The evidence for a decision must outlive the
+ * logs, which is the same rule §9 already follows for metrics (computed from
+ * stored rows, never accumulated in memory).
+ *
+ * One nullable column on the row that already exists, written at the single
+ * failure exit. Not a new table (a job has at most one last cause), and not a
+ * per-attempt history (the question is "why is this stuck now", and keeping
+ * every attempt would grow without bound for a permanently broken route).
+ */
+const migrateV8 = (db: DatabaseSync): void => {
+  db.exec(`ALTER TABLE jobs ADD COLUMN last_error TEXT`)
+}
+
+/**
+ * user_version = 9: the index gains a CJK bigram column, so Chinese is
+ * reachable by re-wording instead of only verbatim.
+ *
+ * The store held Chinese memories `memory_recall` could not find unless the
+ * query repeated a whole punctuation-delimited run of the stored wording — a
+ * failure the project had already written down AS a memory, which is what made
+ * it measurable.
+ *
+ * The index stops being external-content: `cjk` is derived text with no column
+ * behind it in `memories`. Its rows are still fully derived from `memories`,
+ * so the table is rebuilt from there and the sync triggers (recreated by
+ * `createMemoryTriggers`) keep it current from the single place they live.
+ */
+const migrateV9 = (db: DatabaseSync): void => {
+  db.exec(`
+    DROP TABLE memories_fts;
+    CREATE VIRTUAL TABLE memories_fts USING fts5(title, body, cjk);
+    DROP TRIGGER mem_ai;
+    DROP TRIGGER mem_ad;
+    DROP TRIGGER mem_au;
+  `)
+  refillFtsIndex(db)
+  recreateFtsTriggers(db)
+}
+
 const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
   migrateV1,
   migrateV2,
@@ -441,6 +589,8 @@ const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
   migrateV5,
   migrateV6,
   migrateV7,
+  migrateV8,
+  migrateV9,
 ]
 
 /**
@@ -457,6 +607,14 @@ const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
  * `foreign_key_check` below re-validates before anything is committed.
  * Deferred enforcement would not do: the cascade is a DELETE, not a
  * constraint violation, so there would be nothing left to check.
+ *
+ * Temp storage is pinned to MEMORY for the same window. Dropping a table —
+ * which every rebuild migration does — makes SQLite reach for a temporary
+ * FILE, whose location comes from the environment (TMPDIR, and on some
+ * sandboxes nowhere writable at all). Measured: v9 failed with "unable to
+ * open database file" purely because that spill had nowhere to go. A
+ * migration must depend on the store it was handed, not on the ambient
+ * filesystem, and these transactions are small enough to hold in memory.
  */
 export const migrate = (
   db: DatabaseSync,
@@ -464,10 +622,13 @@ export const migrate = (
   target: number = TARGET_USER_VERSION,
 ): void => {
   db.exec('PRAGMA foreign_keys = OFF')
+  const temp = readPragma(db, 'temp_store')
+  db.exec('PRAGMA temp_store = MEMORY')
   try {
     migrateWithForeignKeysOff(db, kind, target)
   } finally {
     db.exec('PRAGMA foreign_keys = ON')
+    db.exec(`PRAGMA temp_store = ${temp}`)
   }
 }
 
@@ -508,7 +669,24 @@ const migrateWithForeignKeysOff = (
         `migration left ${dangling.length} dangling foreign key row(s); rolled back`,
       )
     }
-    db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('integrity-check')`)
+    // 'integrity-check' verifies an external-content index against its source.
+    // Once the index owns its rows (v9), the equivalent proof is that every
+    // memory has an index row — checked directly rather than skipped.
+    if (ftsIsExternalContent(db)) {
+      db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('integrity-check')`)
+    } else {
+      const missing = db
+        .prepare(
+          `SELECT count(*) AS n FROM memories m
+           WHERE NOT EXISTS (SELECT 1 FROM memories_fts f WHERE f.rowid = m.rowid)`,
+        )
+        .get() as { n: number }
+      if (missing.n > 0) {
+        throw new MigrationError(
+          `migration left ${missing.n} memor(ies) unindexed; rolled back`,
+        )
+      }
+    }
     db.exec(`PRAGMA application_id = ${APPLICATION_ID}`)
     db.exec(`PRAGMA user_version = ${target}`)
   })

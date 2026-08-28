@@ -145,6 +145,9 @@ export class JobRunner {
       this.ctx.logger.warn(
         `strataloom: job ${job.id} (${job.kind}) dead-lettered after ${job.attempts} claims`,
       )
+      // Keep whatever cause the LAST real attempt recorded: the dead-letter
+      // pass never ran the handler, so it has no diagnosis of its own and
+      // must not overwrite the one that explains the failure.
       failClaimedJob(store, job.id, job.leaseToken, job.attempts, true)
       return
     }
@@ -168,7 +171,7 @@ export class JobRunner {
       }
       this.ctx.logger.warn(`strataloom: job ${job.id} (${job.kind}) failed:`, error)
       try {
-        failClaimedJob(store, job.id, job.leaseToken, job.attempts, false)
+        failClaimedJob(store, job.id, job.leaseToken, job.attempts, false, error)
       } catch (exitError) {
         this.ctx.logger.warn(`strataloom: retry exit for ${job.id} failed:`, exitError)
       }

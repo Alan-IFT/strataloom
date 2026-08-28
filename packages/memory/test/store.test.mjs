@@ -9,6 +9,7 @@ import { migrate, MigrationError } from '../lib/store/schema.js'
 import { immediateTx } from '../lib/store/tx.js'
 import { APPLICATION_ID, TARGET_USER_VERSION } from '../lib/constants.js'
 import { StoreRegistry } from '../lib/store/store.js'
+import { toFtsPhrase } from '../lib/store/fts.js'
 import { openRegistry, cleanup, tempRoot } from './helpers.mjs'
 
 const openRaw = (path) => {
@@ -217,6 +218,125 @@ test('v6 -> v7 widens derived to a layer and carries the guards across', () => {
     0,
     'the widened triggers retire every layer, not just the old boolean rollup',
   )
+  db.close()
+  cleanup(root)
+})
+
+test('v7 -> v8 keeps queued work and records why a job failed', () => {
+  // A dead letter used to be unattributable once the log rotated, which is
+  // exactly when someone comes asking. The cause now rides the row.
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo', 7)
+  db.exec(`INSERT INTO jobs (id,kind,payload,state,attempts,run_after,created_at,completed_at)
+    VALUES ('old','rebuild','{}','failed',6,0,0,1)`)
+
+  migrate(db, 'repo', 8)
+  assert.equal(userVersion(db), 8)
+  const carried = db.prepare(`SELECT state, attempts, last_error FROM jobs WHERE id='old'`).get()
+  assert.equal(carried.state, 'failed', 'existing rows survive the upgrade')
+  assert.equal(carried.attempts, 6)
+  assert.equal(carried.last_error, null, 'a job that failed before v8 has no recorded cause')
+
+  db.exec(`UPDATE jobs SET last_error = 'StrataloomPipelineLlmError: stream finished as max-tokens'
+           WHERE id='old'`)
+  assert.match(
+    db.prepare(`SELECT last_error FROM jobs WHERE id='old'`).get().last_error,
+    /max-tokens/,
+  )
+  db.close()
+  cleanup(root)
+})
+
+test('v8 -> v9 retokenizes the index so Chinese is found by re-wording', () => {
+  // The live failure this fixes: the default tokenizer emits one token per
+  // CJK run between punctuation, so a query matched only when it equalled a
+  // whole run. A natural re-wording — any substring of what is stored — missed
+  // a memory sitting right there.
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo', 8)
+  const now = Date.now()
+  db.prepare(
+    `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at)
+     VALUES ('zh','coding','repo-local','active',?,?,'human',?,?)`,
+  ).run('检索中文记忆用连续词组，空格分词会变成 AND 而落空', 'FTS5 建表没有配置中文分词器。', now, now)
+  // A short Latin identifier, the case a trigram index would have broken.
+  db.prepare(
+    `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at)
+     VALUES ('en','fact','repo-local','active',?,?,'human',?,?)`,
+  ).run('CI runs on Go', 'the CI job builds with Go and npm', now, now)
+
+  // Query through the SAME builder the recall path uses: the stored expansion
+  // and the query expansion are two halves of one rule, so testing the index
+  // with a hand-rolled phrase would prove nothing about real recall.
+  const hits = (text) =>
+    db
+      .prepare(`SELECT count(*) c FROM memories_fts WHERE memories_fts MATCH ?`)
+      .get(toFtsPhrase(text)).c
+
+  // Under the old tokenizer a CJK run between punctuation is ONE token, so
+  // only a query equal to a whole such run could match. These are all
+  // substrings of what is stored, and all missed it.
+  for (const missed of ['分词器', '空格分词', '中文记忆', '落空']) {
+    assert.equal(hits(missed), 0, `the old index could not find ${missed}`)
+  }
+  assert.equal(hits('CI'), 1, 'short Latin worked before and must keep working')
+
+  migrate(db, 'repo', 9)
+  assert.equal(userVersion(db), 9)
+  for (const found of ['分词器', '空格分词', '中文记忆', '落空']) {
+    assert.equal(hits(found), 1, `a re-worded query now reaches the memory: ${found}`)
+  }
+  assert.equal(hits('检索中文记忆用连续词组'), 1, 'the verbatim query keeps working')
+  // The reason this is bigrams and not trigrams: two-character words are the
+  // common case in Chinese, and short Latin identifiers must not regress.
+  assert.equal(hits('落空'), 1, 'a two-character word is findable')
+  assert.equal(hits('CI'), 1, 'short Latin still resolves — no trigram regression')
+
+  // Escaping, operators-as-words and the index/table agreement are unchanged.
+  db.prepare(
+    `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at)
+     VALUES ('ops','fact','repo-local','active',?,?,'human',?,?)`,
+  ).run('quote "handling"', 'AND OR NOT are plain words here', now, now)
+  assert.equal(hits('AND OR NOT'), 1, 'FTS operators stay literal text')
+  assert.equal(hits('quote "handling"'), 1)
+  // Every memory is indexed — the contentless index's version of the old
+  // external-content 'integrity-check'.
+  assert.equal(
+    db.prepare(
+      `SELECT count(*) c FROM memories m
+       WHERE NOT EXISTS (SELECT 1 FROM memories_fts f WHERE f.rowid = m.rowid)`,
+    ).get().c,
+    0,
+  )
+  db.close()
+  cleanup(root)
+})
+
+test('the stored bigrams and the query bigrams are the same rule', () => {
+  // The expansion exists twice by necessity — SQL on write, JS on read. If the
+  // two ever disagree, Chinese recall breaks silently, so assert they agree on
+  // the same input rather than trusting that both were edited together.
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo')
+  const now = Date.now()
+  const text = '少就是多，删除优于完善'
+  db.prepare(
+    `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at)
+     VALUES ('a','fact','repo-local','active',?,'','human',?,?)`,
+  ).run(text, now, now)
+
+  const storedTokens = new Set(
+    db.prepare(`SELECT cjk FROM memories_fts`).get().cjk.split(' ').filter(Boolean),
+  )
+  // Every bigram the reader would search for must be one the writer stored.
+  for (const token of toFtsPhrase(text).split(' AND ')) {
+    const bare = token.slice(1, -1)
+    if (!/[\u3400-\u9fff]/.test(bare)) continue
+    assert.ok(storedTokens.has(bare), `query bigram ${bare} is not in the index`)
+  }
   db.close()
   cleanup(root)
 })
