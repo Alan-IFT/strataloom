@@ -1,7 +1,19 @@
 /**
  * Pipeline prompt templates, versioned (spec §1: prompts.ts 带版本号).
- * The version rides every job payload so a replayed job renders the prompt
- * it was enqueued for.
+ *
+ * The version is stamped into every job payload, but nothing reads it back: a
+ * retry renders the CURRENT template, not the one it was enqueued under. That
+ * is said plainly because this comment used to promise the opposite, and a
+ * promise the code does not keep is worse than no promise at all.
+ *
+ * Current-template rendering is the behaviour we want so far. v1 → v2
+ * tightened the contract (hand-joined lines became a JSON object), so a job
+ * queued under v1 simply gets the better prompt on its next attempt, with no
+ * migration to write. The stamp stays because it costs nothing and makes an
+ * old payload self-describing when reading history. If a template ever
+ * changes in a way that is NOT backward compatible, this is the seam where
+ * dispatch would belong — building it before such a change exists would be
+ * machinery for a need nobody has shown.
  * @module @strataloom/dsh-memory/pipeline/prompts
  */
 import {

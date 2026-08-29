@@ -1,7 +1,30 @@
 # 当前状态
 
-> 最后更新：2026-08-28 · 重启已验收；rollup 输入无界已修（v0.3.2 / schema v9）
+> 最后更新：2026-08-29 · **v0.3.4 已上线并验收**（schema v9）
 > **每次工作结束时更新本页**，它是新会话的唯一入口。
+
+## v0.3.4 上线验收（2026-08-29 11:20 重启后）
+
+三处修复均已装载并生效，8 库 `user_version` 全为 9，重启后**新增 failed job 为 0**。
+
+- **subagent 归因**：已安装代码确为按 `source.kind` 判定，旧的 `plugin+relay`
+  死分支已不存在；活体喂入两种 source 形状，label 得到 `subagent:<id前8位>`、
+  provenance 得到 `subagent`，未知 kind 仍 fail closed 到 `tool-output`。
+  库中 10 行历史物证（`label='context'` 且内容含 `Background subagent`）
+  **保持原样未回填**——回填会伪造历史。
+- **extract JSON 化**：对 22 个真实 turn 重放，全部产出合法 JSON 且
+  `length ≤ 6000`（最大 5972）；伪造攻击实测**无法制造出额外 events 条目**，
+  攻击文本只能作为字符串值存活。
+- **死信治理**：global 那条 revision=3 的不可达 rebuild **已被 cleanup 删除**
+  （此前存在 5 天）；`5ed2b4d2` 的 extract 死信（turn 9，永久放弃的工作，
+  唯一物证）**正确保留**；8 库 `store_revision` 均为规范十进制串。
+
+**待观察的天然验证点**：`5ed2b4d2` 有一条 `turn=20` 的 pending extract，
+`attempts=4/5`，失败原因正是 `model reply is not valid JSON`——**距死信仅剩
+一次**。它是 0.3.3 时期积累的（既有问题），而下次重试会走 v2 提示词 +
+JSON 渲染 + 宽容解析（`promptVersion` 只写不读，故重试自动用当前实现），
+三处修复恰好都作用在它失败的那条路径上。**它转为 `done` 还是死信，是本次
+升级最直接的实战证据**，值得下次开工时先查一眼。
 
 ## 重启后的真实结果（已验收）
 
