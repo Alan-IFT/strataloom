@@ -35,7 +35,7 @@ dsh plugin --profile web add \
 Restart, then confirm from the log line the plugin prints at startup:
 
 ```
-strataloom 0.3.3 ready (data: /home/you/.dsh/strataloom)
+strataloom 0.3.4 ready (data: /home/you/.dsh/strataloom)
 ```
 
 **Your memories are not touched.** They live in `~/.dsh/strataloom/`, outside
@@ -70,7 +70,7 @@ For a checkout you are modifying:
 ```bash
 cd packages/memory
 npm install        # platform packages come from npm; nothing else is needed
-npm run verify     # typecheck + 135 tests — do this before installing
+npm run verify     # typecheck + 153 tests — do this before installing
 npm pack           # -> strataloom-dsh-memory-<version>.tgz
 dsh plugin --profile web add ./strataloom-dsh-memory-<version>.tgz
 ```
