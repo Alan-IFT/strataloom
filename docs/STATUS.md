@@ -309,11 +309,22 @@ npm run verify        # tsc + 153 测试
   `npm_config_cache=/tmp/npmcache` 之类重定向；不是代码或用户机器的问题。
 - 测试自身干净退出（已修复过一次遗漏 dispose 的泄漏），不需要
   `--test-force-exit`——如果需要它才能退出，说明某处忘了 dispose。
-- **pnpm 更新陷阱**：稳定安装 URL（`releases/latest/download/...`）能保证
-  服务端「这个 URL 永远指向最新版」，但 pnpm 把 URL 依赖的 resolution
-  **钉在锁文件里**，同一 specifier 不会触发重新拉取——`add` 甚至
-  `update --force` 都只是无害地重跑一遍，实际文件不变。唯一可靠的更新
-  路径是先 `remove` 再 `add`（已写进 `INSTALL.md`）。这是实测发现的，不是
-  猜测：一次真实发布因此让已安装的 profile 停留在旧版本却报告成功。
+- **升级装不上时先读 stderr，别先怪缓存**（2026-08-29 更正）。此处原写
+  「pnpm 把 resolution 钉在锁文件里，`add` 只是无害地重跑一遍，实际文件不变」
+  ——**该叙述已被证伪**。两种真实失败都不是「无害」：
+  - **写不进去**：agent 的文件沙箱只允许写工作区，而 profile 在
+    `~/.dsh/profiles/` 之外。`pnpm` 打印 `[EACCES] ... open '.../_tmp_xxx'`
+    后**仍返回 exit 0**，`dsh plugin` 又吞掉细节，于是「命令看似成功、版本
+    没变」被误读成缓存问题。判据：`pnpm-lock.yaml` 的 mtime 停在上次成功
+    安装那一刻，说明历次 remove/add/prune/`--force` **从未写盘**。
+  - **内容对不上**：稳定资产名使 URL 不变而字节改变，锁文件钉的是**旧字节
+    的哈希**。在可写环境里 pnpm 以 `ERR_PNPM_TARBALL_INTEGRITY` **非零退出
+    拒绝安装**（按供应链风险处理），而非静默复用；此时 `remove` 再 `add`
+    确实有效（已在纯净副本上复现）。
+
+  排查顺序：贴 stderr 原文 → 比对三处版本（锁文件的 `version:`、
+  `node_modules/<pkg>/package.json`、release 资产内的 `package.json`）→ 用
+  `touch` 探针确认目录可写。**「实测」二字要能指出命令与原文输出**；上面那条
+  错误结论正是只看退出码与最终版本号得出的。
 - 全量测试约 1.6 秒；跑单文件时加 `--test-force-exit`（有常驻 interval）。
 - 数据位置：`~/.dsh/strataloom/`（`global.sqlite` + `repos/<key>/`）。

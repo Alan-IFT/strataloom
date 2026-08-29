@@ -16,15 +16,15 @@ Then restart the harness.
 ## Update
 
 `latest/download/` redirects to the newest release, and the asset name carries
-no version, so the URL always means "current" — but pnpm resolves a URL
-dependency once and pins that resolution in the lockfile. Running the install
-command again is a no-op if the URL string has not changed: pnpm sees the same
-specifier, trusts the lockfile's `integrity`, and never re-fetches. Measured,
-not assumed — running `add` again on a real profile silently kept a previous
-build in place while reporting success.
+no version, so the URL always means "current" — but pnpm pins a URL
+dependency's resolution in the lockfile, `integrity` included. When a release
+replaces the bytes behind that unchanged URL, `add` alone does not quietly keep
+the old build: it **fails loudly** with `ERR_PNPM_TARBALL_INTEGRITY` and a
+non-zero exit, because a URL whose content changed is, from pnpm's side,
+indistinguishable from a supply-chain swap.
 
-Remove, then add, so pnpm treats it as a new dependency instead of reusing a
-pinned resolution:
+Remove first so the pinned resolution is gone, then add, so the new bytes are
+fetched and hashed fresh:
 
 ```bash
 dsh plugin --profile web remove @strataloom/dsh-memory
@@ -37,6 +37,13 @@ Restart, then confirm from the log line the plugin prints at startup:
 ```
 strataloom 0.3.4 ready (data: /home/you/.dsh/strataloom)
 ```
+
+If the version did not change, read the command's stderr before suspecting a
+cache. `pnpm` can print `[EACCES] ... open '.../\_tmp_xxx'` and still exit 0 —
+that is a sandbox or permission problem writing the profile, not a stale
+resolution, and no amount of `remove`/`prune`/`--force` will help until the
+directory is writable. The tell is `pnpm-lock.yaml`: if its mtime still points
+at the previous successful install, nothing was ever written.
 
 **Your memories are not touched.** They live in `~/.dsh/strataloom/`, outside
 the plugin directory, and an update only replaces code. If the new build needs

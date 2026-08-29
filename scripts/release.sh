@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Publish a release whose asset is directly installable, and updatable via
-# INSTALL.md's remove-then-add (see that file for why plain `add` twice is a
-# silent no-op: pnpm pins a URL dependency's resolution in the lockfile and
-# does not re-fetch just because the server-side content changed).
+# INSTALL.md's remove-then-add (see that file: pnpm pins a URL dependency's
+# resolution, integrity included, so a plain `add` over changed bytes fails
+# loudly with ERR_PNPM_TARBALL_INTEGRITY rather than silently reusing).
 #
 #   dsh plugin --profile <name> add https://.../releases/latest/download/strataloom-dsh-memory.tgz
 #
@@ -30,15 +30,19 @@ asset="strataloom-dsh-memory.tgz"
 
 # Refuse to re-publish a version that already has a release.
 #
-# The install URL is deliberately version-free so that one command means
-# "current" forever — but pnpm keys its store on the URL AND the package
-# version, so overwriting an existing version's asset leaves every installed
-# copy untouched: `add` reports success, reuses the cached unpack, and the new
-# code never arrives. Measured, not theorised: publishing twice as 0.1.0 left
-# a profile running the previous build while claiming to be up to date.
+# The install URL is deliberately version-free, which makes it a promise about
+# BYTES: any lockfile that resolved it stored the `integrity` of what it saw.
+# Replacing an already-published version's asset breaks that promise for every
+# profile holding it — their next install fails with
+# ERR_PNPM_TARBALL_INTEGRITY, because content changing under a fixed URL is
+# indistinguishable from a supply-chain swap.
 #
-# The version is therefore the update signal, and forgetting to bump it is a
-# silent no-op for every user. Fail here instead.
+# So this guard protects other people's working installs, not just this
+# release. Fail here instead.
+#
+# (This comment previously said a re-publish was a SILENT no-op that left
+# profiles on the old build while reporting success. That was wrong — pnpm
+# exits non-zero and refuses to install. The guard stands; its reason did not.)
 if gh release view "$tag" >/dev/null 2>&1; then
   cat >&2 <<EOF
 error: $tag is already released.
