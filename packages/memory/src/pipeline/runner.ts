@@ -29,6 +29,7 @@ import { runExtractJob, type ExtractPayload, type ReconcilePayload } from './ext
 import { runReconcileJob } from './reconcile.ts'
 import { pruneConversations } from '../store/conversations.ts'
 import { collectMetrics } from '../metrics.ts'
+import { isBusy } from '../store/tx.ts'
 import { runDecayJob } from './decay.ts'
 import { enqueueRebuildIfOverflowing, runRebuildJob, type RebuildPayload } from './rebuild.ts'
 
@@ -65,7 +66,41 @@ const HANDLERS: Record<JobKind, (run: JobRun) => Promise<void>> = {
  * decides WHEN work happens, not what maintenance means.
  */
 const maintain = (ctx: Context, store: OpenStore, now: number): void => {
-  ctx.logger.info('strataloom metrics', collectMetrics(store, now))
+  // Pure observation, guarded on its own: a metrics snapshot must not have the
+  // power to stop the system it is measuring. Everything below MUTATES the
+  // store and stays all-or-nothing — a failed write means maintenance did not
+  // happen and must be seen as such — but this line only READS and then hands
+  // the numbers to a logger, so aborting the pass on its behalf trades real
+  // maintenance for a log line.
+  //
+  // The guard costs nothing under the contention that actually breaks this
+  // pass: SQLITE_BUSY strikes writers, and these reads return normally while a
+  // writer holds the lock (measured), so this catch never swallows a busy
+  // error and never spends a busy-retry budget.
+  //
+  // One reason is the logger exporter: it is injected by the deployment, lives
+  // outside this repository, and cannot be audited from here — which is why it
+  // must not hold a veto over maintenance. That reach is narrower than it
+  // sounds, and saying so is the point: this catch covers the exporter's INFO
+  // call only. The `warn` below is outside it, so an exporter that throws on
+  // every channel still aborts the pass. Closing that would mean wrapping
+  // every log call in the runner, which buys little for a failure mode nobody
+  // has reported — but the limit belongs in writing rather than in a reader's
+  // assumption.
+  //
+  // Its reach over BAD DATA is narrow, and the narrowness is measured rather
+  // than assumed: dropping each table in turn, only `usage` lets this guard
+  // rescue the WHOLE pass, because it is the sole table that observation reads
+  // and no maintenance write step touches. Break `conversations`, `memories`
+  // or `jobs` instead and the guard merely defers the throw by one step —
+  // `pruneConversations`, `enqueueRebuild…` and `cleanupJobs` respectively hit
+  // the same damage. So this is not general protection against poisoned data;
+  // the principle it enforces is the one below.
+  try {
+    ctx.logger.info('strataloom metrics', collectMetrics(store, now))
+  } catch (error) {
+    ctx.logger.warn(`strataloom: metrics unavailable for store ${store.repoKey}:`, error)
+  }
   cleanupJobs(store, now)
   // L0 is bulky and its purpose is finite; rows a live memory cites are
   // exempt, so a memory never outlives the words behind it.
@@ -127,8 +162,45 @@ export class JobRunner {
     if (doCleanup) this.lastCleanup = now
     for (const store of this.stores.all()) {
       if (this.stopped) return
+      // Maintenance is guarded SEPARATELY from job claiming, because the two
+      // are independent duties that happen to share a tick. Sharing one try
+      // block made a maintenance failure cancel the whole store's pipeline for
+      // that tick: with `collectMetrics` throwing, a pending extract job in the
+      // same store stayed at `attempts = 0` — one broken periodic chore, zero
+      // jobs run.
+      //
+      // `maintain` itself keeps its all-or-nothing semantics: it still aborts
+      // on the first throw and only logs. That is deliberate under the failure
+      // that actually occurs here — SQLITE_BUSY from a second process on the
+      // same repository, which hits its WRITE steps. `sleepSync` blocks the
+      // event loop via `Atomics.wait`, so each write step that exhausts its
+      // budget freezes for BUSY_TIMEOUT_MS * (IMMEDIATE_TX_RETRIES + 1) = 8s.
+      // Stopping at the first throw pays that once; guarding each step
+      // individually would pay it per step (~24s). Under contention,
+      // all-or-nothing IS the early exit — a feature, not a gap (ADR 0006).
+      if (doCleanup) {
+        try {
+          maintain(this.ctx, store, now)
+        } catch (error) {
+          this.ctx.logger.warn(
+            `strataloom: maintenance failed for store ${store.repoKey}:`,
+            error,
+          )
+          // A busy failure already PROVED another process holds the write
+          // lock. `claimNextJob` is itself an `immediateTx` with its own full
+          // retry budget, so continuing would re-lose the same race and pay a
+          // SECOND ~8s freeze — the very arithmetic that rejects per-step
+          // guards, applied to the step that happens to live outside the try
+          // block (measured: 16936ms, and `attempts` still 0).
+          //
+          // Non-busy failures (bad or poisoned data) leave the lock free, so
+          // claiming proceeds: that is the connection this split exists to
+          // break, and it stays broken for every failure that does not carry
+          // this specific proof.
+          if (isBusy(error)) continue
+        }
+      }
       try {
-        if (doCleanup) maintain(this.ctx, store, now)
         if (peekClaimable(store, now) === undefined) continue
         if (this.busy(store)) continue // heavy jobs wait for agent idle
         const job = claimNextJob(store, now, now + LEASE_DURATION_MS)

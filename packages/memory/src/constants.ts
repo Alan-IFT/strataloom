@@ -111,8 +111,12 @@ export const ROLLUP_SOURCE_LIMIT = 200
  */
 export const ROLLUP_TRANSCRIPT_CHARS = 6_000
 
-/** Decay runs at most once per this interval, per store. */
-export const DECAY_INTERVAL_MS = 86_400_000
+/* `DECAY_INTERVAL_MS` used to sit here, and nothing ever read it. Decay's
+   once-per-day cadence is not a comparison against an interval — it is the
+   idempotence key `jobId('decay', repoKey, <YYYY-MM-DD>)`, so a second enqueue
+   on the same day collapses into the row that already exists. A constant that
+   states a rule the code implements elsewhere is a second source of truth
+   waiting to drift; removed rather than wired up. */
 
 /** L0 conversation retention: raw turns outlive the jobs that read them,
  * but not forever — rows a live memory still cites are exempt. */

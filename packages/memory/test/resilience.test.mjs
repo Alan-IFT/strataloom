@@ -20,11 +20,17 @@ import { MemoryService } from '../lib/service.js'
 import { registerTools } from '../lib/tools.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import { JobRunner } from '../lib/pipeline/runner.js'
-import { commitClaimedJob, enqueueJob, claimNextJob, FencingError } from '../lib/pipeline/jobs.js'
+import {
+  commitClaimedJob,
+  enqueueJob,
+  claimNextJob,
+  jobId,
+  FencingError,
+} from '../lib/pipeline/jobs.js'
 import { runDecayJob } from '../lib/pipeline/decay.js'
 import { pruneConversations } from '../lib/store/conversations.js'
 import { queryInjectionRows } from '../lib/store/fts.js'
-import { IMMEDIATE_TX_RETRIES } from '../lib/constants.js'
+import { BUSY_TIMEOUT_MS, DONE_RETENTION_MS, IMMEDIATE_TX_RETRIES } from '../lib/constants.js'
 import { openRegistry, cleanup, tempRoot, fakeAgent, fakeCtx } from './helpers.mjs'
 
 const quiet = { warn() {}, info() {} }
@@ -362,6 +368,233 @@ test('storage that cannot support WAL is reported, not silently accepted', () =>
     'no false alarm on ordinary local disk',
   )
   watched.dispose()
+  registry.dispose()
+  cleanup(root)
+})
+
+/*
+ * `maintain` is deliberately NOT exported. `lastCleanup = 0` makes the FIRST
+ * tick a maintenance tick, so every assertion below is driven through the real
+ * `tick()` the scheduler uses, exactly like the rest of this file.
+ *
+ * The two breaks are different on purpose, and each isolates ONE fix:
+ *
+ * - `breakMaintenanceWrite` drops a table a WRITE step needs, so `maintain`
+ *   throws no matter how the read-only metrics line is guarded. That is the
+ *   only way to test the maintenance/claiming split by itself.
+ * - `breakMetrics` drops a table only `collectMetrics` reads, which is the
+ *   reproduced bad-data path — and, once the metrics line is guarded, is
+ *   precisely a failure `maintain` must ABSORB rather than abort on.
+ */
+const breakMaintenanceWrite = (store) => store.db.exec('DROP TABLE conversations')
+const breakMetrics = (store) => store.db.exec('DROP TABLE usage')
+
+test('runner: a failed maintenance pass does not cancel the same store\'s job pipeline', async () => {
+  // The regression this locks: `maintain` and job claiming used to share ONE
+  // try block, so a throwing periodic chore took the whole tick down with it
+  // and the store ran zero jobs. Measured before the fix: attempts stayed 0.
+  //
+  // Maintenance is broken at a WRITE step (`pruneConversations`), which is
+  // also the shape the real trigger takes — SQLITE_BUSY hits writers. A
+  // read-only break would be absorbed by the metrics guard and would prove
+  // nothing about this split.
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  enqueueJob(store, 'extract', 'j1', { sessionId: 's', turn: 1 }, 0)
+  breakMaintenanceWrite(store)
+
+  const warnings = []
+  const ctx = fakeCtx({})
+  ctx.logger = { info() {}, warn: (message) => warnings.push(String(message)) }
+
+  const runner = new JobRunner(ctx, registry, () => false)
+  runner.tick()
+  await runner.whenSettled() // must not reject
+
+  assert.equal(
+    store.db.prepare(`SELECT attempts FROM jobs WHERE id = 'j1'`).get().attempts,
+    1,
+    'the job was still claimed and attempted despite maintenance failing',
+  )
+  assert.ok(
+    warnings.some((line) => line.includes('maintenance failed')),
+    'the maintenance failure is reported, not swallowed',
+  )
+  await runner.dispose()
+  registry.dispose()
+  cleanup(root)
+})
+
+test('runner: observation cannot stop the system it observes', async () => {
+  // `collectMetrics` only READS and hands numbers to a logger. Letting it
+  // abort the pass would trade real maintenance — job cleanup, L0 pruning,
+  // the daily decay enqueue — for a log line. Everything AFTER it still runs.
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+
+  // An over-age `done` row: proof that `cleanupJobs` actually executed, not
+  // merely that nothing threw.
+  const stale = Date.now() - DONE_RETENTION_MS - 86_400_000
+  store.db
+    .prepare(
+      `INSERT INTO jobs (id, kind, payload, state, attempts, run_after, created_at, completed_at)
+       VALUES ('old', 'extract', '{}', 'done', 1, 0, ?, ?)`,
+    )
+    .run(stale, stale)
+
+  breakMetrics(store)
+
+  // A busy principal keeps the tick from CLAIMING anything, so what the
+  // assertions see is the enqueue itself rather than a job that also ran.
+  const runner = new JobRunner(fakeCtx({}), registry, () => true)
+  const before = new Date().toISOString().slice(0, 10)
+  runner.tick()
+  await runner.whenSettled()
+  const after = new Date().toISOString().slice(0, 10)
+
+  assert.equal(
+    store.db.prepare(`SELECT count(*) AS n FROM jobs WHERE id = 'old'`).get().n,
+    0,
+    'cleanupJobs ran: the over-age done row is gone',
+  )
+  const decay = store.db.prepare(`SELECT id FROM jobs WHERE kind = 'decay'`).all()
+  assert.equal(decay.length, 1, "today's decay job was enqueued")
+  assert.ok(
+    // Two dates accepted only so a tick crossing UTC midnight cannot flake.
+    [before, after].some((day) => decay[0].id === jobId('decay', store.repoKey, day)),
+    'the decay job carries the deterministic once-per-day idempotence key',
+  )
+  await runner.dispose()
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * Hold a real write lock on `dbPath` from a SEPARATE OS process and return
+ * once it is provably taken (the child signals through a marker file). Same
+ * shape as the `immediateTx` test at the top of this file — an in-process
+ * transaction would not reproduce contention, because SQLite serialises a
+ * single connection instead of returning SQLITE_BUSY.
+ */
+const holdWriteLockFrom = (dbPath, marker) => {
+  const child = spawn(process.execPath, [
+    '-e',
+    `
+    const { DatabaseSync } = require('node:sqlite');
+    const fs = require('node:fs');
+    const db = new DatabaseSync(${JSON.stringify(dbPath)});
+    db.exec('BEGIN IMMEDIATE');
+    db.exec("INSERT INTO meta (k, v) VALUES ('lockholder', '1')");
+    fs.writeFileSync(${JSON.stringify(marker)}, '1');
+    const until = Date.now() + 120000; while (Date.now() < until) {}
+    db.exec('ROLLBACK'); db.close();
+    `,
+  ])
+  const pause = new Int32Array(new SharedArrayBuffer(4))
+  const deadline = Date.now() + 5_000
+  while (!existsSync(marker)) {
+    if (Date.now() > deadline) throw new Error('child never took the lock')
+    Atomics.wait(pause, 0, 0, 10)
+  }
+  return child
+}
+
+/** One exhausted busy-retry budget, in milliseconds: the unit both tests below count in. */
+const oneBudget = BUSY_TIMEOUT_MS * (IMMEDIATE_TX_RETRIES + 1)
+
+test('runner: contention costs ONE busy-retry budget per tick, not one per step', async () => {
+  // Guarding each maintenance step separately looks like strictly more
+  // robustness, and it is the opposite. The failure that actually happens
+  // here is SQLITE_BUSY from a second process on the same repository, and it
+  // hits the WRITE steps. `tx.ts` retries with `sleepSync`, i.e. `Atomics.wait`
+  // — a SYNCHRONOUS freeze of the whole event loop — so every step that
+  // exhausts its budget costs BUSY_TIMEOUT_MS * (IMMEDIATE_TX_RETRIES + 1).
+  //
+  // Stopping at the first throw pays that ONCE (~8s). Catching per step would
+  // let each of the three write steps pay it in turn (~24s). Under contention
+  // the all-or-nothing pass is therefore an EARLY EXIT, and this test is here
+  // so that "let's also guard the other steps" fails loudly instead of
+  // tripling a freeze nobody measures.
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1') // opened BEFORE the lock is taken
+  const child = holdWriteLockFrom(join(root, 'repos', 'k1', 'memory.sqlite'), join(root, 'locked'))
+
+  // No claimable job, so the tick's wall clock IS the maintenance pass:
+  // `peekClaimable` is a read and returns normally while the writer holds the
+  // lock, which is also why guarding the read-only metrics line costs nothing.
+  // This deliberate exclusion is also this test's blind spot — see the
+  // claimable variant below, which exists because of it.
+  assert.equal(
+    store.db.prepare(`SELECT count(*) AS n FROM jobs`).get().n,
+    0,
+    'nothing claimable, so the measurement is maintenance alone',
+  )
+
+  const runner = new JobRunner(fakeCtx({}), registry, () => false)
+  const started = Date.now()
+  runner.tick()
+  await runner.whenSettled() // must not reject
+  const elapsed = Date.now() - started
+
+  child.kill()
+
+  assert.ok(
+    elapsed < 2 * oneBudget,
+    `one tick under contention froze for ${elapsed}ms; one busy-retry budget is ` +
+      `${oneBudget}ms, so anything at or above ${2 * oneBudget}ms means the ` +
+      'maintenance steps are being retried one after another',
+  )
+  await runner.dispose()
+  registry.dispose()
+  cleanup(root)
+})
+
+test('runner: a busy maintenance failure does not buy a SECOND freeze in claiming', async () => {
+  // The regression this locks, measured: 16936ms — 2.12 budgets — with
+  // `attempts` still 0. Double the freeze, and the job STILL was not claimed.
+  //
+  // The test above counts budgets with NOTHING claimable, which is exactly
+  // what let this through: it measures `maintain` alone. Splitting the try
+  // blocks made a swallowed maintenance failure fall through to
+  // `claimNextJob`, and that call is itself a `store.tx()` — an `immediateTx`
+  // with its OWN full retry budget. Against the same still-held lock it
+  // re-loses the same race and pays a second ~8s. The per-step arithmetic
+  // (ADR 0006) was right and simply did not scan this far: the "second step"
+  // that must not re-run lives OUTSIDE the try block.
+  //
+  // So: same lock, one pending job, same 2-budget ceiling.
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1') // opened BEFORE the lock is taken
+  enqueueJob(store, 'extract', 'j1', { sessionId: 's', turn: 1 }, 0)
+  const child = holdWriteLockFrom(join(root, 'repos', 'k1', 'memory.sqlite'), join(root, 'locked'))
+
+  assert.equal(
+    store.db.prepare(`SELECT count(*) AS n FROM jobs`).get().n,
+    1,
+    'a claimable job is present: this tick reaches the claim path, unlike the test above',
+  )
+
+  const runner = new JobRunner(fakeCtx({}), registry, () => false)
+  const started = Date.now()
+  runner.tick()
+  await runner.whenSettled() // must not reject
+  const elapsed = Date.now() - started
+
+  child.kill()
+
+  assert.ok(
+    elapsed < 2 * oneBudget,
+    `a tick with a claimable job froze for ${elapsed}ms; one busy-retry budget is ` +
+      `${oneBudget}ms, so anything at or above ${2 * oneBudget}ms means claiming ` +
+      're-lost the race that maintenance had already lost — a second freeze bought ' +
+      'nothing, since the lock is still held',
+  )
+  assert.equal(
+    store.db.prepare(`SELECT attempts FROM jobs WHERE id = 'j1'`).get().attempts,
+    0,
+    'the claim was skipped rather than attempted: the lock proved it could not succeed',
+  )
+  await runner.dispose()
   registry.dispose()
   cleanup(root)
 })

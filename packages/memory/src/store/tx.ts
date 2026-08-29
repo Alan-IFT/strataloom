@@ -9,7 +9,16 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { BUSY_BACKOFF_MS, IMMEDIATE_TX_RETRIES } from '../constants.ts'
 
-const isBusy = (error: unknown): boolean => {
+/**
+ * "Did this throw come from losing a lock race?" — exported because the
+ * scheduler needs the SAME answer this file acts on. A busy failure is the one
+ * failure that proves something about the NEXT write: the lock is held by
+ * another process, so a further write transaction would only re-lose the same
+ * race (`runner.ts` uses that to skip a doomed claim). Any second spelling of
+ * this predicate would be a second source of truth that drifts from the retry
+ * loop it is supposed to agree with.
+ */
+export const isBusy = (error: unknown): boolean => {
   const code = (error as { errcode?: number } | null)?.errcode
   // SQLITE_BUSY (5) and extended codes (261 BUSY_RECOVERY, 517 BUSY_SNAPSHOT…).
   return typeof code === 'number' && (code & 0xff) === 5
