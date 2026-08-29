@@ -1,7 +1,7 @@
 # StrataLoom — DSH 插件架构（v2.8 · 实现规范 · **已实现**）
 
 > **实现状态**：P0 + P1 + P2 全部落地于 `packages/memory`
-> （`@strataloom/dsh-memory`），135 个测试全绿，含真平台 e2e 与打包安装契约。
+> （`@strataloom/dsh-memory`），153 个测试全绿，含真平台 e2e 与打包安装契约。
 > schema 至 v9。实现闭环见 §13 前三节。
 > §12 仅余两项**经评审拒绝**的能力（连续 trust 公式、向量索引）未实现。
 >
@@ -163,7 +163,7 @@ packages/memory/                      # 实际布局（v2.7 校准，src 约 1.9
 │       ├── reconcile.ts  # 批量去重/冲突/取代，一次提交
 │       ├── decay.ts      # 每日：沉睡 / 复活 / excerpt 压实（纯 SQL）
 │       └── rebuild.ts    # 溢出时的 rollup，revision 双重围栏
-├── test/                 # §10（114 测试）
+├── test/                 # §10（153 测试）
 └── package.json          # peer: @deepseek-ai/dsh-*；node >= 22（node:sqlite）
 ```
 

@@ -13,8 +13,8 @@
 - **中文检索生效**：`取舍`（2 字词）命中 3 条、`工程取舍` 命中 2 条——修复前
   这两个都是 0 命中；
 - **死信复活生效**：Ops 的 rebuild 由 `failed` 复活并重新执行；
-- **诊断分类生效**：global 那行旧死信被正确标为 `obsolete`（revision 3 vs
-  当前 8），未误报成 `stuck`。
+- **不可达死信自行消失**：global 那行 revision 3 的旧 rebuild 死信，现由
+  `cleanupJobs` 直接删除（store 已到 11），不再需要诊断工具替它解释。
 
 **并且它暴露了下一个真实缺陷**（见下节）。这正是 `jobs.last_error` 的价值：
 第一次让失败原因**自己说话**，而不是靠事后推断。
@@ -68,16 +68,43 @@ turn（8、10、11、12、13）全部一次成功**。turn 9 的内容是一整�
 > 通用原则：**重试只对瞬态故障有意义**。确定性的语义答复重试多少次都一样，
 > 把它计入 attempts 只是在消耗死信额度并掩盖真实信号。
 
+**那条 extract 死信要留满 30 天，它是本 bug 的最后物证**（区别于上面被删的
+rebuild）。实测：该库 turn 2..17 全部 `done`，唯独 turn 9 `failed`；extract 的
+id 是 `hash(kind, repoKey, sessionId, turn)`，**turn 不会重来**，所以没有任何
+后继会替它把这轮做掉——它不是「被取代」，是**一次永久放弃的提炼**。丢的只是
+那次提炼，turn 9 的 33 行 L0 转写仍在库里。63ba102 修的是不再产生新的这类
+死信，但已经发生的那次不可恢复；把它当垃圾提前删掉，是抹掉损失而不是修复它，
+所以 `FAILED_RETENTION_MS`（30 天）对它照旧适用。
+
 验收命令（仓库根目录下运行）：
 
 ```bash
 node scripts/inspect.mjs --days 3650
 ```
 
-> `global` 保留的那行 `obsolete` 不是失败：它是 revision 3 时死掉的 job，而
-> store 已到 8——该 id 再也算不出来，属于等 cleanup 的不可达垃圾（failed 行
-> 保留 30 天）。`inspect.mjs` 按「payload 的 revision 是否仍等于当前 revision」
-> 区分：相等才是 `stuck`（真卡住并打印 `last_error`），不等则是 `obsolete`。
+> `inspect.mjs` 现在**只列事实**：每条 failed job 带 kind、attempts、age、
+> `last_error`，不再判断「这条还会不会重跑」。那个判断的真相源在 `jobId()` 的
+> 构成与各 kind 的触发条件里（都在 `packages/memory/src/`），诊断工具重新推导
+> 它就是一条规则两处实现——何况只有 `rebuild` 的 id 含 revision，用
+> `payload.expectedRevision` 去问其余三类，问的是一个它们根本没有的字段。
+>
+> 唯一能由**数据本身**判定的不可达性已下沉到 `cleanupJobs`：failed 的
+> `rebuild` 若 `expectedRevision` 不等于当前 `store_revision`，其 id 再也算不
+> 出来（`jobId('rebuild', repoKey, expectedRevision)`），而后继 rebuild 会重做
+> 全量画像——**与年龄无关，直接删除**。这不是新规则，是把 `runRebuildJob` 已有
+> 的 fencing 判据搬到数据生命周期上：同一条规则，一处定义，两个生效时机。
+>
+> 把规则搬到数据侧，代价是**两侧必须对同一状态给出同一答案**。第一版没做到：
+> `store_revision` 只由 memories 的 invalidate 触发器写入，尚无 raw memory 的
+> 库根本没有这一行；`readRevision()` 把缺行读作 **0**，SQL 子查询却给 **NULL**，
+> 而 `NULL IS NOT <任何值>` 恒真 → 新库上**可达**的 `expectedRevision=0` rebuild
+> 被无条件删除。后果不止丢一行：删后同 id 走 INSERT 而非复活，`attempts` 归零，
+> `MAX_CLAIMS` 毒丸防御被静默绕过，确定性失败的 rebuild 每 6 小时重置一次重试
+> 预算、永远烧 LLM 且永不死信——与本文「重试只对瞬态故障有意义」直接冲突。
+> 现以 `COALESCE(..., 0)` 与 `readRevision()` 对齐。同批加 `json_valid(payload)`：
+> `json_extract` 遇非 JSON 会抛，三条 DELETE 同事务，而 `maintain()` 无内层
+> catch——一行坏数据会让该 store 的 cleanup + prune + decay 入队 + rebuild 触发
+> 整轮失效。维护路径上的语句不得有能力停掉维护本身。
 
 ### 两条死信是**两个不同的原因**（第三轮查清，推翻了第二轮的「都是路由」）
 
@@ -128,7 +155,7 @@ node scripts/inspect.mjs --days 3650
 
 ## 一句话
 
-插件**可用且已验证**（135 测试全绿，含真平台 e2e 与打包安装契约）。
+插件**可用且已验证**（153 测试全绿，含真平台 e2e 与打包安装契约）。
 **4×4 架构（D10）已全部落地**，且这次由**真实数据**证实而非仅由测试断言：
 两个仓库各有 5–6 个真实 L2 场景块。详见
 [`design/4x4-memory.md`](design/4x4-memory.md)。
@@ -274,7 +301,7 @@ recall 竞争的弱检索规则；实测预算内可容纳 5 块而上限 6，�
 
 ```bash
 cd packages/memory
-npm run verify        # tsc + 135 测试
+npm run verify        # tsc + 153 测试
 ```
 
 - Node ≥ 22（用 `node:sqlite`）。

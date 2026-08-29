@@ -230,3 +230,203 @@ test('cleanup deletes aged done/failed rows only', () => {
   registry.dispose()
   cleanup(root)
 })
+
+/** Put the store at a known snapshot so the reachability predicate has one. */
+const setRevision = (store, revision) => {
+  store.db
+    .prepare(`INSERT INTO meta (k, v) VALUES ('store_revision', ?)
+              ON CONFLICT(k) DO UPDATE SET v = excluded.v`)
+    .run(String(revision))
+}
+
+const insertFailed = (store, id, kind, payload, completedAt) => {
+  store.tx(() => {
+    store.db
+      .prepare(
+        `INSERT INTO jobs (id, kind, payload, state, attempts, run_after, created_at, completed_at)
+         VALUES (?, ?, ?, 'failed', 6, 0, 0, ?)`,
+      )
+      .run(id, kind, JSON.stringify(payload), completedAt)
+  })
+}
+
+const idsIn = (store) =>
+  store.db.prepare(`SELECT id FROM jobs ORDER BY id`).all().map((r) => r.id)
+
+test('cleanup drops an unreachable rebuild regardless of age, and keeps a reachable one', () => {
+  // The row's id is derived from the revision it was queued for, so a store at
+  // a later revision can never compute that id again — it is garbage the moment
+  // the snapshot moves, not 30 days later. The reachable twin must survive:
+  // the next trigger revives it (see the dead-letter revival test above).
+  const { root, registry, store } = setup()
+  const now = Date.now()
+  setRevision(store, 11)
+  insertFailed(store, 'stale-rebuild', 'rebuild', { expectedRevision: 3 }, now)
+  insertFailed(store, 'live-rebuild', 'rebuild', { expectedRevision: 11 }, now)
+
+  cleanupJobs(store, now)
+  assert.deepEqual(
+    idsIn(store),
+    ['live-rebuild'],
+    'age plays no part: the superseded snapshot alone decides',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('a fresh extract dead letter survives the rebuild sweep, then ages out normally', () => {
+  // extract/reconcile/decay payloads carry no expectedRevision, so the SQL sees
+  // NULL there. With `!=` the comparison would be NULL — falsy — and the row
+  // would be spared by accident rather than by rule; `IS NOT` makes the kind
+  // filter the thing that spares it. This dead letter is the ONLY record that
+  // one turn's distillation was abandoned for good (its id is fixed to that
+  // turn, which never comes back), so it must keep the full retention window.
+  const { root, registry, store } = setup()
+  const now = Date.now()
+  setRevision(store, 11)
+  insertFailed(store, 'fresh-extract', 'extract', { sessionId: 's', turn: 9 }, now)
+  insertFailed(store, 'fresh-reconcile', 'reconcile', { sessionId: 's', turn: 9 }, now)
+
+  cleanupJobs(store, now)
+  assert.deepEqual(idsIn(store), ['fresh-extract', 'fresh-reconcile'])
+
+  // The age path is untouched: past 30 days the same rows go.
+  cleanupJobs(store, now + 31 * 86_400_000)
+  assert.deepEqual(idsIn(store), [])
+  registry.dispose()
+  cleanup(root)
+})
+
+test('a rebuild with no expectedRevision is unreachable too, not spared by a NULL', () => {
+  // This is the case that pins `IS NOT` over `!=`, and it is NOT the extract
+  // case: the kind filter already spares extract, so flipping the operator
+  // leaves every other test green. Here `json_extract` yields NULL, and
+  // `NULL != 11` is NULL — WHERE reads that as false and keeps the row forever.
+  // A rebuild that cannot name its snapshot can never be matched to one, so the
+  // honest reading is "does not match", exactly as runRebuildJob's fence treats
+  // a revision that fails to compare equal.
+  const { root, registry, store } = setup()
+  const now = Date.now()
+  setRevision(store, 11)
+  insertFailed(store, 'rebuild-no-revision', 'rebuild', {}, now)
+
+  cleanupJobs(store, now)
+  assert.deepEqual(idsIn(store), [], 'a NULL revision must not read as "still current"')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('deleting an unreachable rebuild leaves revival intact for the current snapshot', () => {
+  // Cleanup must not be a veto in disguise. Asserting pending/attempts=0 on the
+  // post-delete row alone proves nothing — a row that was NEVER deleted and got
+  // revived in place satisfies the same three assertions. So compare the two
+  // paths directly: the INSERT taken after a delete, and the UPDATE revival
+  // taken when the row survives, must land on the SAME state. That equality is
+  // what "cleanup did not change the outcome" actually means.
+  const { root, registry, store } = setup()
+  const now = Date.now()
+  const id = jobId('rebuild', 'k1', 11)
+  const live = { expectedRevision: 11, provider: 'p', model: 'm' }
+  const observe = () =>
+    store.db
+      .prepare(
+        `SELECT kind, payload, state, attempts, run_after, completed_at,
+                lease_token, lease_until, last_error FROM jobs WHERE id = ?`,
+      )
+      .get(id)
+
+  // Path A: the stale row is swept, so the trigger takes the INSERT branch.
+  setRevision(store, 11)
+  insertFailed(store, id, 'rebuild', { expectedRevision: 3 }, now)
+  cleanupJobs(store, now)
+  assert.deepEqual(idsIn(store), [], 'the superseded row is gone')
+  enqueueJob(store, 'rebuild', id, live, 4242)
+  const afterInsert = observe()
+
+  // Path B: the same id is dead-lettered while still reachable, so cleanup
+  // spares it and the very same trigger takes the ON CONFLICT revival branch.
+  store.tx(() => store.db.prepare(`DELETE FROM jobs`).run())
+  insertFailed(store, id, 'rebuild', live, now)
+  store.db
+    .prepare(`UPDATE jobs SET last_error = 'TypeError: bad reply' WHERE id = ?`)
+    .run(id)
+  cleanupJobs(store, now)
+  assert.deepEqual(idsIn(store), [id], 'a reachable dead letter is not swept')
+  enqueueJob(store, 'rebuild', id, live, 4242)
+  const afterRevival = observe()
+
+  assert.deepEqual(
+    afterInsert,
+    afterRevival,
+    'revival and re-insert are the same job in the same state — cleanup is not a veto',
+  )
+  assert.equal(afterInsert.state, 'pending')
+  assert.equal(afterInsert.attempts, 0, 'either way the retry budget is whole')
+  assert.equal(afterInsert.last_error, null, 'no stale explanation survives')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('a store that never wrote a revision keeps its reachable rebuild', () => {
+  // `store_revision` is written only by the memories invalidate trigger, so a
+  // store with no raw memory yet simply has no such meta row — the normal state
+  // of a new store. `readRevision` reads that as 0, so an expectedRevision:0
+  // rebuild is reachable and the next trigger revives it by id. The SQL must
+  // agree: without COALESCE the subquery is NULL, `IS NOT` is true against
+  // anything, and this row is deleted while still live. Every other test here
+  // calls setRevision(), so none of them can reach this branch.
+  const { root, registry, store } = setup()
+  const now = Date.now()
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM meta WHERE k = 'store_revision'`).get().c,
+    0,
+    'precondition: the revision row genuinely does not exist',
+  )
+  insertFailed(store, 'live-rebuild', 'rebuild', { expectedRevision: 0 }, now)
+  insertFailed(store, 'stale-rebuild', 'rebuild', { expectedRevision: 2 }, now)
+
+  cleanupJobs(store, now)
+  assert.deepEqual(
+    idsIn(store),
+    ['live-rebuild'],
+    'a missing revision row means 0, not "matches nothing"',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('one malformed payload cannot cancel the rest of the cleanup pass', () => {
+  // `json_extract` throws on non-JSON, and all three deletes share one
+  // transaction, so an unreadable row would roll back the age-based cleanups
+  // with it — and since `maintain` has no inner catch, the throw also takes out
+  // pruneConversations, the decay enqueue and the rebuild trigger, every pass,
+  // forever. No current writer produces such a row; the point is that a
+  // maintenance statement must not be able to disable maintenance.
+  const { root, registry, store } = setup()
+  const now = Date.now()
+  setRevision(store, 11)
+  store.tx(() => {
+    store.db
+      .prepare(
+        `INSERT INTO jobs (id, kind, payload, state, attempts, run_after, created_at, completed_at)
+         VALUES ('bad', 'rebuild', 'not json', 'failed', 6, 0, 0, ?),
+                ('old-done', 'extract', '{}', 'done', 1, 0, 0, ?),
+                ('stale-rebuild', 'rebuild', '{"expectedRevision":3}', 'failed', 6, 0, 0, ?)`,
+      )
+      .run(now, now - 40 * 86_400_000, now)
+  })
+
+  assert.doesNotThrow(() => cleanupJobs(store, now), 'a bad row must not abort the pass')
+  assert.deepEqual(
+    idsIn(store),
+    ['bad'],
+    'the aged done row and the superseded rebuild were still collected',
+  )
+
+  // The unreadable row is not kept forever either — it just waits for the age
+  // line, the same fallback every kind without a readable revision gets.
+  cleanupJobs(store, now + 31 * 86_400_000)
+  assert.deepEqual(idsIn(store), [])
+  registry.dispose()
+  cleanup(root)
+})

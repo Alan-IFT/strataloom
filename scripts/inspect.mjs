@@ -13,6 +13,12 @@
  * TREND is recoverable retroactively with a GROUP BY. That is the whole reason
  * no time-series table exists — the honest question is what happened, and the
  * data answering it was already being stored for provenance.
+ *
+ * That line held once and was crossed: a failed-job classifier read
+ * `payload.expectedRevision` to decide whether a job would ever run again, which
+ * is an inference about the pipeline's rules, not a query over its data. It is
+ * gone; this file reports failed rows and lets the plugin's own lifecycle decide
+ * which of them still mean anything.
  */
 import { DatabaseSync } from 'node:sqlite'
 import { existsSync, readdirSync } from 'node:fs'
@@ -50,6 +56,20 @@ if (stores.length === 0) {
 
 const pct = (n, d) => (d === 0 ? '  —  ' : `${((n / d) * 100).toFixed(0)}%`.padStart(5))
 
+/**
+ * How long ago a timestamp was, in the unit that carries information. Whole
+ * days floor to `0d ago` for anything under 24h, which reads as "just now" for
+ * a job that in fact died most of a day back — the exact span where an operator
+ * is deciding whether a failure is current. Below a day, report hours.
+ */
+const ago = (at) => {
+  if (at === null || at === undefined) return 'at an unrecorded time'
+  const ms = Date.now() - at
+  return ms < 86_400_000
+    ? `${Math.floor(ms / 3_600_000)}h ago`
+    : `${Math.floor(ms / 86_400_000)}d ago`
+}
+
 for (const [label, file] of stores) {
   const db = new DatabaseSync(file, { readOnly: true })
   const one = (sql, ...p) => db.prepare(sql).get(...p) ?? {}
@@ -70,7 +90,7 @@ for (const [label, file] of stores) {
   console.log(`   memories   ${memories.active ?? 0} active, ${memories.derivedRows ?? 0} derived (${memories.total ?? 0} rows total)`)
   console.log(`   recall     ${recall.calls ?? 0} calls in ${days}d, ${recall.misses ?? 0} missed  (${pct(recall.misses ?? 0, recall.calls ?? 0)})`)
 
-  // Stuck work, and WHY. A dead letter whose cause must be reconstructed from
+  // Failed work, and WHY. A dead letter whose cause must be reconstructed from
   // rotated logs is a dead letter nobody fixes, so the reason rides the row
   // (schema v8) and surfaces here beside the counts.
   // `last_error` arrives with schema v8. This tool must keep working against a
@@ -79,34 +99,24 @@ for (const [label, file] of stores) {
   const hasLastError = db
     .prepare(`SELECT count(*) AS n FROM pragma_table_info('jobs') WHERE name = 'last_error'`)
     .get().n > 0
-  // A dead letter whose snapshot has moved on is NOT stuck work: its id is
-  // derived from the revision it was queued for, so that id is never computed
-  // again and the row is unreachable garbage awaiting cleanup. Reporting it as
-  // stuck would send someone chasing a job the store has already left behind —
-  // and would make a healthy restart look like a failed one.
-  const revision = Number(
-    db.prepare(`SELECT v FROM meta WHERE k = 'store_revision'`).get()?.v ?? 0,
-  )
-  const stuck = db.prepare(
-    `SELECT kind, attempts, payload, ${hasLastError ? 'last_error' : 'NULL AS last_error'} FROM jobs
+  // Report the rows, not a verdict about them. Whether a dead letter will ever
+  // be worked again is decided by `jobId()`'s parts and each kind's trigger
+  // (both in packages/memory/src/) — only `rebuild` carries the revision in its
+  // id, so reading `expectedRevision` here answered that question for one kind
+  // and guessed for the rest. Re-deriving reachability would be that rule's
+  // second implementation, in a file with no tests that no new job kind is
+  // obliged to update; the one case data alone can settle (an unreachable
+  // rebuild) is now settled by `cleanupJobs`, which deletes the row so it never
+  // reaches this list. That keeps this tool a query over stored data, as the
+  // header above claims.
+  const failed = db.prepare(
+    `SELECT kind, attempts, completed_at,
+            ${hasLastError ? 'last_error' : 'NULL AS last_error'} FROM jobs
      WHERE state = 'failed' ORDER BY completed_at DESC LIMIT 5`,
   ).all()
-  for (const job of stuck) {
-    let queuedFor
-    try {
-      queuedFor = JSON.parse(job.payload).expectedRevision
-    } catch {
-      queuedFor = undefined
-    }
-    if (queuedFor !== undefined && queuedFor !== revision) {
-      console.log(
-        `   obsolete   ${job.kind} failed at revision ${queuedFor}, store is now at ` +
-          `${revision} — superseded, cleanup will drop it`,
-      )
-      continue
-    }
+  for (const job of failed) {
     console.log(
-      `   stuck      ${job.kind} dead-lettered after ${job.attempts} claims — ` +
+      `   failed     ${job.kind} after ${job.attempts} claims, ${ago(job.completed_at)} — ` +
         `${job.last_error ?? 'cause not recorded (failed before schema v8)'}`,
     )
   }
