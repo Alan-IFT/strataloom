@@ -251,10 +251,13 @@ test('the output cap covers the worst reply the prompts invite, priced as CJK', 
   // The live failure this locks down: of four rebuild jobs ever run, the two
   // with small inputs finished on attempt 1 and the one summarising 27 mostly
   // Chinese memories burned all six attempts, while extract/reconcile/decay
-  // went 68/0 over the same routes and days. The rollup prompt invites
-  // 6 x (60 + 900 + 30) = 5940 characters; in Chinese that is ~5940 tokens
-  // against a cap that was 4000, so the reply came back truncated — and a
-  // truncated reply is unparseable, not merely short.
+  // went 68/0 over the same routes and days. At the time the rollup prompt
+  // invited 6 x (60 + 900 + 30) = 5940 characters; in Chinese that is ~5940
+  // tokens against a cap that was 4000, so the reply came back truncated —
+  // and a truncated reply is unparseable, not merely short. (The rollup
+  // target has since been narrowed, so `extract` is now the largest invited
+  // reply; the `max` below is what keeps this test pointed at whichever
+  // prompt is worst rather than at whichever one was worst that day.)
   //
   // The old guard hid this: it priced the worst case as `chars/4 * 2`, which
   // is still half the real CJK cost, so it passed while the cap was too small.
@@ -262,17 +265,19 @@ test('the output cap covers the worst reply the prompts invite, priced as CJK', 
   // raising the cap fails here instead of in production.
   const {
     LLM_MAX_TOKENS,
-    ROLLUP_MAX_SCENARIOS,
-    ROLLUP_TARGET_CHARS,
-    ROLLUP_TITLE_TARGET_CHARS,
     EXTRACT_MAX_CANDIDATES,
     EXTRACT_TITLE_TARGET_CHARS,
     EXTRACT_BODY_TARGET_CHARS,
     PERSONA_TARGET_CHARS,
+    worstRollupReplyChars,
   } = await import('../lib/constants.js')
 
+  // The rollup term is CALLED, not restated. It used to be spelled out here
+  // as a third copy of an expression that also appeared twice in
+  // constants.ts — so a re-tuned target moved the guard and left the test
+  // asserting the old shape.
   const worstReplyChars = Math.max(
-    ROLLUP_MAX_SCENARIOS * (ROLLUP_TITLE_TARGET_CHARS + ROLLUP_TARGET_CHARS + 30),
+    worstRollupReplyChars(),
     EXTRACT_MAX_CANDIDATES * (EXTRACT_TITLE_TARGET_CHARS + EXTRACT_BODY_TARGET_CHARS + 60),
     PERSONA_TARGET_CHARS + 60,
   )
@@ -283,6 +288,176 @@ test('the output cap covers the worst reply the prompts invite, priced as CJK', 
     `LLM_MAX_TOKENS (${LLM_MAX_TOKENS}) must cover ${worstReplyChars} CJK tokens`,
   )
 })
+
+test('the derived layer must fit the packet it exists to produce', async () => {
+  // The bug this locks down was silent in exactly the way that matters: the
+  // rollup prompt ASKED for <=900-char bodies, nothing enforced it, and the
+  // model overshot by ~2x on every block. On a live store six scenario blocks
+  // were built and three reached the packet — the other three were dropped by
+  // the budget with nobody deciding which. Unlike an L1 overflow, that has no
+  // downstream remedy: the derived layer IS the remedy.
+  //
+  // So the write path now truncates to the targets, and constants.ts asserts
+  // at load that the worst permitted derived packet fits the budget. This test
+  // guards the assertion itself: it re-executes the module with the target
+  // pushed back over the line and requires a throw.
+  //
+  // It deliberately asserts the RULE, not the arithmetic. No number below is a
+  // budget, a token count, or a solved ceiling — those live in constants.ts
+  // and are free to move. What must never change is that raising a derived
+  // target without raising the budget FAILS AT LOAD rather than in production.
+  const { readFileSync, writeFileSync, rmSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const libDir = join(import.meta.dirname, '..', 'lib')
+  const source = readFileSync(join(libDir, 'constants.js'), 'utf8')
+
+  // Patched in place inside lib/ so the module's own relative imports resolve.
+  const OVERSIZED = 900 // the historical value the live store was measured at
+  const patched = source.replace(
+    /export const ROLLUP_TARGET_CHARS = \d+;/,
+    `export const ROLLUP_TARGET_CHARS = ${OVERSIZED};`,
+  )
+  assert.notEqual(patched, source, 'the probe must actually rewrite the target')
+
+  const probe = join(libDir, `constants.guard-probe.${randomUUID()}.js`)
+  writeFileSync(probe, patched)
+  try {
+    await assert.rejects(
+      import(`file://${probe}`),
+      (error) => {
+        // The message must carry the worst case AND the budget: a guard that
+        // fails without showing both numbers cannot be acted on, and the next
+        // person has to re-derive the ceiling by hand (which is how the
+        // hand-counted `- [preference] ` prefix got mis-stated twice).
+        assert.match(error.message, /derived layer cannot fit/, 'names the rule it broke')
+        assert.match(error.message, /\d+ tokens/, 'reports the worst case it measured')
+        assert.match(error.message, /INJECT_BODY_BUDGET_TOKENS \(\d+\)/, 'reports the budget')
+        return true
+      },
+    )
+  } finally {
+    rmSync(probe, { force: true })
+  }
+
+  // And the shipped configuration is on the right side of that same line —
+  // otherwise the plugin would not load at all, which is the point of putting
+  // the check at module scope rather than in a health endpoint nobody calls.
+  const {
+    ROLLUP_TARGET_CHARS,
+    PERSONA_TARGET_CHARS,
+    BODY_MAX_CHARS,
+    ROLLUP_MAX_SCENARIOS,
+    INJECT_BODY_BUDGET_TOKENS,
+    DERIVED_WORST_LINE_CHARS,
+    worstPersonaTokens,
+    worstScenarioTokens,
+  } = await import('../lib/constants.js')
+
+  // THE invariant, restated as the one thing the whole fix rests on. Both
+  // execution points spend these same two functions, so asserting the
+  // inequality here asserts the load-time guard and the runtime personal cap
+  // at once.
+  assert.ok(
+    worstPersonaTokens() + ROLLUP_MAX_SCENARIOS * worstScenarioTokens() <=
+      INJECT_BODY_BUDGET_TOKENS,
+    'worstPersona + ROLLUP_MAX_SCENARIOS x worstScenario must fit the body budget',
+  )
+
+  // The guard prices NEWLINES, not just length. `renderEntry` indents a body's
+  // own newlines, so a guard fed `'x'.repeat(n)` would be blind to that whole
+  // dimension and would certify a packet that a bullet-list briefing
+  // overflows — measured: 1247 tokens at zero density, 1307 at 33 breaks per
+  // 1000 characters, with the old guard reporting green throughout. So the
+  // priced worst case must exceed the naive single-line one.
+  const { estimateTokens, renderEntry } = await import('../lib/recall/render.js')
+  const singleLine = estimateTokens(
+    renderEntry(
+      { id: '', kind: 'preference', title: 'x'.repeat(26), body: 'x'.repeat(PERSONA_TARGET_CHARS) },
+      false,
+    ),
+  )
+  assert.ok(
+    worstPersonaTokens() > singleLine,
+    'the guard must price a body shaped with newlines, not one synthetic line',
+  )
+  assert.ok(
+    DERIVED_WORST_LINE_CHARS > 0 && DERIVED_WORST_LINE_CHARS < PERSONA_TARGET_CHARS,
+    'the worst-case line length is a real shape, not a disabled knob',
+  )
+  assert.ok(
+    ROLLUP_TARGET_CHARS < BODY_MAX_CHARS && PERSONA_TARGET_CHARS < BODY_MAX_CHARS,
+    'the derived targets are tighter than the hard caps they used to be cut at',
+  )
+})
+
+test('derived rows are truncated to their targets, not to the hard body cap', async () => {
+  // The root cause in one assertion: the targets used to be a REQUEST inside
+  // the prompt while the write path cut at BODY_MAX_CHARS (2000), so a verbose
+  // model produced rows that were legal, oversized, and unbudgeted. Asserting
+  // the relationship (target, not cap) rather than a length keeps this true
+  // when the target is re-tuned.
+  const { ROLLUP_TARGET_CHARS, ROLLUP_TITLE_TARGET_CHARS, PERSONA_TARGET_CHARS } =
+    await import('../lib/constants.js')
+  const { runRebuildJob, readRevision } = await import('../lib/pipeline/rebuild.js')
+  const { openRegistry: openReg, cleanup: clean } = await import('./helpers.mjs')
+
+  const { root, registry } = openReg()
+  const store = registry.open('k-trunc')
+  // Seed enough raw rows that the packet genuinely overflows; otherwise the
+  // job settles early as "L1 fits again" and never parses a reply.
+  store.tx(() => {
+    for (let i = 0; i < 40; i++) {
+      store.db
+        .prepare(
+          `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+           VALUES (?, 'fact', 'repo-local', 'active', ?, ?, 'human', 0, ?)`,
+        )
+        .run(randomUUID(), `seed title ${i}`, `a reasonably long seeded body ${i}. `.repeat(8), i)
+    }
+  })
+
+  // A model that ignores the prompt's request — which is what actually happened.
+  const overlong = 'x'.repeat(BODY_OVERSHOOT)
+  const ctx = {
+    get: (name) =>
+      name === 'llm'
+        ? {
+            async *stream() {
+              yield {
+                type: 'text-delta',
+                index: 0,
+                text: JSON.stringify({
+                  scenarios: [{ title: 'y'.repeat(BODY_OVERSHOOT), body: overlong }],
+                }),
+              }
+              yield { type: 'finish', reason: { kind: 'stop' } }
+            },
+          }
+        : undefined,
+    logger: { debug() {}, warn() {}, info() {} },
+  }
+  const rev = readRevision(store)
+  const payload = { expectedRevision: rev, provider: 'p', model: 'm' }
+  enqueueJob(store, 'rebuild', 'rb-trunc', payload, 0)
+  await runRebuildJob(
+    ctx,
+    store,
+    claimNextJob(store, Date.now(), Date.now() + 60_000),
+    payload,
+    new AbortController().signal,
+  )
+
+  const row = store.db.prepare(`SELECT title, body FROM memories WHERE derived = 2`).get()
+  assert.ok(row, 'the rebuild committed a scenario block')
+  assert.equal(row.body.length, ROLLUP_TARGET_CHARS, 'the body is cut to the ROLLUP target')
+  assert.equal(row.title.length, ROLLUP_TITLE_TARGET_CHARS, 'the title is cut to its target')
+  assert.ok(PERSONA_TARGET_CHARS > 0, 'the portrait target is the L3 counterpart of the same rule')
+  registry.dispose()
+  clean(root)
+})
+
+/** Far beyond any target, so the test cannot pass by the model being tidy. */
+const BODY_OVERSHOOT = 1_900
 
 test('real routing: an unregistered provider fails without a fallback service', async () => {
   const { ctx, shutdown } = await bootLlm({ pinned: { kind: 'reply', text: '{}' } })

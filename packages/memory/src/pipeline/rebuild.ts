@@ -46,8 +46,10 @@ import {
   ROLLUP_MAX_SCENARIOS,
   ROLLUP_SOURCE_LIMIT,
   ROLLUP_TRANSCRIPT_CHARS,
-  TITLE_MAX_CHARS,
-  BODY_MAX_CHARS,
+  ROLLUP_TARGET_CHARS,
+  ROLLUP_TITLE_TARGET_CHARS,
+  PERSONA_TARGET_CHARS,
+  PERSONA_TITLE,
 } from '../constants.ts'
 import { LAYER, type MemoryHit } from '../types.ts'
 import { queryInjectableSet } from '../store/fts.ts'
@@ -232,6 +234,28 @@ interface Scenario {
  * rebuild that produced nothing must not commit, because committing zero
  * scenarios would look like "the packet fits now" and leave the overflowing
  * raw set injected in truncated form.
+ *
+ * Truncation is to the ROLLUP TARGETS, not to the hard `*_MAX_CHARS` caps this
+ * used to cut at. The targets were only ever a REQUEST inside the prompt, and
+ * a request is not a bound: measured on a live store, all six blocks the model
+ * returned exceeded `PERSONA_TARGET_CHARS`, five of six exceeded
+ * `ROLLUP_TARGET_CHARS`, and bodies ran to 1820 characters against a target of
+ * 900 — systematically about 2x. The hard caps (2000) then let all of it
+ * through, so the derived layer blew the injection budget and half its blocks
+ * were dropped unread.
+ *
+ * The load-time guard in `constants.ts` asserts that
+ * `ROLLUP_MAX_SCENARIOS` blocks of this size fit the packet. An assertion is
+ * only worth its arithmetic if the quantity it reasons about is the quantity
+ * the write path actually guarantees — so the enforcement has to be HERE, at
+ * the only door derived rows enter through. Asking the model more firmly was
+ * the rejected alternative: it is the same request, and it already failed six
+ * times out of six.
+ *
+ * Cutting rather than rejecting the block: a briefing whose last sentence is
+ * clipped still restores a working context, while throwing away the whole
+ * rollup because the model was verbose costs the layer entirely — and the
+ * retry would re-ask the same model the same way.
  */
 const parseScenarios = (raw: unknown): Scenario[] => {
   const root = raw as { scenarios?: unknown }
@@ -244,8 +268,8 @@ const parseScenarios = (raw: unknown): Scenario[] => {
     if (typeof scenario.title !== 'string' || typeof scenario.body !== 'string') {
       throw new PipelineLlmError('malformed scenario in rollup reply')
     }
-    const title = scenario.title.trim().slice(0, TITLE_MAX_CHARS)
-    const body = scenario.body.trim().slice(0, BODY_MAX_CHARS)
+    const title = scenario.title.trim().slice(0, ROLLUP_TITLE_TARGET_CHARS)
+    const body = scenario.body.trim().slice(0, ROLLUP_TARGET_CHARS)
     if (title === '' || body === '') continue
     out.push({ title, body })
   }
@@ -319,13 +343,16 @@ const runPersonaJob = async (
   return true
 }
 
-/** The portrait's fixed title; it is a singleton, so the title is a label. */
-const PERSONA_TITLE = 'How to work with this user'
-
 /**
  * Validate a portrait reply. A "keep" needs no body; a "rewrite" without one
  * is malformed and reaches the retry exit rather than storing an empty
  * portrait that would inject as nothing.
+ *
+ * The body is cut to `PERSONA_TARGET_CHARS` for the reason given on
+ * `parseScenarios`: the target was a request the model ignored (all six blocks
+ * measured on a live store overshot it), and the portrait is spent from the
+ * SAME injection budget in every repository — an oversized one does not merely
+ * overrun, it evicts the scenario blocks queued behind it.
  */
 const parsePersona = (raw: unknown): { keep: boolean; body: string } => {
   const root = raw as { verdict?: unknown; body?: unknown }
@@ -336,7 +363,7 @@ const parsePersona = (raw: unknown): { keep: boolean; body: string } => {
     throw new PipelineLlmError('portrait reply has no usable verdict')
   }
   if (root.verdict === 'keep') return { keep: true, body: '' }
-  const body = typeof root.body === 'string' ? root.body.trim().slice(0, BODY_MAX_CHARS) : ''
+  const body = typeof root.body === 'string' ? root.body.trim().slice(0, PERSONA_TARGET_CHARS) : ''
   if (body === '') throw new PipelineLlmError('portrait rewrite carries no body')
   return { keep: false, body }
 }

@@ -223,6 +223,155 @@ test('no read exit hand-formats stored content: the tool renderers go through re
   }
 })
 
+test('the personal store cannot starve the repo store: its contribution is capped', async () => {
+  // THE end-to-end gap this fix closes, and the one every previous round left
+  // open: 159 tests passed and the load-time guard was green while, on the
+  // real machine, ZERO of six L2 blocks reached the packet.
+  //
+  // The shape that produced it, reproduced exactly:
+  //   - the global (personal) store has NO derived rows, because D9's
+  //     invalidate_derived_* triggers delete the L3 portrait on any personal
+  //     raw write and nothing rebuilds it until the next maintenance pass;
+  //   - so `queryInjectionRows` takes its FALLBACK branch and returns up to
+  //     INJECT_TOP_N raw L1 atoms, a branch that bounds the row COUNT and not
+  //     one byte of their size;
+  //   - `buildContextProvider` concatenates personal ahead of repo and spends
+  //     ONE budget over the pair, so personal ate all 1300 tokens first.
+  //
+  // The assertion is the RULE — "the repo store's derived layer still reaches
+  // the model" — not a token count or a block count. Retuning the budget, the
+  // targets or INJECT_TOP_N must keep this true or fail here.
+  clearRepoIdentityMemo()
+  const repo = makeRepo()
+  const { root, registry } = openRegistry()
+  const principal = fakeAgent({ id: 'p', cwd: repo })
+  const ctx = fakeCtx({ agents: [principal] })
+  const svc = service(registry, ctx)
+
+  // Personal side: no portrait, and enough big L1 atoms that the ungated
+  // fallback would exhaust the whole packet on its own.
+  // Sizes mirror the live global store, where the eight rows ran from 73 to
+  // 452 tokens: a couple are individually small enough to pass the cap, most
+  // are not, and together they are far over the whole packet budget. A
+  // uniform seeding would have hidden the difference between "capped" and
+  // "personal excluded entirely".
+  const personal = registry.openGlobal()
+  personal.tx(() => {
+    for (const [i, repeats] of [4, 60, 60, 60, 60, 60, 60, 4].entries()) {
+      // The global store requires `private` visibility (guard_visibility_*),
+      // so this cannot go through the repo-shaped `insert` helper above.
+      personal.db
+        .prepare(
+          `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+           VALUES (?, 'preference', 'private', 'active', ?, ?, 'principal-explicit', 0, ?)`,
+        )
+        .run(
+          `personal-${i}`,
+          `a personal preference number ${i}`,
+          `personal detail ${i}. `.repeat(repeats),
+          // Newest first: the two small rows sit at the ends, so this also
+          // shows the cap SKIPPING an oversized row rather than stopping at it.
+          i,
+        )
+    }
+  })
+  const { estimateTokens, renderEntry } = await import('../lib/recall/render.js')
+  const { INJECT_BODY_BUDGET_TOKENS, worstPersonaTokens } = await import('../lib/constants.js')
+  const fallbackCost = queryInjectionRows(personal).reduce(
+    (sum, row) => sum + estimateTokens(renderEntry(row, false)),
+    0,
+  )
+  assert.equal(
+    personal.db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c,
+    0,
+    'the scenario under test is a personal store with NO derived row',
+  )
+  assert.ok(
+    fallbackCost > INJECT_BODY_BUDGET_TOKENS,
+    `the personal fallback must be able to exhaust the budget alone (was ${fallbackCost})`,
+  )
+
+  // Repo side: derived L2 blocks, sized as the enforced write path produces.
+  const store = svc.storeFor(principal, true)
+  store.tx(() => {
+    for (let i = 0; i < 6; i++) {
+      store.db
+        .prepare(
+          `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+           VALUES (?, 'fact', 'repo-local', 'active', ?, ?, 'derived', 0, ?, 2)`,
+        )
+        .run(`l2-${i}`, `scenario block ${i}`, `SCENARIOBODY${i} `.repeat(30), i)
+    }
+  })
+
+  const packet = buildContextProvider(ctx, svc)({ agent: principal })
+  const arrived = [0, 1, 2, 3, 4, 5].filter((i) => packet.includes(`SCENARIOBODY${i}`))
+  assert.equal(
+    arrived.length,
+    6,
+    `every repo scenario block must reach the packet; only ${arrived.length} did`,
+  )
+  // ...and personal is still represented: this is a CAP, not an eviction.
+  assert.match(packet, /a personal preference/, 'the personal side still contributes')
+  assert.ok(
+    estimateTokens(packet) <= 1_400,
+    'and the whole packet still respects the spec §4.2 total',
+  )
+
+  // The cap is the invariant's number, spent by the same function the
+  // load-time guard uses — not a second constant that could drift from it.
+  assert.ok(worstPersonaTokens() > 0, 'the cap comes from the shared invariant')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('a full-length L3 portrait is admitted by the cap that bounds the personal side', async () => {
+  // The cap must bound the FALLBACK without evicting the thing the fallback
+  // stands in for. This is not hypothetical: priced against a single-line
+  // synthetic body the cap comes to 161 tokens, and the live portrait on this
+  // machine renders to 168 because it contains four newlines, which
+  // `renderEntry` indents. A cap of 161 would therefore have dropped the real
+  // L3 portrait in every repository — trading defect A for a worse one.
+  //
+  // Asserting the relationship, not the numbers: a worst-case portrait must
+  // fit the cap derived for it, whatever those two values become.
+  const { withinBudget } = await import('../lib/recall/render.js')
+  const { worstPersonaTokens, PERSONA_TITLE, PERSONA_TARGET_CHARS, DERIVED_WORST_LINE_CHARS } =
+    await import('../lib/constants.js')
+
+  // Built at exactly the shape the guard prices: full target length, and a
+  // line break every DERIVED_WORST_LINE_CHARS characters. This is the precise
+  // guarantee the design offers — "any portrait no denser than the guard's
+  // worst case survives the cap" — so the test moves with the constants
+  // instead of pinning today's 171 and 600.
+  let body = ''
+  for (let i = 0; i < PERSONA_TARGET_CHARS; i++) {
+    body += (i + 1) % DERIVED_WORST_LINE_CHARS === 0 ? '\n' : 'x'
+  }
+  const portrait = { id: 'p1', kind: 'preference', title: PERSONA_TITLE, body }
+  assert.ok(body.includes('\n'), 'a real portrait is multi-line')
+  assert.deepEqual(
+    withinBudget([portrait], worstPersonaTokens()).map((h) => h.id),
+    ['p1'],
+    'a worst-shaped portrait at full target length must survive the personal cap',
+  )
+
+  // And the cap is genuinely newline-aware rather than accidentally roomy:
+  // priced as one synthetic line it would come to less than this, which is
+  // what would have evicted the live 168-token portrait.
+  const singleLine = { ...portrait, body: 'x'.repeat(PERSONA_TARGET_CHARS) }
+  const { estimateTokens, renderEntry } = await import('../lib/recall/render.js')
+  assert.ok(
+    worstPersonaTokens() >= estimateTokens(renderEntry(portrait, false)),
+    'the cap covers a multi-line portrait...',
+  )
+  assert.ok(
+    estimateTokens(renderEntry(portrait, false)) >
+      estimateTokens(renderEntry(singleLine, false)),
+    '...and a multi-line portrait really does cost more than a single-line one',
+  )
+})
+
 test('commit ⇒ next assemble sees it (forget closes injection immediately)', async () => {
   clearRepoIdentityMemo()
   const repo = makeRepo()
