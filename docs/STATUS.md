@@ -187,7 +187,21 @@ ADR 0005 的开工条件是「比率显著 **且** 抽读 L0 确认存在改写�
 
 另有两项**既存**缺陷，独立登记不混修：L0 无凭据扫描（`captureTurn` 路径零扫描，
 extract 提示词那句 "no secrets" 是给模型的请求而非机制）；`conversations`
-无体积上界（`pruneConversations` 只按时间删）。
+无体积上界（`pruneConversations` 只按时间删）——后者的实测状态见
+[ADR 0009 §七](decisions/0009-measure-at-the-outermost-ruler.md)。
+
+## 🔴 最高优先级缺陷：`sourceOf` 的兑现率是 2.1%
+
+**详见 [ADR 0009](decisions/0009-measure-at-the-outermost-ruler.md)**（含全部
+数字、被否决的三条路径及其算术、以及五条教训）。这里只留指针，不复制事实。
+
+一句话：`memory_recall(sourceOf:)` 承诺「核对原话」，但读路径上两把尺子串联，
+**外侧的 token 预算先截断**，使 `SOURCE_TURN_LIMIT` 成为不绑定的惰性常量——
+它从 20 调到 5000，用户可见内容近乎不变。ADR 0008 那次 20→34 的修复因此是
+**有成本、无收益**。
+
+**开工前必读 ADR 0009 §五**：推荐方案（`excerpt` 复活）有三个前置必改项；
+且**若决定不修实现，就必须改工具描述与规范条款**——两者不可都留。
 
 ## ✅ 已修复并发布：L2 场景块进注入包从 0/6 恢复到 6/6（v0.3.5）
 

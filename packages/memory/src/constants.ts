@@ -78,6 +78,20 @@ export const LIST_LIMIT = 200
 /**
  * Rows returned by the L0 drill-down mode of memory_recall (`sourceOf`).
  *
+ * MEASURED NON-BINDING (ADR 0009). `sourceOf`'s rows are rendered through
+ * `renderFramed(hits, RECALL_RESULT_BUDGET_TOKENS)`, and that budget truncates
+ * first: an L0 row costs p50=41 but p90=516 tokens against a 500-token budget,
+ * and 10.2% of rows exceed it on their own. Replayed across all 11 cited
+ * sessions, raising this value moves delivery from a mean of 6.45 rows (at 20)
+ * to 6.82 (at 34) to 7.64 (at 100), and 100 to 5000 changes nothing at all.
+ * Coverage of the actually-cited lines does not move.
+ *
+ * So the derivation kept below is not wrong — it measured row density at the
+ * SQL exit accurately — but the ruler that decides what a caller SEES sits one
+ * step further out, and was never replayed through. Raising this constant buys
+ * scan and transport cost with no change in output. Do not re-derive it without
+ * replaying through `renderFramed`.
+ *
  * 34, raised from 20 by the `tool/call` capture, and the raise is a CORRECTION
  * rather than a widening: this is a ROW budget over a table whose row density
  * changed, so leaving it alone silently shrinks the window's content.
