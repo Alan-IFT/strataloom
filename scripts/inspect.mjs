@@ -85,10 +85,33 @@ for (const [label, file] of stores) {
      FROM conversations WHERE label='tool:memory_recall' AND created_at >= ?`,
     RECALL_NO_MATCH, since,
   )
+  // Tool results that have no request beside them. Until 0.3.6 the capture
+  // dropped every `tool/call`, so this was 100% by construction and L0 recorded
+  // what tools replied without recording what the agent did.
+  //
+  // It is here because it answers a question no version string can: a release
+  // that is installed but not yet RUNNING leaves this at 100% while every
+  // version check reports the new build. Reading it over a window ("since")
+  // rather than over all history is what makes it a liveness signal instead of
+  // a historical fact — old rows stay orphaned forever and would mask the
+  // change. A store with no recent turns simply reports no calls.
+  const pairing = one(
+    `SELECT sum(CASE WHEN label LIKE 'tool:%' THEN 1 ELSE 0 END) AS results,
+            sum(CASE WHEN label LIKE 'tool-call:%' THEN 1 ELSE 0 END) AS calls
+     FROM conversations WHERE created_at >= ?`,
+    since,
+  )
 
   console.log(`\n── ${label} ${'─'.repeat(Math.max(0, 46 - label.length))}`)
   console.log(`   memories   ${memories.active ?? 0} active, ${memories.derivedRows ?? 0} derived (${memories.total ?? 0} rows total)`)
   console.log(`   recall     ${recall.calls ?? 0} calls in ${days}d, ${recall.misses ?? 0} missed  (${pct(recall.misses ?? 0, recall.calls ?? 0)})`)
+  if ((pairing.results ?? 0) > 0) {
+    const orphans = (pairing.results ?? 0) - (pairing.calls ?? 0)
+    console.log(
+      `   tool rows  ${pairing.results ?? 0} results, ${pairing.calls ?? 0} calls in ${days}d` +
+        `  (${pct(Math.max(0, orphans), pairing.results ?? 0)} orphaned)`,
+    )
+  }
 
   // Failed work, and WHY. A dead letter whose cause must be reconstructed from
   // rotated logs is a dead letter nobody fixes, so the reason rides the row
