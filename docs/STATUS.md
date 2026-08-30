@@ -1,9 +1,61 @@
 # 当前状态
 
-> 最后更新：2026-08-30 · **v0.3.4 已上线并验收**（schema v9）
+> 最后更新：2026-08-30 · **v0.3.5 已发布并安装**（schema v9，无迁移）
 > **每次工作结束时更新本页**，它是新会话的唯一入口。
 
-## ✅ 已修复：L2 场景块进注入包从 0/6 恢复到 6/6（未发布，schema 不变）
+## ⚠️ 下一步：L0 记录了「工具说了什么」，没记录「agent 做了什么」
+
+**详见 [ADR 0008](decisions/0008-l0-records-what-tools-said-not-what-the-agent-did.md)。**
+这是当前最大的缺口，也是下一轮五步流程的对象。
+
+`src/transcript.ts` 的 `collectTurnEvents` 有两处丢弃：`tool/call` 事件整类
+`continue`（只留工具名，参数丢弃），以及文本为空的事件整条丢弃（`textOf` 只取
+`type==='text'` 块，故**纯 tool_use 的 assistant 消息整条消失**）。
+
+实测本仓库真实会话 `session-43422ed9`：
+
+```
+assistant/message 722 条，其中纯工具调用 380 条 → 丢弃 52.6%
+tool/call         863 条 → 丢弃 100%
+tool/result       878 条 → 全部入库
+```
+
+后果：**extract 在看不见 agent 任何一次工具调用的情况下提炼记忆**；
+`parent-agent`（默认注入集三来源之一）的供给被砍掉一半；L0 里每条工具结果
+都是**没有请求的孤儿**。
+
+**业界对照**：[TencentDB-Agent-Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory/tree/feat/server_team)
+的 `import_opik.py:352-358` 差异恰好就在我们丢弃的那一行——它先取文本，
+**文本为空不影响 `tool_call` 的独立采集**，且强制 `truncate`（32k + `…[truncated]`
+标记）、并用 `drop_orphan_tool_results()` 把「结果必须有对应请求」当作不变量。
+hermes（无 L0 层）与 memorax（逻辑在闭源服务端）**不可比**。
+
+## ⛔ 阶段 4（检索融合）门禁：两半都不成立，保持关闭
+
+ADR 0005 的开工条件是「比率显著 **且** 抽读 L0 确认存在改写后命中的实例」。
+本轮查明**两半都还不成立**（详见 ADR 0008）：
+
+- **比率那一半已被自己的修复作废**：按 v9（CJK bigram）切分，v9 之前
+  302 次调用 / 40% 未命中，**占样本 99%**；v9 之后仅 **4 次调用**。
+  `STATUS.md` 早就写明 v9 前的数据混入分词损耗不可用于该判断。
+- **另一半其实可求值**：查询串在平台 session 日志的 `tool/call.data.arguments`
+  里，按 `callId` 配对后 135 次调用全部可配对。但 `conversations.ts` 声明
+  L0 存在正是为了**不依赖**平台日志，故该路径只能用于一次性调研，
+  **不得固化为常设诊断依赖**。
+
+## 三项待修缺口（ADR 0008 登记，未排期）
+
+| # | 缺口 | 证据 |
+|---|---|---|
+| 2 | `recallMissRate` 分母含 `Error:` 行 | 修正后 `edf7a686` 由 29% 变 **71%** |
+| 3 | 历史比率未按 v9 切分/作废 | v9 前样本占 99% |
+| 4 | `memory_recall.query` 无长度上限 | 实测均值 9.2 字符；schema 无 `maxLength`，`execute` 不截断 |
+
+另有两项**既存**缺陷，独立登记不混修：L0 无凭据扫描（`captureTurn` 路径零扫描，
+extract 提示词那句 "no secrets" 是给模型的请求而非机制）；`conversations`
+无体积上界（`pruneConversations` 只按时间删）。
+
+## ✅ 已修复并发布：L2 场景块进注入包从 0/6 恢复到 6/6（v0.3.5）
 
 详见 [ADR 0007](decisions/0007-injection-budget-container-mismatch.md)。
 **两个独立缺陷同一轮修完**——只修一半会退化（只修 A 会让 `3e857510e628`
@@ -59,7 +111,7 @@ memorax-code 的预算逻辑在闭源服务端，不可比。
 3. **单库采样产生 7 倍偏差**，而**间歇性敞口**会让单次采样自相矛盾：
    采样要跨库，也要跨时间。
 
-## 维护失败不再连坐任务流水线（未发布，schema 不变）
+## 维护失败不再连坐任务流水线（v0.3.5 已上线，schema 不变）
 
 `runner.ts` 的 `run()` 把 `maintain()` 与 job 认领放在**同一个 try 块**里，于是
 一次维护失败会**取消该库整轮流水线**。实测：让 `collectMetrics` 抛异常
