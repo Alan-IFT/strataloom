@@ -87,10 +87,16 @@ export const LIST_LIMIT = 200
  * Coverage of the actually-cited lines does not move.
  *
  * So the derivation kept below is not wrong — it measured row density at the
- * SQL exit accurately — but the ruler that decides what a caller SEES sits one
- * step further out, and was never replayed through. Raising this constant buys
- * scan and transport cost with no change in output. Do not re-derive it without
- * replaying through `renderFramed`.
+ * SQL exit accurately, and raising 20 to 34 really does fetch +93.5% more
+ * window text. That layer simply is not the last one. Eight of the eleven
+ * sessions deliver a byte-identical set at 20 and at 34; coverage of the
+ * actually-cited lines is unchanged at every limit.
+ *
+ * The raise is therefore not free but inert: it lifts the wasted-fetch rate
+ * from 88.7% to 94.0% (raw fetch +91% per call) while delivery stays near the
+ * 500-token ceiling. Do not re-derive this constant without replaying through
+ * `renderFramed` — the SQL exit will keep reporting progress that no caller
+ * receives.
  *
  * 34, raised from 20 by the `tool/call` capture, and the raise is a CORRECTION
  * rather than a widening: this is a ROW budget over a table whose row density
