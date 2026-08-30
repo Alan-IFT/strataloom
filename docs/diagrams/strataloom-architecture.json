@@ -1,0 +1,440 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "StrataLoom · 分层记忆插件架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1320,
+      900
+    ],
+    "views": [
+      {
+        "id": "capture-path",
+        "label": "采集与提炼",
+        "focus": [
+          "agent",
+          "capture",
+          "l0",
+          "runner",
+          "extract",
+          "reconcile",
+          "l1"
+        ],
+        "note": "一个 turn 结束触发采集，写入 L0；提炼与对账把它变成 L1 记忆。"
+      },
+      {
+        "id": "read-path",
+        "label": "三条读出口",
+        "focus": [
+          "inject",
+          "tools",
+          "render",
+          "l1",
+          "l2",
+          "l3",
+          "agent"
+        ],
+        "note": "注入、recall、sourceOf 共用同一个渲染器（D8），预算各自独立。"
+      },
+      {
+        "id": "derived-layers",
+        "label": "派生层与失效",
+        "focus": [
+          "l1",
+          "rebuild",
+          "l2",
+          "l3",
+          "decay"
+        ],
+        "note": "任何 raw 写入触发 D9 失效，派生层由维护轮按 revision 围栏重建。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "agent",
+      "type": "external",
+      "label": "DSH Agent",
+      "sublabel": "会话与工具调用",
+      "pos": [
+        36,
+        400
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "capture",
+      "type": "backend",
+      "label": "transcript 采集",
+      "sublabel": "turn-stopping 钩子",
+      "pos": [
+        259,
+        110
+      ],
+      "size": [
+        162,
+        74
+      ]
+    },
+    {
+      "id": "tools",
+      "type": "frontend",
+      "label": "memory_* 工具",
+      "sublabel": "recall / propose / forget",
+      "pos": [
+        259,
+        400
+      ],
+      "size": [
+        162,
+        74
+      ]
+    },
+    {
+      "id": "inject",
+      "type": "frontend",
+      "label": "注入 Provider",
+      "sublabel": "systemPrompt 变量",
+      "pos": [
+        259,
+        690
+      ],
+      "size": [
+        162,
+        74
+      ]
+    },
+    {
+      "id": "render",
+      "type": "security",
+      "label": "唯一渲染器",
+      "sublabel": "renderEntry · withinBudget",
+      "pos": [
+        464,
+        580
+      ],
+      "size": [
+        170,
+        74
+      ]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "MemoryService",
+      "sublabel": "provenance 闸门 · §2.3/2.4",
+      "pos": [
+        464,
+        210
+      ],
+      "size": [
+        170,
+        74
+      ]
+    },
+    {
+      "id": "l0",
+      "type": "database",
+      "label": "L0 conversations",
+      "sublabel": "原始转写 · 唯一物证",
+      "pos": [
+        740,
+        100
+      ],
+      "size": [
+        168,
+        74
+      ]
+    },
+    {
+      "id": "l1",
+      "type": "database",
+      "label": "L1 memories",
+      "sublabel": "4 kinds · D9 触发器失效派生层",
+      "pos": [
+        740,
+        310
+      ],
+      "size": [
+        168,
+        74
+      ]
+    },
+    {
+      "id": "l2",
+      "type": "database",
+      "label": "L2 场景块",
+      "sublabel": "derived=2 · ≤620 字符",
+      "pos": [
+        740,
+        560
+      ],
+      "size": [
+        168,
+        74
+      ]
+    },
+    {
+      "id": "l3",
+      "type": "database",
+      "label": "L3 画像",
+      "sublabel": "derived=3 · ≤600 字符",
+      "pos": [
+        740,
+        740
+      ],
+      "size": [
+        168,
+        74
+      ]
+    },
+    {
+      "id": "runner",
+      "type": "messagebus",
+      "label": "JobRunner",
+      "sublabel": "租约 · revision 围栏",
+      "pos": [
+        1026,
+        100
+      ],
+      "size": [
+        162,
+        74
+      ]
+    },
+    {
+      "id": "extract",
+      "type": "backend",
+      "label": "extract",
+      "sublabel": "转写 → 候选",
+      "pos": [
+        1026,
+        280
+      ],
+      "size": [
+        162,
+        66
+      ]
+    },
+    {
+      "id": "reconcile",
+      "type": "backend",
+      "label": "reconcile",
+      "sublabel": "去重 · supersede",
+      "pos": [
+        1026,
+        400
+      ],
+      "size": [
+        162,
+        66
+      ]
+    },
+    {
+      "id": "rebuild",
+      "type": "backend",
+      "label": "rebuild",
+      "sublabel": "rollup / persona",
+      "pos": [
+        1026,
+        580
+      ],
+      "size": [
+        162,
+        66
+      ]
+    },
+    {
+      "id": "decay",
+      "type": "backend",
+      "label": "decay",
+      "sublabel": "L1 休眠·归档·引文老化",
+      "pos": [
+        1026,
+        700
+      ],
+      "size": [
+        162,
+        66
+      ]
+    },
+    {
+      "id": "llm",
+      "type": "cloud",
+      "label": "LLM 路由",
+      "sublabel": "agentDefaultModel",
+      "pos": [
+        1204,
+        180
+      ],
+      "size": [
+        104,
+        66
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "插件进程",
+      "wraps": [
+        "capture",
+        "tools",
+        "inject",
+        "render",
+        "service"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "每仓 SQLite（schema v9）",
+      "wraps": [
+        "l0",
+        "l1",
+        "l2",
+        "l3"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "异步管线",
+      "wraps": [
+        "runner",
+        "extract",
+        "reconcile",
+        "rebuild",
+        "decay"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "agent-capture",
+      "from": "agent",
+      "to": "capture",
+      "label": "turn 结束",
+      "variant": "emphasis"
+    },
+    {
+      "id": "agent-tools",
+      "from": "agent",
+      "to": "tools"
+    },
+    {
+      "id": "inject-agent",
+      "from": "inject",
+      "to": "agent",
+      "label": "每轮注入 ≤1400 tok"
+    },
+    {
+      "id": "capture-l0",
+      "from": "capture",
+      "to": "l0",
+      "label": "写入调用与结果"
+    },
+    {
+      "id": "tools-service",
+      "from": "tools",
+      "to": "service"
+    },
+    {
+      "id": "inject-render",
+      "from": "inject",
+      "to": "render",
+      "label": "1300 tok 预算"
+    },
+    {
+      "id": "tools-render",
+      "from": "tools",
+      "to": "render",
+      "label": "500 tok 预算"
+    },
+    {
+      "id": "service-l1",
+      "from": "service",
+      "to": "l1",
+      "label": "读写 · FTS"
+    },
+    {
+      "id": "l0-runner",
+      "from": "l0",
+      "to": "runner",
+      "label": "排队 extract"
+    },
+    {
+      "id": "runner-extract",
+      "from": "runner",
+      "to": "extract"
+    },
+    {
+      "id": "extract-reconcile",
+      "from": "extract",
+      "to": "reconcile"
+    },
+    {
+      "id": "reconcile-l1",
+      "from": "reconcile",
+      "to": "l1",
+      "label": "落库",
+      "variant": "emphasis"
+    },
+    {
+      "id": "rebuild-l2",
+      "from": "rebuild",
+      "to": "l2",
+      "label": "重建 L2/L3"
+    },
+    {
+      "id": "extract-llm",
+      "from": "extract",
+      "to": "llm"
+    },
+    {
+      "id": "l0-service",
+      "from": "l0",
+      "to": "service",
+      "label": "sourceOf 回溯",
+      "variant": "dashed"
+    },
+    {
+      "id": "render-derived",
+      "from": "render",
+      "to": "l2",
+      "label": "读 L1/L2/L3"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "两条正交的轴",
+      "items": [
+        "L0→L3 是粒度轴，由管线逐层生长",
+        "fact/coding/preference/procedure 是用途轴，只在 L1 有意义",
+        "派生层按设计跨 kind 聚合，不是 4×4 网格"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "一条规则一个实现",
+      "items": [
+        "三条读出口共用同一渲染器（D8）",
+        "写侧豁免集 ≡ 读侧可达集，同一个 status 谓词",
+        "派生层由 D9 触发器统一失效，不靠调用方记得清理"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "已登记未修（ADR 0009）",
+      "items": [
+        "SOURCE_TURN_LIMIT 不绑定：token 预算先截断",
+        "sourceOf 兑现率 2.1%–4.3%，但零使用实例",
+        "90 天 L0 保留期尚未触发，例外集恒等于全集"
+      ]
+    }
+  ]
+}
