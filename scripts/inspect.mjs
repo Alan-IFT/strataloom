@@ -85,31 +85,59 @@ for (const [label, file] of stores) {
      FROM conversations WHERE label='tool:memory_recall' AND created_at >= ?`,
     RECALL_NO_MATCH, since,
   )
-  // Tool results that have no request beside them. Until 0.3.6 the capture
-  // dropped every `tool/call`, so this was 100% by construction and L0 recorded
-  // what tools replied without recording what the agent did.
+  // The newest turn that produced tool results, and how many requests stand
+  // beside them. Until 0.3.6 the capture dropped every `tool/call`, so L0
+  // recorded what tools replied without recording what the agent did.
   //
   // It is here because it answers a question no version string can: a release
-  // that is installed but not yet RUNNING leaves this at 100% while every
-  // version check reports the new build. Reading it over a window ("since")
-  // rather than over all history is what makes it a liveness signal instead of
-  // a historical fact — old rows stay orphaned forever and would mask the
-  // change. A store with no recent turns simply reports no calls.
-  const pairing = one(
-    `SELECT sum(CASE WHEN label LIKE 'tool:%' THEN 1 ELSE 0 END) AS results,
+  // that is installed but not yet RUNNING keeps writing rows in the old shape
+  // while every version check reports the new build.
+  //
+  // Why the LAST TURN and not a rate over a window — four queried reasons, not
+  // preferences:
+  //
+  //  1. Pairing is a property of a TURN, and inside one it is homogeneous.
+  //     Counted over all 8 real stores: 66 turns entirely without requests,
+  //     2 entirely with, and 0 mixed. So the newest turn on its own settles
+  //     which build performed the most recent capture. A rate cannot: a window
+  //     spanning two eras averages them into a number that describes neither
+  //     of them.
+  //  2. It does not read `since`. Reading a windowed rate correctly required
+  //     knowing when the process restarted and converting that by hand into
+  //     `--days` — a fact the store does not contain. This query needs nothing
+  //     from outside the store.
+  //  3. Because it does not read `since`, `--days 0` cannot collapse its window
+  //     to zero width and make the line vanish.
+  //  4. `HAVING results > 0` is load-bearing, not defensive dressing: a turn
+  //     can be pure conversation with no tool result at all (`94394b03d790`
+  //     holds one such turn among 20), and taking max(created_at) naively would
+  //     print `0 results, 0 calls` for it — a reading indistinguishable from a
+  //     turn captured by the old code. A store with no tool results anywhere
+  //     yields no row and prints nothing, so `global` needs no extra guard.
+  //
+  // GROUP BY `created_at` is GROUP BY turn. That is a queried fact, not an
+  // assumption: across all 8 stores every (session_id, turn) has
+  // count(DISTINCT created_at) = 1 — 69 turns, 0 exceptions — and no timestamp
+  // is shared by two turns.
+  const lastToolTurn = db.prepare(
+    `SELECT created_at,
+            sum(CASE WHEN label LIKE 'tool:%'      THEN 1 ELSE 0 END) AS results,
             sum(CASE WHEN label LIKE 'tool-call:%' THEN 1 ELSE 0 END) AS calls
-     FROM conversations WHERE created_at >= ?`,
-    since,
-  )
+     FROM conversations
+     GROUP BY created_at
+     HAVING results > 0
+     ORDER BY created_at DESC
+     LIMIT 1`,
+  ).get()
 
   console.log(`\n── ${label} ${'─'.repeat(Math.max(0, 46 - label.length))}`)
   console.log(`   memories   ${memories.active ?? 0} active, ${memories.derivedRows ?? 0} derived (${memories.total ?? 0} rows total)`)
   console.log(`   recall     ${recall.calls ?? 0} calls in ${days}d, ${recall.misses ?? 0} missed  (${pct(recall.misses ?? 0, recall.calls ?? 0)})`)
-  if ((pairing.results ?? 0) > 0) {
-    const orphans = (pairing.results ?? 0) - (pairing.calls ?? 0)
+  if (lastToolTurn !== undefined) {
     console.log(
-      `   tool rows  ${pairing.results ?? 0} results, ${pairing.calls ?? 0} calls in ${days}d` +
-        `  (${pct(Math.max(0, orphans), pairing.results ?? 0)} orphaned)`,
+      `   tool rows  last turn ${ago(lastToolTurn.created_at)} : ` +
+        `${String(lastToolTurn.results).padStart(3)} results, ` +
+        `${String(lastToolTurn.calls).padStart(3)} calls`,
     )
   }
 
