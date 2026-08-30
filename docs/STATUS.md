@@ -34,6 +34,20 @@ L2 场景块：3e857510 6 块 / ec2636fc 5 块 / edf7a686 6 块，共 15/17 块�
    ```
 
    即采集侧的 0.3.6 **确已在运行**，不只是装上了。
+
+   > **读数陷阱：`results` 与 `calls` 不相等时，先查是不是零参数工具。**
+   > 例如实测过一个批次是 `29 results, 27 calls`，逐工具拆开后差额全部来自
+   > `list_agents`（2 结果 / 0 请求），其余 `bash 22/22`、`subagent 2/2`、
+   > `send_message 1/1`、`memory_recall 1/1`、`memory_propose 1/1` 全部配平。
+   >
+   > 成因确定且**非本次回归**：`list_agents`/`get_goal`/`job_list` 这类零参数
+   > 工具的 `arguments` 是空串，摘要后文本为空，被 `transcript.ts` 里**早已存在**
+   > 的空文本过滤（`entry.text.trim() !== ''`）丢弃。ADR 0008 已登记为「残留
+   > 1.2% 孤儿」并写明不要当 bug 查。
+   >
+   > 判定方法（一条 SQL）：按 `label` 分组比对该批次的 `tool:X` 与
+   > `tool-call:X`。**若差额集中在零参数工具，采集正常；若出现在带参数的
+   > 工具上，那才是真问题。**
 2. ⏳ **仍待触发**：那条 677 字符的画像被重写到 ≤600。当前它**已被 D9 触发器
    删除**（global `store_revision=18`，`derived` 行为 0），等下一轮维护重建。
    触发链：任何 personal raw 写入 → D9 删画像 → 下轮维护重建（≤6 小时）。
