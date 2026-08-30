@@ -67,10 +67,31 @@ interface PromptTranscript {
  * (`reconcile`, `rollup`, `persona` all `JSON.stringify` their input) — the
  * hand-joined text here was the one exception, not the convention.
  *
- * Budget semantics are carried over unchanged in kind: each event costs what
- * it actually adds to the payload, and an event that does not fit ENDS the
- * transcript rather than being trimmed. Whole records or none: a half record
- * is exactly the artifact this shape exists to make impossible.
+ * Each event costs what it actually adds to the payload, and it is spent whole
+ * or not at all: a half record is exactly the artifact this shape exists to
+ * make impossible.
+ *
+ * An event that does not fit is SKIPPED, and the cheaper ones behind it are
+ * still considered. This used to `break` — end the transcript at the first
+ * event too large for the remaining budget — which made ONE oversized row a
+ * wall: past it, everything the turn contained was invisible whatever it cost.
+ * `recall/render.ts: withinBudget` had already settled the question the other
+ * way, in a comment that states the rule outright ("An entry that does not fit
+ * is SKIPPED, not treated as end-of-list"), and this was the last budget point
+ * in the codebase still disagreeing with it. Measured over 46 real sessions,
+ * skipping keeps 4% more events; the real argument is that a rule enforced in
+ * two places must be ONE rule, and "one oversized item must not hide the
+ * cheaper ones queued behind it" is not a property of packets, it is a
+ * property of budgets.
+ *
+ * `withinBudget` itself is deliberately NOT called here, and that is not an
+ * omission to be tidied up later. It prices entries through `renderEntry`
+ * against a TOKEN budget, because its container is the injection packet; this
+ * prices JSON records against a CHARACTER budget, because its container is the
+ * prompt payload. Two containers, two rulers, one rule — the same distinction
+ * `constants.ts` draws between the load-time derived guard and the runtime
+ * personal cap. Sharing the function would force one container to be measured
+ * with the other's ruler, which is how a budget stops meaning anything.
  *
  * "What it adds" is charged literally, so `EXTRACT_TRANSCRIPT_CHARS` bounds
  * the string the model receives, not the sum of its parts. The wrapper
@@ -107,7 +128,7 @@ const renderTranscript = (events: readonly TranscriptEvent[]): PromptTranscript 
     // The comma joining this entry to the previous one is part of what it
     // adds, so it is part of what it costs.
     const cost = JSON.stringify(entry).length + (kept.length === 0 ? 0 : 1)
-    if (cost > budget) break
+    if (cost > budget) continue
     kept.push(entry)
     budget -= cost
   }

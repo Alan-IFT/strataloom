@@ -14,7 +14,7 @@ import { captureTurn, readTurn, pruneConversations } from '../lib/store/conversa
 import { collectTurnEvents } from '../lib/transcript.js'
 import { buildContextProvider, renderFramed } from '../lib/recall/inject.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
-import { L0_RETENTION_MS, ROLLUP_TRANSCRIPT_CHARS } from '../lib/constants.js'
+import { L0_RETENTION_MS, ROLLUP_TRANSCRIPT_CHARS, SOURCE_TURN_LIMIT } from '../lib/constants.js'
 import { collectMetrics } from '../lib/metrics.js'
 import { RECALL_NO_MATCH } from '../lib/tools.js'
 import { runDecayJob } from '../lib/pipeline/decay.js'
@@ -37,6 +37,8 @@ import {
   turnEvents,
   userMessageEvent,
   assistantMessageEvent,
+  toolCallEvent,
+  toolResultEvent,
 } from './helpers.mjs'
 
 const makeRepo = () => {
@@ -147,6 +149,60 @@ test('L0 drill-down: memory_recall sourceOf returns the original conversation', 
   assert.equal(turns[0].provenance, 'human')
 
   await assert.rejects(service.source('ghost', principal, 20), /no memory with id/)
+  registry.dispose()
+  cleanup(root)
+})
+
+test('the L0 drill-down window survives the tool/call row-density change', async () => {
+  // The read-side cost that nearly shipped unrecorded. `SOURCE_TURN_LIMIT` is a
+  // ROW budget over a table whose density rose ~68% when `tool/call` capture
+  // landed, so the same 20 rows bought a third less conversation — measured on
+  // real sessions: -34.3% window characters, -34.6% assistant rows.
+  //
+  // `extract` did not have this problem because its budget is in CHARACTERS and
+  // re-balanced itself. That is the general lesson worth pinning: a change in
+  // what L0 stores must be re-checked against EVERY consumer's own ruler, and
+  // the row-budgeted one cannot self-correct.
+  //
+  // The assertion is the RULE, not the constant: the window must still deliver
+  // as much genuine CONVERSATION as it did before tool calls joined the table.
+  // `PRE_CHANGE_LIMIT` is the old value, and it is the yardstick precisely
+  // because back then every row in the window was conversation.
+  const PRE_CHANGE_LIMIT = 20
+  const { root, registry, principal, service } = setup()
+  const { id } = await service.propose(
+    { title: 'deploy with make', body: 'make deploy', kind: 'procedure' },
+    principal,
+  )
+  const store = service.storeFor(principal, false)
+
+  // A turn with more material than any window will hold, shaped the way real
+  // sessions are: assistant reasoning interleaved with the calls it made and
+  // the results they returned.
+  const entries = []
+  for (let i = 0; i < PRE_CHANGE_LIMIT * 3; i++) {
+    entries.push(toolCallEvent(1, `c${i}`, 'bash', JSON.stringify({ command: `step ${i}` })))
+    entries.push(assistantMessageEvent(1, `assistant reasoning number ${i}`))
+    entries.push(toolResultEvent(1, `c${i}`, `result ${i}`))
+  }
+  const events = collectTurnEvents(turnEvents(1, entries), 1)
+  store.tx(() => captureTurn(store, principal.session.id, 1, events))
+
+  const window = await service.source(id, principal, SOURCE_TURN_LIMIT)
+  const conversationRows = window.filter((row) => !row.label.startsWith('tool-call:'))
+  assert.ok(
+    conversationRows.length >= PRE_CHANGE_LIMIT,
+    `the window delivers ${conversationRows.length} conversation rows, fewer than the ` +
+      `${PRE_CHANGE_LIMIT} it delivered before tool calls shared it — SOURCE_TURN_LIMIT ` +
+      `(${SOURCE_TURN_LIMIT}) must track L0 row density`,
+  )
+  // The calls are IN the window rather than filtered out of it — the rejected
+  // alternative would have kept the limit at 20 by hiding what the agent did,
+  // which is the blindness this whole change removes.
+  assert.ok(
+    window.some((row) => row.label.startsWith('tool-call:')),
+    'the drill-down shows the request, not only the result',
+  )
   registry.dispose()
   cleanup(root)
 })
@@ -460,6 +516,62 @@ test('metrics: the recall miss rate is read from L0, not from a counter', () => 
   registry.dispose()
   cleanup(root)
 })
+test('capturing tool CALLS does not move the recall miss rate', () => {
+  // The reason `tool/call` rows get their own label family. `metrics.ts` and
+  // `scripts/inspect.mjs` read the recall miss rate as a population:
+  //   count(label = 'tool:memory_recall' AND text LIKE 'No stored memories matched.%')
+  //   / count(label = 'tool:memory_recall')
+  // Recording a REQUEST under the same label would inflate the denominator and
+  // never the numerator — every `memory_recall` call would add one non-miss —
+  // silently halving the number that gates the retrieval-fusion decision
+  // (ADR 0005). The metric would keep returning a value; the value would be
+  // wrong, and no test that locks the marker's WORDING would notice.
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+
+  // The same three results as the test above, now with their requests beside
+  // them, exactly as the fixed capture path writes them.
+  const rows = collectTurnEvents(
+    turnEvents(1, [
+      toolCallEvent(1, 'c1', 'memory_recall', '{"query":"工程取舍","kind":"fact"}'),
+      toolResultEvent(1, 'c1', RECALL_NO_MATCH),
+      toolCallEvent(1, 'c2', 'memory_recall', '{"query":"预算容器"}'),
+      toolResultEvent(1, 'c2', 'The following are stored memory entries...'),
+      toolCallEvent(1, 'c3', 'memory_recall', '{"query":"tool/call"}'),
+      toolResultEvent(1, 'c3', RECALL_NO_MATCH),
+    ]),
+    1,
+  )
+  store.tx(() => captureTurn(store, 'sess-metrics', 1, rows))
+
+  // The requests ARE stored — this is not "the rows were dropped again".
+  assert.equal(rows.length, 6, 'both families are captured')
+  assert.equal(
+    store.db
+      .prepare(`SELECT count(*) c FROM conversations WHERE label = 'tool-call:memory_recall'`)
+      .get().c,
+    3,
+    'the requests landed under their own family',
+  )
+
+  const m = collectMetrics(store, Date.now())
+  assert.equal(m.recallCalls, 3, 'the RESULT family is still the population')
+  assert.equal(m.recallMissRate, 0.667, 'and the rate is untouched by the new rows')
+
+  // Stated as the property rather than as two numbers: no `tool-call:` row may
+  // be visible to a consumer matching the result family. Every consumer does
+  // so by exact equality, which is what makes a distinct prefix sufficient.
+  assert.equal(
+    store.db
+      .prepare(`SELECT count(*) c FROM conversations WHERE label = 'tool:memory_recall'`)
+      .get().c,
+    3,
+    'exact-equality matching cannot see the request family',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
 test('metrics report oldest pending job age and dead letters', () => {
   const { root, registry } = openRegistry()
   const store = registry.open('k1')

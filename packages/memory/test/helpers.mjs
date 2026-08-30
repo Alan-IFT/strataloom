@@ -124,7 +124,12 @@ export const toolResultEvent = (turn, callId, text) => ({
   },
 })
 
-export const toolCallEvent = (turn, callId, name) => ({
+/**
+ * A `tool/call` event. `args` is the RAW argument string the platform records
+ * — the model's unparsed output — so tests can hand it anything a model could
+ * produce, including strings that are not JSON at all.
+ */
+export const toolCallEvent = (turn, callId, name, args = '{}') => ({
   type: 'tool/call',
-  data: { turn, step: 0, callId, name, arguments: '{}' },
+  data: { turn, step: 0, callId, name, arguments: args },
 })

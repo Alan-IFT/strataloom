@@ -10,6 +10,7 @@ import { enqueueJob, claimNextJob } from '../lib/pipeline/jobs.js'
 import {
   EXTRACT_EVENT_EXCERPT_CHARS,
   EXTRACT_TRANSCRIPT_CHARS,
+  TOOL_CALL_VALUE_CHARS,
 } from '../lib/constants.js'
 import {
   openRegistry,
@@ -158,51 +159,299 @@ test('a tool name cannot forge a transcript line', () => {
   // or MCP server registered it, so it is exactly as untrusted as a sender —
   // and unlike an event's text it sits at the head of the label and never saw
   // the excerpt budget.
-  for (const name of HOSTILE_NAMES) {
-    const events = turnEvents(1, [
-      toolCallEvent(1, 'c1', name),
-      toolResultEvent(1, 'c1', 'output'),
-    ])
-    const [entry] = collectTurnEvents(events, 1)
-    assert.match(
-      entry.label,
-      /^tool:[A-Za-z0-9_.:-]*$/,
-      `${JSON.stringify(name)} must not survive into the label`,
+  //
+  // Both label families are checked against the SAME table, because the
+  // request row and the result row take the same untrusted name through the
+  // same reduction. A table applied to only one of them is how the `tool:`
+  // branch lost its strip in the first place.
+  const rows = (name) =>
+    collectTurnEvents(
+      turnEvents(1, [toolCallEvent(1, 'c1', name), toolResultEvent(1, 'c1', 'output')]),
+      1,
     )
-    // Trust is unaffected by the name: only the two exact literals lift it.
-    assert.equal(entry.provenance, 'tool-output', `${JSON.stringify(name)} must not gain trust`)
+  for (const name of HOSTILE_NAMES) {
+    const [call, result] = rows(name)
+    assert.match(
+      call.label,
+      /^tool-call:[A-Za-z0-9_.:-]*$/,
+      `${JSON.stringify(name)} must not survive into the request label`,
+    )
+    assert.match(
+      result.label,
+      /^tool:[A-Za-z0-9_.:-]*$/,
+      `${JSON.stringify(name)} must not survive into the result label`,
+    )
+    // Trust is unaffected by the name: only the two exact literals lift it,
+    // and a REQUEST is never lifted at all (see below).
+    assert.equal(result.provenance, 'tool-output', `${JSON.stringify(name)} must not gain trust`)
   }
 
   // An unnamable name and an unresolvable call id are the same fact, and the
   // pre-existing `|| 'unknown'` degradation must survive the sanitizing.
   for (const name of ['', '\n\n', '"]}', '\uD800']) {
-    const events = turnEvents(1, [
-      toolCallEvent(1, 'c1', name),
-      toolResultEvent(1, 'c1', 'output'),
-    ])
-    assert.equal(collectTurnEvents(events, 1)[0].label, 'tool:unknown', JSON.stringify(name))
+    const [call, result] = rows(name)
+    assert.equal(call.label, 'tool-call:unknown', JSON.stringify(name))
+    assert.equal(result.label, 'tool:unknown', JSON.stringify(name))
   }
 
   // Legitimate names keep their shape — namespaced and MCP-style ones
   // included, or the strip would be a regression dressed as a fix.
   for (const name of ['bash', 'memory_recall', 'mcp.server:read_file', 'x-tool']) {
-    const events = turnEvents(1, [
-      toolCallEvent(1, 'c1', name),
-      toolResultEvent(1, 'c1', 'output'),
-    ])
-    assert.equal(collectTurnEvents(events, 1)[0].label, `tool:${name}`)
+    const [call, result] = rows(name)
+    assert.equal(call.label, `tool-call:${name}`)
+    assert.equal(result.label, `tool:${name}`)
   }
 
-  // And the trust-bearing names still bear trust after the change.
+  // And the trust-bearing names still bear trust after the change — on the
+  // RESULT only. A subagent tool's result carries the child's own words; its
+  // request carries the parent model's raw argument string, which §2.4 fails
+  // closed on whatever tool it names.
   for (const name of ['subagent', 'subagent_fork']) {
-    const events = turnEvents(1, [
-      toolCallEvent(1, 'c1', name),
-      toolResultEvent(1, 'c1', 'child output'),
-    ])
-    const [entry] = collectTurnEvents(events, 1)
-    assert.equal(entry.label, `tool:${name}`)
-    assert.equal(entry.provenance, 'subagent')
+    const [call, result] = collectTurnEvents(
+      turnEvents(1, [toolCallEvent(1, 'c1', name), toolResultEvent(1, 'c1', 'child output')]),
+      1,
+    )
+    assert.equal(result.label, `tool:${name}`)
+    assert.equal(result.provenance, 'subagent')
+    assert.equal(call.label, `tool-call:${name}`)
+    assert.equal(call.provenance, 'tool-output', 'a request never inherits the result trust')
   }
+})
+
+// ---- tool/call capture: what the AGENT did, not only what tools said ------
+
+test('a tool call is captured as a structured summary, not raw and not head-truncated', () => {
+  // The defect: `collectTurnEvents` discarded every `tool/call` event, so L0
+  // recorded 878 tool results and 0 requests for this repo's own
+  // `session-43422ed9` — every stored result an orphan. The fix records the
+  // request, and the SHAPE of that record is the whole reason it pays for
+  // itself rather than costing extract input.
+  const long = 'x'.repeat(4_821)
+  const [entry] = collectTurnEvents(
+    turnEvents(1, [
+      toolCallEvent(1, 'c1', 'write', JSON.stringify({ content: long, file_path: 'src/a.ts' })),
+    ]),
+    1,
+  )
+
+  const summary = JSON.parse(entry.text)
+  // The long value is recorded as a MEASUREMENT. Not the value (that is the
+  // `raw` shape), and not its first N characters (that is `head400`): both
+  // were measured to REDUCE the events extract fits, because a long argument
+  // is long in one value, so a head cut keeps the least informative part of it
+  // and throws away the field names that follow.
+  assert.equal(summary.content, `<${long.length} chars>`, 'the long value became its length')
+  assert.ok(!entry.text.includes('xxxx'), 'no part of the long value survives verbatim')
+  // ...while the short value beside it is kept exactly, which is the point:
+  // "which tool, against which target" is what extraction can use.
+  assert.equal(summary.file_path, 'src/a.ts', 'short values stay verbatim')
+
+  // The boundary is the constant, executed rather than described.
+  const atCap = 'y'.repeat(TOOL_CALL_VALUE_CHARS)
+  const overCap = 'y'.repeat(TOOL_CALL_VALUE_CHARS + 1)
+  const [bounded] = collectTurnEvents(
+    turnEvents(1, [toolCallEvent(1, 'c1', 'bash', JSON.stringify({ at: atCap, over: overCap }))]),
+    1,
+  )
+  const boundedSummary = JSON.parse(bounded.text)
+  assert.equal(boundedSummary.at, atCap, 'at the cap, kept whole')
+  assert.equal(boundedSummary.over, `<${overCap.length} chars>`, 'one over, elided')
+})
+
+test('a captured tool call never exceeds what extraction can read', () => {
+  // M3's EXECUTED assertion, not a comment claiming the bound. The row cap is
+  // `EXTRACT_EVENT_EXCERPT_CHARS` because that is the invariant: extraction
+  // cuts every event to it, so a longer stored row has no reader — the bytes
+  // are paid for at capture and discarded before the model ever sees them.
+  //
+  // Per-value elision alone does NOT give this bound, which is why it is
+  // enforced separately: enough short fields, or enough elided ones, still
+  // build a long row. Both shapes are exercised.
+  const manyShort = Object.fromEntries(
+    Array.from({ length: 60 }, (_, i) => [`field_number_${i}`, `value_${i}`]),
+  )
+  const manyLong = Object.fromEntries(
+    Array.from({ length: 40 }, (_, i) => [`field_${i}`, 'z'.repeat(TOOL_CALL_VALUE_CHARS + 1)]),
+  )
+  const cases = [
+    ['many short values', JSON.stringify(manyShort)],
+    ['many elided values', JSON.stringify(manyLong)],
+    ['one enormous value', JSON.stringify({ content: 'q'.repeat(50_000) })],
+    ['not an object', 'w'.repeat(50_000)],
+    ['not JSON at all', `${'w'.repeat(50_000)}{`],
+    ['a bare JSON array', JSON.stringify(Array.from({ length: 5_000 }, (_, i) => i))],
+    ['a bare JSON string', JSON.stringify('e'.repeat(50_000))],
+    // The one that is not merely large but STRUCTURALLY hostile: `JSON.parse`
+    // accepts this and `JSON.stringify` then overflows the stack on the way
+    // back out (measured on this Node: ~4500 levels is the boundary). It is
+    // here because the summary's contract is that it never throws, and a `try`
+    // around the parse alone protected the wrong half — one such call took the
+    // WHOLE turn's L0 down with it, the user's own message included.
+    ['a deeply nested value', `{"a":${'['.repeat(10_000)}1${']'.repeat(10_000)}}`],
+  ]
+  for (const [label, args] of cases) {
+    const [entry] = collectTurnEvents(
+      turnEvents(1, [toolCallEvent(1, 'c1', 'bash', args)]),
+      1,
+    )
+    assert.ok(
+      entry.text.length <= EXTRACT_EVENT_EXCERPT_CHARS,
+      `${label}: stored ${entry.text.length} chars, more than extraction can ever read ` +
+        `(${EXTRACT_EVENT_EXCERPT_CHARS})`,
+    )
+    // And what is stored is still a fact, not a fragment: an over-cap row
+    // degrades to the whole call's measured length rather than to a prefix.
+    assert.ok(entry.text !== '', `${label}: the call is still recorded`)
+  }
+})
+
+test('a hostile tool call cannot take the rest of the turn down with it', () => {
+  // The consequence the row-cap test above cannot see, because it looks at one
+  // event: capture is a WHOLE-TURN operation, so a throw inside one event's
+  // summary loses every other event in the turn. `auto-extract.ts` catches it
+  // to keep the turn boundary alive — which means the loss is silent, one
+  // `warn` line and no L0 at all for that turn.
+  //
+  // The human message is the assertion that matters. It is the highest-trust
+  // material there is (§2.4 `human`, the only level that reaches the default
+  // injection packet), and it has nothing to do with the tool call that broke.
+  const deep = `{"a":${'['.repeat(10_000)}1${']'.repeat(10_000)}}`
+  const rows = collectTurnEvents(
+    turnEvents(1, [
+      toolCallEvent(1, 'c1', 'bash', deep),
+      userMessageEvent('we always deploy with make deploy'),
+      toolResultEvent(1, 'c1', 'ok'),
+    ]),
+    1,
+  )
+  const human = rows.find((row) => row.provenance === 'human')
+  assert.ok(human !== undefined, 'the human message survived a neighbouring hostile call')
+  assert.equal(human.text, 'we always deploy with make deploy')
+  assert.equal(rows.length, 3, 'and so did every other event in the turn')
+  // The hostile call itself is still RECORDED, degraded to what is knowable
+  // about it — its length. Dropping the row would be the other way to avoid
+  // throwing, and it would hide the fact that a call happened at all.
+  const call = rows.find((row) => row.label === 'tool-call:bash')
+  assert.equal(call.text, `<${deep.length} chars>`, 'degrades to the existing measured fallback')
+})
+
+test('a tool event whose name or arguments is not a string still capture the turn', () => {
+  // The sibling of the deep-nesting case, and the same failure shape: a
+  // non-string reaching `labelSegment` calls `.replace` on it and throws, which
+  // costs the WHOLE turn's L0 rather than one label.
+  //
+  // The platform types both fields as `string`, and across 145 real session
+  // logs / ~14k calls they always are. That is a fact about today's producers,
+  // not an invariant: the name arrives from whatever plugin or MCP server
+  // registered the tool, which this module already treats as untrusted as a
+  // sender id. `transcript.ts` calls itself the fail-closed injection boundary,
+  // so "no current producer does this" is not the standard it holds itself to.
+  //
+  // BOTH families are covered, because `tool/result` had the same hole wearing
+  // a guard that looked sufficient: its `?? ''` only catches nullish, so a
+  // numeric name went straight through it into the same throw.
+  const hostileNames = [undefined, null, 42, 0, { a: 1 }, ['x'], true, Symbol.iterator]
+  for (const name of hostileNames) {
+    const label = String(typeof name === 'symbol' ? 'symbol' : JSON.stringify(name) ?? 'undefined')
+    const rows = collectTurnEvents(
+      turnEvents(1, [
+        { type: 'tool/call', data: { turn: 1, step: 0, callId: 'c1', name, arguments: '{}' } },
+        userMessageEvent('we always deploy with make deploy'),
+        toolResultEvent(1, 'c1', 'tool output'),
+      ]),
+      1,
+    )
+    // The turn survives whole — this is the assertion that matters, and the
+    // human message is the material with the most to lose (§2.4 `human`).
+    assert.equal(rows.length, 3, `${label}: every event in the turn survived`)
+    const human = rows.find((row) => row.provenance === 'human')
+    assert.equal(human?.text, 'we always deploy with make deploy', `${label}: human intact`)
+    // An unnamable tool degrades to the SAME label an unresolved call id has
+    // always produced, in both families. Never `[object Object]`: a label is an
+    // identifier, so a stringified object would be a fabricated name.
+    assert.equal(rows[0].label, 'tool-call:unknown', `${label}: request degrades`)
+    assert.equal(rows[2].label, 'tool:unknown', `${label}: result degrades`)
+    assert.equal(rows[0].provenance, 'tool-output', `${label}: still fails closed`)
+  }
+
+  // `arguments` gets the same narrowing, and deliberately NOT `String()`:
+  // `String(undefined)` is the literal text "undefined", which would record
+  // the call as having had an argument list saying `undefined` — a fabricated
+  // fact, the one thing L0 must never hold.
+  for (const args of [undefined, null, 42, { a: 1 }]) {
+    const rows = collectTurnEvents(
+      turnEvents(1, [
+        { type: 'tool/call', data: { turn: 1, step: 0, callId: 'c1', name: 'bash', arguments: args } },
+        userMessageEvent('human line'),
+      ]),
+      1,
+    )
+    const call = rows.find((row) => row.label === 'tool-call:bash')
+    assert.ok(
+      call === undefined || !call.text.includes('undefined'),
+      `${JSON.stringify(args) ?? 'undefined'}: never records a fabricated argument list`,
+    )
+    assert.ok(
+      rows.some((row) => row.provenance === 'human'),
+      `${JSON.stringify(args) ?? 'undefined'}: the turn survived`,
+    )
+  }
+
+  // And the whole event missing its data fields at once.
+  const bare = collectTurnEvents(
+    turnEvents(1, [{ type: 'tool/call', data: {} }, userMessageEvent('human line')]),
+    1,
+  )
+  assert.ok(
+    bare.some((row) => row.provenance === 'human'),
+    'an entirely malformed tool/call does not cost the turn',
+  )
+})
+
+test('a tool call is tool-output provenance, whatever tool it names', () => {
+  // Spec §2.4 fail-closed, and the reason it is not negotiable: `arguments` is
+  // the model's raw unparsed output, so text an attacker planted in an earlier
+  // tool result can steer it. `parent-agent` is one of §2.3's three DEFAULT
+  // injection provenances — granting it here would open a path from
+  // model-controllable text into the packet injected on every turn.
+  const names = ['bash', 'subagent', 'subagent_fork', 'memory_propose']
+  for (const name of names) {
+    const [entry] = collectTurnEvents(
+      turnEvents(1, [toolCallEvent(1, 'c1', name, '{"a":"b"}')]),
+      1,
+    )
+    assert.equal(entry.provenance, 'tool-output', `${name}: a request is never trusted`)
+    assert.notEqual(entry.provenance, 'parent-agent', `${name}: never the injectable level`)
+  }
+})
+
+test('the assistant branch does not also capture its tool_use blocks', () => {
+  // The rejected half of the original proposal, pinned so it is not re-added.
+  // Across every real session log on this machine, all 13715 assistant
+  // `tool-call` blocks carry `arguments` byte-identical to their `tool/call`
+  // event — capturing both would be one fact recorded twice, and the block is
+  // the weaker copy (no callId pairing of its own, no separate provenance).
+  const args = '{"command":"ls"}'
+  const events = turnEvents(1, [
+    {
+      type: 'assistant/message',
+      data: {
+        turn: 1,
+        step: 0,
+        message: {
+          id: 'a',
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'bash', arguments: args }],
+          source: { kind: 'model', provider: 'p', model: 'm' },
+        },
+      },
+    },
+    toolCallEvent(1, 'c1', 'bash', args),
+  ])
+  const collected = collectTurnEvents(events, 1)
+  assert.equal(collected.length, 1, 'the call is recorded ONCE, from the event')
+  assert.equal(collected[0].label, 'tool-call:bash')
+  assert.equal(collected[0].provenance, 'tool-output')
 })
 
 test('non-subagent source kinds fail closed to tool-output', () => {
@@ -596,16 +845,23 @@ test('the extract input survives every line terminator and JSON escape', async (
       ]),
     )
     const parsed = parseExtractInput(input) // never throws: the encoder escaped it
-    assert.equal(parsed.events.length, 2, `${JSON.stringify(hostile)}: no extra record`)
+    // Three records now: the human line, the tool REQUEST, and the tool
+    // result. The request is the row this turn used to lose entirely.
+    assert.equal(parsed.events.length, 3, `${JSON.stringify(hostile)}: no extra record`)
     assert.equal(
-      parsed.events[1].text,
-      stored[1].text,
+      parsed.events[2].text,
+      stored[2].text,
       `${JSON.stringify(hostile)}: text round-trips byte for byte`,
     )
     assert.match(
       parsed.events[1].label,
+      /^tool-call:[A-Za-z0-9_.:-]*$/,
+      `${JSON.stringify(hostile)}: request label stays an identifier`,
+    )
+    assert.match(
+      parsed.events[2].label,
       /^tool:[A-Za-z0-9_.:-]*$/,
-      `${JSON.stringify(hostile)}: label stays an identifier`,
+      `${JSON.stringify(hostile)}: result label stays an identifier`,
     )
   }
 })
@@ -694,6 +950,79 @@ test('the extract input truncates whole records, never half of one', async () =>
     assert.ok(event.text.startsWith(`${i}:`), `record ${i} is whole and in order`)
     assert.equal(event.text.length, EXTRACT_EVENT_EXCERPT_CHARS + 1)
   }
+})
+
+test('one oversized record does not hide the cheaper ones behind it', async () => {
+  // The rule inconsistency this fixes: `renderTranscript` used to `break` at
+  // the first event too large for the remaining budget, which made one
+  // expensive row a WALL — everything after it was invisible whatever it cost.
+  // `recall/render.ts: withinBudget` had already settled the same question the
+  // other way, in a comment that states it outright ("An entry that does not
+  // fit is SKIPPED, not treated as end-of-list"). This was the last budget
+  // point in the codebase still disagreeing.
+  //
+  // The fixture is the shape that distinguishes the two rules and nothing
+  // else: fill most of the budget with affordable events, then place an
+  // unaffordable one, then place a cheap one behind it. Under `break` the
+  // cheap tail is lost; under `skip` only the expensive row is.
+  //
+  // Every event is capped at the same excerpt length, so the fixture cannot
+  // rely on the wall being intrinsically enormous — it has to leave a GAP the
+  // wall overruns and the tail fits into. The filler is therefore sized by
+  // measurement rather than by a typed count: add events until the remaining
+  // budget is smaller than a full-length record. Each filler is much cheaper
+  // than the window is wide, so this always lands inside it, and it re-sizes
+  // itself if `EXTRACT_TRANSCRIPT_CHARS` ever moves.
+  //
+  // The two assertions below then VALIDATE that premise instead of assuming
+  // it: if the sizing ever drifted, "the wall has to be the event that did not
+  // fit" fails and says so, rather than the test passing vacuously.
+  const fillerText = 'f'.repeat(120)
+  const wallCost = JSON.stringify({
+    seq: 0,
+    label: 'user',
+    text: `${'w'.repeat(EXTRACT_EVENT_EXCERPT_CHARS)}…`,
+  }).length
+  const filler = []
+  let remaining = EXTRACT_TRANSCRIPT_CHARS - JSON.stringify({ events: [] }).length
+  while (remaining > wallCost) {
+    // seq 1 is `turn/start`, so the i-th entry carries seq i + 2.
+    const cost =
+      JSON.stringify({ seq: filler.length + 2, label: 'user', text: fillerText }).length +
+      (filler.length === 0 ? 0 : 1)
+    remaining -= cost
+    filler.push(userMessageEvent(fillerText))
+  }
+
+  const { input } = await extractInputFor(
+    turnEvents(1, [
+      ...filler,
+      userMessageEvent(`WALL ${'w'.repeat(EXTRACT_EVENT_EXCERPT_CHARS)}`),
+      userMessageEvent('CHEAP TAIL'),
+    ]),
+  )
+  const texts = parseExtractInput(input).events.map((event) => event.text)
+  assert.ok(
+    !texts.some((text) => text.startsWith('WALL')),
+    'the fixture must actually exercise a skip: the wall has to be the event that did not fit',
+  )
+  assert.ok(
+    texts.some((text) => text === 'CHEAP TAIL'),
+    'the cheap event behind the oversized one must still be considered',
+  )
+  // Asserted as the RULE the two budget points share, not as a count: skipping
+  // is the same decision `withinBudget` makes, executed on a different
+  // container with a different ruler (JSON characters, not rendered tokens).
+  const { withinBudget } = await import('../lib/recall/render.js')
+  const hits = [
+    { id: '1', kind: 'fact', title: 'expensive', body: 'x'.repeat(4_000) },
+    { id: '2', kind: 'fact', title: 'cheap', body: 'y' },
+  ]
+  assert.deepEqual(
+    withinBudget(hits, 50).map((hit) => hit.id),
+    ['2'],
+    'the packet budget skips too — one rule, two containers',
+  )
 })
 
 test('a turn whose every event is budgeted out settles without calling the model', async () => {

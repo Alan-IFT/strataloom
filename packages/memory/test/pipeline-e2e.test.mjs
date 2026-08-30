@@ -289,6 +289,118 @@ test('the output cap covers the worst reply the prompts invite, priced as CJK', 
   )
 })
 
+test('the extract INPUT is inside the exchange guard, not only its reply', async () => {
+  // The coverage hole this closes. `worstExchangeChars` priced exactly one
+  // prompt — the rollup — so `EXTRACT_TRANSCRIPT_CHARS` could be set to any
+  // value at all and nothing would fail: the only assertion that mentioned
+  // extract priced its REPLY. That mattered because a provider may count
+  // `maxTokens` against the WHOLE exchange rather than the completion (a live
+  // rollup finished as `max-tokens` with room to spare on the output side),
+  // and extract's exchange is now the larger of the two.
+  //
+  // It asserts the RULE, not the numbers. Every quantity below is imported;
+  // the reply term is CALLED rather than restated, because it already existed
+  // in three places and a re-tuned target moved only some of them. Raising a
+  // target without raising the cap must fail HERE, at load, rather than as
+  // "model reply is not valid JSON" in production.
+  const {
+    LLM_MAX_TOKENS,
+    EXTRACT_TRANSCRIPT_CHARS,
+    ROLLUP_TRANSCRIPT_CHARS,
+    worstExtractReplyChars,
+    worstRollupReplyChars,
+  } = await import('../lib/constants.js')
+
+  const worstExchange = Math.max(
+    ROLLUP_TRANSCRIPT_CHARS + worstRollupReplyChars(),
+    EXTRACT_TRANSCRIPT_CHARS + worstExtractReplyChars(),
+  )
+  assert.ok(
+    LLM_MAX_TOKENS >= worstExchange,
+    `LLM_MAX_TOKENS (${LLM_MAX_TOKENS}) must hold the worst EXCHANGE (${worstExchange}), ` +
+      'input included — priced at one token per character, the honest CJK rate',
+  )
+  // The transcript cap is DERIVED from that inequality, not chosen: it is
+  // whatever the cap leaves once the invited reply is reserved. Asserting the
+  // solved ceiling rather than a literal keeps this true when a target moves.
+  const ceiling = LLM_MAX_TOKENS - worstExtractReplyChars()
+  assert.ok(
+    EXTRACT_TRANSCRIPT_CHARS <= ceiling,
+    `EXTRACT_TRANSCRIPT_CHARS (${EXTRACT_TRANSCRIPT_CHARS}) must stay under ${ceiling}`,
+  )
+
+  // The reply term must be MEASURED, not estimated — this is the assertion
+  // that would have caught the previous round. It priced the scaffolding as a
+  // hand-counted "+60 per candidate", which solved to a ceiling of 7100 and
+  // shipped 7000; constructed and measured, one candidate costs 165 characters
+  // beyond its raw title and body, so the real ceiling is 6558 and 7000 was
+  // over it by 442. A test that only checks "cap <= ceiling" cannot see that,
+  // because both sides move together when the estimate is wrong.
+  //
+  // So: build the worst candidate the prompt permits and require the guard's
+  // own price to cover what `JSON.stringify` actually charges for it.
+  const {
+    EXTRACT_MAX_CANDIDATES,
+    EXTRACT_TITLE_TARGET_CHARS,
+    EXTRACT_BODY_TARGET_CHARS,
+    REPLY_WORST_ESCAPE_RATE,
+  } = await import('../lib/constants.js')
+  const { MEMORY_KINDS } = await import('../lib/types.js')
+  const escapeHeavy = (chars) => {
+    const period = Math.max(2, Math.floor(1 / REPLY_WORST_ESCAPE_RATE))
+    let out = ''
+    for (let i = 0; i < chars; i++) out += (i + 1) % period === 0 ? '"' : 'x'
+    return out
+  }
+  const worstReply = JSON.stringify({
+    candidates: Array.from({ length: EXTRACT_MAX_CANDIDATES }, () => ({
+      title: escapeHeavy(EXTRACT_TITLE_TARGET_CHARS),
+      body: escapeHeavy(EXTRACT_BODY_TARGET_CHARS),
+      kind: [...MEMORY_KINDS].sort((a, b) => b.length - a.length)[0],
+      sourceSeqs: Array.from({ length: 6 }, () => 9999), // the measured max
+    })),
+  })
+  assert.ok(
+    worstExtractReplyChars() >= worstReply.length,
+    `the guard prices the extract reply at ${worstExtractReplyChars()}, but a reply the ` +
+      `prompt permits serializes to ${worstReply.length} — the scaffolding is under-counted`,
+  )
+  // ...and the escape dimension is real, not a disabled knob: an escape-heavy
+  // string must genuinely cost more than its own length.
+  assert.ok(
+    JSON.stringify(escapeHeavy(EXTRACT_BODY_TARGET_CHARS)).length - 2 > EXTRACT_BODY_TARGET_CHARS,
+    'the worst-case reply must be priced with JSON escaping, not with raw lengths',
+  )
+
+  // And the guard is EXECUTED, not merely satisfied today. Re-load the module
+  // with the transcript pushed over its own ceiling and require a throw —
+  // otherwise this test would pass just as happily against a guard that had
+  // been deleted.
+  const { readFileSync, writeFileSync, rmSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const libDir = join(import.meta.dirname, '..', 'lib')
+  const source = readFileSync(join(libDir, 'constants.js'), 'utf8')
+  // `[\d_]+`, not `\d+`: tsc preserves the numeric separator in `7_000`, and a
+  // probe that silently fails to rewrite would assert nothing at all.
+  const patched = source.replace(
+    /export const EXTRACT_TRANSCRIPT_CHARS = [\d_]+;/,
+    `export const EXTRACT_TRANSCRIPT_CHARS = ${ceiling + 1};`,
+  )
+  assert.notEqual(patched, source, 'the probe must actually rewrite the transcript cap')
+
+  const probe = join(libDir, `constants.extract-probe.${randomUUID()}.js`)
+  writeFileSync(probe, patched)
+  try {
+    await assert.rejects(import(`file://${probe}`), (error) => {
+      assert.match(error.message, /worst exchange/, 'names the rule it broke')
+      assert.match(error.message, /LLM_MAX_TOKENS \(\d+\)/, 'reports the cap')
+      return true
+    })
+  } finally {
+    rmSync(probe, { force: true })
+  }
+})
+
 test('the derived layer must fit the packet it exists to produce', async () => {
   // The bug this locks down was silent in exactly the way that matters: the
   // rollup prompt ASKED for <=900-char bodies, nothing enforced it, and the
@@ -312,9 +424,14 @@ test('the derived layer must fit the packet it exists to produce', async () => {
   const source = readFileSync(join(libDir, 'constants.js'), 'utf8')
 
   // Patched in place inside lib/ so the module's own relative imports resolve.
+  // `[\d_]+` matches its sibling probe below: tsc preserves numeric separators,
+  // and eight constants in this file already carry one. This probe works today
+  // only because `620` happens not to — one rule, one expression, rather than
+  // two that agree by luck. (Both probes assert `notEqual` afterwards, so a
+  // silent non-match would be caught either way; this keeps them from drifting.)
   const OVERSIZED = 900 // the historical value the live store was measured at
   const patched = source.replace(
-    /export const ROLLUP_TARGET_CHARS = \d+;/,
+    /export const ROLLUP_TARGET_CHARS = [\d_]+;/,
     `export const ROLLUP_TARGET_CHARS = ${OVERSIZED};`,
   )
   assert.notEqual(patched, source, 'the probe must actually rewrite the target')
