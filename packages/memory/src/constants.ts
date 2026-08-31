@@ -4,7 +4,7 @@
  * design constants).
  * @module @strataloom/dsh-memory/constants
  */
-import { estimateTokens, renderEntry } from './recall/render.ts'
+import { estimateTokens, renderEntry, SOURCE_LABEL_MAX_CHARS } from './recall/render.ts'
 // `types.ts` imports nothing, so this cannot close a cycle the way importing
 // from `inject.ts` would (see the note on `recall/render.ts`). The kind enum is
 // read rather than quoted so the extract reply guard prices whatever kinds
@@ -65,26 +65,279 @@ export const INJECT_TOP_N = 20
 export const SIMILAR_LIMIT = 5
 
 export const RECALL_CANDIDATE_LIMIT = 50
-/** Rendered recall result budget (spec §4.3). */
+/**
+ * What THIS repository's own rows may contribute to a recall result (spec §4.3).
+ *
+ * Read the name literally: it is the HOME container, not the packet. Until the
+ * group feature existed those were the same thing, and `tools.ts` spending this
+ * on every hit — home and foreign alike — is what made a per-member budget at
+ * the service layer decorative (see `RECALL_PACKET_BUDGET_TOKENS`).
+ */
 export const RECALL_RESULT_BUDGET_TOKENS = 500
-
+/**
+ * The recall packet's REAL container, in CHARACTERS.
+ *
+ * This is the number the previous revision of this file did not have, and its
+ * absence is exactly why the guard at the bottom was vacuous: that guard
+ * compared the worst packet against `RECALL_RESULT_BUDGET_TOKENS x
+ * (GROUP_MAX_MEMBERS + 1)`, which is not a container at all — it is an
+ * expression in which the member count CANCELS (proof at the guard).
+ *
+ * The real one was found by following the value a model actually receives:
+ *
+ *     service.recall()          -> hits (structured)
+ *     tools.ts  output.render() -> content: [{ type: 'text', text }]
+ *     dsh-agent-loop            -> appendToolResult(..., result.content)
+ *     dsh-llm                   -> createToolResultMessage({ content })
+ *
+ * `createToolResultMessage` puts `result.content` — and NOTHING else — into the
+ * message (`@deepseek-ai/dsh-llm/lib/index.js:202`, reached from
+ * `@deepseek-ai/dsh-agent-loop/lib/index.js:302`). The structured `value` never
+ * reaches a model. So the rendered STRING is the entire product, and the first
+ * thing downstream that truncates it is the platform's tool-result pruner,
+ * configured identically at 8192 characters in
+ * `@deepseek-ai/dsh-base/cordis.patch.yml` and in all three shipped agent
+ * presets (code / cordis / standard). Past that threshold it keeps head 4096 +
+ * marker + tail 1024 and DELETES the middle.
+ *
+ * Measured 2026-09-01 against a worst-case packet built at the constants this
+ * file used to carry (home 500 + 8 members x 200):
+ *
+ *     rendered packet   8506 chars   403 entries
+ *     after the pruner  5159 chars   231 entries
+ *     silently deleted                172 entries
+ *
+ * That is ADR 0007's failure shape one layer further out, and it is why this
+ * constant is denominated in CHARACTERS: the pruner counts Unicode code points,
+ * so a token-denominated guard cannot see the cut at all.
+ *
+ * KNOWN COUPLING, recorded rather than hidden: this mirrors a platform default
+ * that this package does not own, so a deployment which lowers `thresholdChars`
+ * makes this guard optimistic. That is still strictly better than what it
+ * replaces — a guard modelling a container that does not exist — and what the
+ * guard PRICES is a real packet rendered through the real `renderFramed`, so
+ * the only thing that can drift is the threshold, never the pricing.
+ */
+export const RECALL_PACKET_MAX_CHARS = 8_192
 /**
  * Rows `/memory` lists per scope. Generous: the point of that command is
  * completeness, so the cap is a guard against flooding a chat with an enormous
  * store, not an editorial filter.
  */
 export const LIST_LIMIT = 200
-
+/**
+ * What ONE group member repository may contribute to a recall result.
+ *
+ * PER LIBRARY, deliberately, and that is the entire design. The alternative —
+ * letting foreign rows compete for the single `RECALL_RESULT_BUDGET_TOKENS`
+ * container — is ADR 0007's defect with different labels: measured over the
+ * real stores, a shared container let foreign rows displace this repo's own
+ * memories in 33.1%-40.9% of queries. A budget per member makes the home
+ * repository's result a function of the home repository alone.
+ *
+ * 220, and it is the MAXIMUM OF TWO derivations — a measured knee and an
+ * enforced floor — rounded up. The first was measured, the value was set to it,
+ * and then the load-time guard at the bottom of this file rejected it. The
+ * guard was right and the measurement was incomplete; the constant moved rather
+ * than the invariant (ADR 0007: 常量跟随不变量走). It moved a second time, for
+ * the same reason, when the renderer began emitting a `(from …)` label — see
+ * "the label raise" below.
+ *
+ * ## Derivation 1 — the coverage knee (150)
+ *
+ * Measured 2026-09-01 over the three declared members of the real `NFBY_CMS`
+ * group (59 distinct active non-derived rows), priced through the real
+ * `renderEntry` with `withId=true` — the ruler the recall tool actually renders
+ * by (ADR 0009: measure at the outermost ruler, never at the SQL exit):
+ *
+ *     row cost (tokens)   min 85   p25 110   p50 125   p75 135   p90 151   max 186
+ *
+ *     budget   rows that fit alone   seeds gaining foreign   foreign delivered
+ *        50          0/59  (0.0%)           0/1412                    0
+ *       100          6/59 (10.2%)         174/1412                  178
+ *       125         38/59 (64.4%)         634/1412                  740
+ *       150         53/59 (89.8%)         848/1412                 1079
+ *       175         56/59 (94.9%)         879/1412                 1134
+ *       200         59/59 (100%)          898/1412                 1186
+ *       300         59/59 (100%)          900/1412                 1378
+ *       500         59/59 (100%)          901/1412                 1540
+ *
+ * The curve has a knee, and it is sharp. Below 150 the budget is BELOW the
+ * median row: 50 admits literally nothing (the cheapest foreign row costs 85),
+ * and 100 reaches 10.2% of rows — a budget that mostly buys an empty result is
+ * worse than no feature, because it looks like the group is not configured.
+ * From 150 to 500 the delivered count rises 1079 → 1540 (+42.7%) while the
+ * seeds that gain anything at all rise 848 → 901 (+6.3%): past the knee the
+ * extra budget is spent making already-served queries longer, not serving new
+ * ones. 150 buys 94.1% of the coverage 500 buys, for 30% of the ceiling.
+ *
+ * The queries are 1412 seeds generated MECHANICALLY from stored titles (Latin
+ * words >= 4 chars, CJK bigrams, deduped) rather than chosen by hand, so the
+ * curve carries no selection bias toward terms known to work.
+ *
+ * ## Derivation 2 — the enforced floor, which is why this is not 150
+ *
+ * The measurement above sampled the rows that EXIST. It could not see the rows
+ * the write path is permitted to CREATE. A member store's L2 scenario blocks
+ * are written at `ROLLUP_TITLE_TARGET_CHARS` + `ROLLUP_TARGET_CHARS`, and
+ * priced the way recall renders them — with the id, with a `(from …)` label at
+ * its `SOURCE_LABEL_MAX_CHARS` ceiling, and with the body's own newlines
+ * indented — one such block costs 212 tokens:
+ *
+ *     worst L2 block, withId=false (injection's ruler)              183
+ *     worst L2 block, withId=true  (recall's ruler)                 194
+ *     worst L2 block, withId=true + worst source label (this one)   212
+ *
+ * ### The label raise: 200 -> 220
+ *
+ * Attribution is not free and the guard priced it immediately. Adding
+ * `(from <source>) ` to a foreign entry costs at most
+ * `SOURCE_LABEL_MAX_CHARS + 8` characters, so the enforced floor rose 194 ->
+ * 212 and the load-time guard REJECTED the shipped 200 the moment the renderer
+ * changed:
+ *
+ *     strataloom: RECALL_FOREIGN_BUDGET_TOKENS (200) cannot admit even one
+ *     worst-shaped foreign row (212 tokens rendered with its id)
+ *
+ * That is the guard doing exactly the job its own history describes — the
+ * feature would have been on, approved, and silently empty for a member holding
+ * only scenario blocks. `max(150, 212) = 212`, rounded up to 220. The rounding
+ * is not slack for its own sake: it leaves a round number that need not move
+ * for a one-token change in the label format, while the packet guard in
+ * `tools.ts` re-derives the container bound from it at every load.
+ *
+ * At 150 an approved group whose member holds only scenario blocks returns
+ * NOTHING — the feature would be on, approved, and silently empty, which is
+ * precisely the "green guard, zero product effect" failure ADR 0007 lesson 4
+ * records. `withinBudget` skips an oversized row whole, so this is not partial
+ * degradation; it is total.
+ *
+ * 150 measured 89.8% of today's rows fitting and read like the knee. Its p90
+ * (151) already sat above it — the tail was visible in the data and I still
+ * chose the knee, because "89.8% of rows fit" sounds like most of the value.
+ * It is not: the 10.2% that do not fit are the DERIVED rows, i.e. exactly the
+ * summaries a foreign repository contributes once it has enough content to
+ * summarise. The guard caught this; the replay did not, because no member store
+ * in the sample had scenario blocks matching the enforced target.
+ *
+ * So the value is `max(knee, worst enforced row)` rounded up: `max(150, 194)`
+ * → 200 originally, and `max(150, 212)` → 220 once entries carry their source.
+ * Cost of the first raise, measured on the same 1412 seeds: foreign entries
+ * delivered 1079 → 1186 (+9.9%), queries gaining anything 848 → 898 (+5.9%),
+ * mean rendered result 266.2 → 280.3 tokens (+5.3%). It buys correctness for a
+ * one-row case at about 5% more tokens — and the home side is unaffected either
+ * way (1401/1401 identical at every value tested).
+ *
+ * ## What this budget is NOT: a claim about the rows that exist
+ *
+ * Both derivations above are honest about their own scope, and the consequence
+ * is worth stating plainly because a later reader WILL be tempted to "tune"
+ * this number against the store on their disk. Measured over the real stores:
+ * the 17 active L2 blocks have bodies of 317-1820 characters and cost 96-483
+ * tokens at recall's ruler, so only 7 of 17 fit this budget and the rest are
+ * skipped whole. Those blocks predate `rebuild.ts`'s `.slice()` clamp, so they
+ * are larger than the write path can now produce — and raising this constant to
+ * admit them is NOT the conclusion. The value is bounded above by the packet
+ * container (`GROUP_MAX_MEMBERS` falls as this rises), and the rows that carry
+ * foreign coverage are L0/L1: those fit 59/59 and outnumber L2 in foreign
+ * delivery by roughly 1564 to 80. ADR 0011 §5 carries the full distribution and
+ * the discard rate.
+ */
+export const RECALL_FOREIGN_BUDGET_TOKENS = 220
+/**
+ * The most members one declaration may name.
+ *
+ * 6, and it is DERIVED rather than chosen: it is the largest value at which the
+ * worst rendered recall packet still fits `RECALL_PACKET_MAX_CHARS`. The guard
+ * that establishes this lives in `tools.ts`, beside the render call it prices,
+ * and it is a real inequality — raising this constant to 7 makes the plugin
+ * throw at load. Measured by building the packet through the production
+ * `renderFramed`, at the current `RECALL_FOREIGN_BUDGET_TOKENS` of 220:
+ *
+ *     members   worst packet chars   vs 8192
+ *           5                7004    fits
+ *           6                7939    fits (253 spare)
+ *           7                8874    THROWS
+ *           8                9809    THROWS
+ *
+ * The spare margin fell from 763 to 253 when entries began carrying a `(from
+ * …)` source label and the per-member budget rose 200 → 220 to keep admitting
+ * one worst-shaped row. 6 survived that raise; it matters that it was
+ * RE-DERIVED rather than merely left alone, because the next widening of an
+ * entry's rendered shape is what takes this to 5, and the guard — not a reader
+ * — is what will say so.
+ *
+ * It was 8 in the previous revision, under a guard that could not fail. That
+ * guard compared `500 + N x 200` against `500 x (N + 1)`, in which N cancels
+ * (`N·F > N·R  <=>  F > R`), so it certified N = 100000 — a 20,000,500-token
+ * worst case — without a murmur. 8 was never checked by anything; it only
+ * looked checked. The number moved because the invariant became real, which is
+ * the direction ADR 0007 requires (常量跟随不变量走).
+ *
+ * The real case that motivated the feature declares 3 members, so 6 is still
+ * 2x headroom. The point is not that 6 is special: it is that the value is now
+ * the answer to a question a machine asks at every load.
+ */
+export const GROUP_MAX_MEMBERS = 6
+/**
+ * The budget the recall tool renders the WHOLE packet with — home plus members.
+ *
+ * Derived, never typed: it is exactly the sum of the containers the service
+ * layer has already spent, so by construction this render can never clip a row
+ * the service admitted. That is the point. Previously `tools.ts` rendered every
+ * hit — home and foreign alike — against `RECALL_RESULT_BUDGET_TOKENS`, which
+ * made the per-member budget beneath it purely decorative: the outermost ruler
+ * was a SHARED container, so foreign delivery was a function of how much this
+ * repository happened to match. Measured over 1936 mechanically generated seeds
+ * against the four real stores, foreign rows reaching the model:
+ *
+ *     home tokens in the result   seeds gaining a foreign row (shared ruler)
+ *                             0                                        97%
+ *                         1-249                                        49%
+ *                       250-499                                        25%
+ *                       500-999                                        23%
+ *                        >=1000                                         6%
+ *
+ * An approved, human-gated feature that silently returns nothing precisely when
+ * this repository is well-stocked is ADR 0007 lesson 4 (green guard, zero
+ * product effect) welded to ADR 0009 (measure at the outermost ruler). Under
+ * the split containers the same replay delivers 65% -> 75% at the >=1000 end
+ * and 2263 foreign rows against 1844, with home delivery byte-identical to the
+ * group-off baseline on all 1936 seeds.
+ *
+ * Rejected alternative — carve a foreign floor OUT of the 500 (i.e. home 300 +
+ * foreign 200). It was implemented and measured, and it BREAKS the zero-
+ * regression gate: home delivery diverged from the group-off baseline on
+ * 521/1936 seeds, losing 612 home rows. Reserving for the guest by taxing the
+ * host is the eviction this design exists to forbid, so the data refused it.
+ */
+export const RECALL_PACKET_BUDGET_TOKENS =
+  RECALL_RESULT_BUDGET_TOKENS + GROUP_MAX_MEMBERS * RECALL_FOREIGN_BUDGET_TOKENS
 /**
  * Rows returned by the L0 drill-down mode of memory_recall (`sourceOf`).
  *
- * MEASURED NON-BINDING (ADR 0009). `sourceOf`'s rows are rendered through
- * `renderFramed(hits, RECALL_RESULT_BUDGET_TOKENS)`, and that budget truncates
- * first: an L0 row costs p50=41 but p90=516 tokens against a 500-token budget,
- * and 10.2% of rows exceed it on their own. Replayed across all 11 cited
- * sessions, raising this value moves delivery from a mean of 6.45 rows (at 20)
- * to 6.82 (at 34) to 7.64 (at 100), and 100 to 5000 changes nothing at all.
- * Coverage of the actually-cited lines does not move.
+ * MEASURED NON-BINDING (ADR 0009). `sourceOf`'s rows are rendered through the
+ * recall tool's renderer, and that budget truncates first: an L0 row costs
+ * p50=41 but p90=516 tokens, and 10.2% of rows exceed 500 on their own.
+ * Replayed across all 11 cited sessions, raising this value moves delivery from
+ * a mean of 6.45 rows (at 20) to 6.82 (at 34) to 7.64 (at 100), and 100 to 5000
+ * changes nothing at all. Coverage of the actually-cited lines does not move.
+ *
+ * That render budget is now `RECALL_PACKET_BUDGET_TOKENS` (1700) rather than
+ * `RECALL_RESULT_BUDGET_TOKENS` (500), and the effect on THIS path was measured
+ * rather than assumed: replayed over the 13 real L0 sessions on this machine,
+ * delivery rises from a mean of 11.92 rows to 14.92 (+25.2%), changing 12 of
+ * 13. That is a widening of the drill-down window, and it is ACCEPTABLE for the
+ * reason the derivation below already gives — `sourceOf` answers 核对原话, and
+ * the limit it was fighting was never the row count but the renderer's budget.
+ *
+ * It is also SAFE against the container: `sourceOf` carries no per-store budget
+ * of its own, but `renderFramed` spends the same token budget whatever the hits
+ * are, and the packet guard in `tools.ts` prices the maximum characters that
+ * budget can buy (4 chars per token, tight). Measured worst case at 1700 is
+ * 7429 characters against the 8192 container, and the largest real L0 packet
+ * measured 6998. The bound therefore covers both modes of the tool, not just
+ * the group case it was derived for.
  *
  * So the derivation kept below is not wrong — it measured row density at the
  * SQL exit accurately, and raising 20 to 34 really does fetch +93.5% more
@@ -793,7 +1046,7 @@ export const DERIVED_WORST_LINE_CHARS = 30
  * real `\n` that `renderEntry` will indent. Built rather than described, so
  * the guard prices the same string operation production performs.
  */
-const worstShapedBody = (chars: number): string => {
+export const worstShapedBody = (chars: number): string => {
   let body = ''
   for (let index = 0; index < chars; index++) {
     body += (index + 1) % DERIVED_WORST_LINE_CHARS === 0 ? '\n' : 'x'
@@ -847,7 +1100,6 @@ export const worstScenarioTokens = (): number =>
  */
 const worstDerivedPacketTokens = (): number =>
   worstPersonaTokens() + ROLLUP_MAX_SCENARIOS * worstScenarioTokens()
-
 const worstDerivedTokens = worstDerivedPacketTokens()
 if (worstDerivedTokens > INJECT_BODY_BUDGET_TOKENS) {
   throw new Error(
@@ -857,4 +1109,77 @@ if (worstDerivedTokens > INJECT_BODY_BUDGET_TOKENS) {
       `lower ROLLUP_TARGET_CHARS or PERSONA_TARGET_CHARS`,
   )
 }
+/**
+ * The FLOOR on the per-member budget: one worst-shaped L2 scenario row rendered
+ * WITH its id (recall renders `withId=true`, and the id is 36 characters the
+ * injection path never pays). A per-member budget below this would admit
+ * nothing at all from a member whose store holds only scenario blocks — a
+ * feature that is on, approved, and silently empty.
+ *
+ * It does not price a single-line synthetic body. `renderEntry` indents a
+ * body's own newlines (`\n` → `\n␣␣`, +2 chars each), so `'x'.repeat(n)` is
+ * blind to a whole dimension of the cost — the precise false-green ADR 0007
+ * records, where a guard reported OK at a newline density that overflowed.
+ * `worstShapedBody` is reused so this guard prices the same shape.
+ *
+ * The CEILING — the one that bounds `GROUP_MAX_MEMBERS` — is deliberately NOT
+ * here. It has to price a rendered packet, which means calling `renderFramed`,
+ * which lives in `recall/inject.ts` and imports this module. So it lives in
+ * `tools.ts`, next to the render call it is about to make. Putting it here
+ * would close the `constants → inject → constants` cycle that `render.ts`
+ * exists to keep open (see that module's header).
+ *
+ * Neither guard asserts against `INJECT_BODY_BUDGET_TOKENS`. Group content
+ * NEVER reaches the injection packet (that path is untouched by design — three
+ * merged libraries measure 4104 tokens against a 1300 budget, 3.16x, and
+ * ADR 0007's invariant already runs on 31 tokens of slack). Recall is a tool
+ * result: a different container, so a different ruler.
+ */
+const worstForeignRowTokens = estimateTokens(
+  renderEntry(
+    {
+      // A real UUID's width, not a placeholder: the id is rendered, so it costs.
+      id: '123e4567-e89b-12d3-a456-426614174000',
+      kind: 'fact',
+      title: 'x'.repeat(ROLLUP_TITLE_TARGET_CHARS),
+      body: worstShapedBody(ROLLUP_TARGET_CHARS),
+      // A foreign row is the ONLY row that renders a `(from …)` label, and the
+      // label is what makes the packet honest about whose memory it shows. It
+      // is priced at the renderer's own ceiling (`SOURCE_LABEL_MAX_CHARS` —
+      // which is why that cap exists at all, a declaration being hand-written
+      // and otherwise unbounded), never at the length of a real source string:
+      // pricing today's members would repeat the "existing data mistaken for
+      // possible data" error this constant's own history records above.
+      source: 'x'.repeat(SOURCE_LABEL_MAX_CHARS),
+    },
+    true,
+  ),
+)
+if (RECALL_FOREIGN_BUDGET_TOKENS < worstForeignRowTokens) {
+  throw new Error(
+    `strataloom: RECALL_FOREIGN_BUDGET_TOKENS (${RECALL_FOREIGN_BUDGET_TOKENS}) cannot admit ` +
+      `even one worst-shaped foreign row (${worstForeignRowTokens} tokens rendered with its id); ` +
+      'an approved group would return nothing from such a member',
+  )
+}
+/**
+ * The worst-case ENTRY the packet guard fills its container with.
+ *
+ * Not the worst-shaped row above: that row maximises TOKENS, and the container
+ * this must not overflow is denominated in CHARACTERS. Those pick opposite
+ * adversaries. `estimateTokens` is `ceil(len / 4)`, so an entry costing `c`
+ * tokens spans at most `4c` characters, and the bound is TIGHT — this exact
+ * 16-character entry costs 4 tokens, the cheapest any entry can cost. Filling a
+ * budget with these therefore produces the most characters a budget can ever
+ * buy, and a guard that passes on them passes on everything.
+ *
+ * Exported because the guard that spends it lives in `tools.ts` (see above),
+ * while the shape belongs beside the pricing rules it is built from.
+ */
+export const worstPacketFillEntry = (): { id: string; kind: string; title: string; body: string } => {
+  const shell = renderEntry({ id: '', kind: '', title: '', body: '' }, true).length
+  return { id: '', kind: '', title: 'x'.repeat(16 - shell), body: '' }
+}
+/** The worst rendered cost of one foreign row, exported so tests assert it rather than restate it. */
+export const worstForeignRowCost = (): number => worstForeignRowTokens
 

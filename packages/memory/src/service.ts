@@ -14,18 +14,29 @@ import { queryAllMemories, queryRecallRows, querySimilarRows } from './store/fts
 import { readSessionTurns } from './store/conversations.ts'
 import { looksSecret, projectStore, PROJECTION_DIR, PROJECTION_FILE } from './projection.ts'
 import { deriveWorkspaceRoot } from './store/repo-key.ts'
+import {
+  approvalReason,
+  GROUP_FILE,
+  readGroupDeclaration,
+  resolveGroupMembers,
+  type ResolvedMember,
+} from './store/group.ts'
 import type { TranscriptEvent } from './transcript.ts'
 import {
   BODY_MAX_CHARS,
   TITLE_MAX_CHARS,
   SIMILAR_LIMIT,
+  RECALL_FOREIGN_BUDGET_TOKENS,
+  RECALL_RESULT_BUDGET_TOKENS,
 } from './constants.ts'
+import { withinBudget } from './recall/render.ts'
 import type {
   ForgetReport,
   MemoryCandidate,
   MemoryId,
   MemoryHit,
   MemoryScopeListing,
+  AttributedMemoryHit,
   ProposeResult,
   ShareReport,
   RecallQuery,
@@ -68,6 +79,38 @@ export const commitL1Mutation = <T>(store: OpenStore, mutate: () => T): T => sto
 
 /** Public memory service (spec §3.1). */
 export class MemoryService extends Service {
+  /**
+   * Group state, created on first use rather than as class fields.
+   *
+   * Lazy because it must survive construction: the group paths are reached
+   * from `recall`/`list`/`forget`, which several suites drive against a
+   * service built by prototype-bypass (`Object.setPrototypeOf`, no constructor
+   * run) — a field initializer would simply not exist there, and a read path
+   * that throws `undefined.get` on an unusual construction is a worse failure
+   * than the one it was meant to prevent. One accessor, so both pieces of
+   * state are created together or not at all.
+   *
+   * `grants` holds approved `(session repo source, member-set fingerprint)`
+   * pairs. Process-local and NEVER written into the repository: a trust
+   * decision stored where an attacker can write is not a trust decision — a
+   * checked-in grant file would let anyone who can open a pull request
+   * pre-approve their own group. It is keyed on the ASKING repository as well
+   * as the members, so a grant in one checkout is not a grant in another.
+   *
+   * `cache` holds resolved members per session and is also the TOCTOU
+   * boundary: the declaration is read and approved once, and this holds the
+   * very result that approval was granted against (see `resolveGroup`).
+   */
+  private group?: {
+    readonly cache: Map<string, Promise<readonly ResolvedMember[]>>
+    readonly grants: Set<string>
+  }
+
+  private groupState(): NonNullable<MemoryService['group']> {
+    this.group ??= { cache: new Map(), grants: new Set() }
+    return this.group
+  }
+
   constructor(
     ctx: Context,
     private readonly stores: StoreRegistry,
@@ -105,11 +148,119 @@ export class MemoryService extends Service {
   /**
    * Both stores a given agent can read, nearest scope first. Repo memories
    * outrank personal ones on ties because the more specific context wins.
+   *
+   * DELIBERATELY UNCHANGED by the group feature, and deliberately still
+   * private. Four call sites share this one definition (`recall`, `list`,
+   * `source`, `forget`), and they do not all want the same answer: `forget`
+   * needs it to mean "stores this session may WRITE", which group members are
+   * not. Widening it here would have silently granted cross-repository writes
+   * from a read feature. Group membership is a separate, parallel accessor
+   * (`groupMembers`) that each caller opts into explicitly.
    */
   private readableStores(agent: Agent, openIfMissing: boolean): OpenStore[] {
     return [this.storeFor(agent, openIfMissing), this.globalStore(openIfMissing)].filter(
       (store) => store !== undefined,
     )
+  }
+
+  /**
+   * The group members this session may READ, in declaration order.
+   *
+   * Never includes the session's own store, never includes global, and never
+   * opens anything. Empty unless a valid declaration exists AND a human
+   * approved this exact (repository, member-set) pair in this session.
+   *
+   * Memoised per agent for the session's lifetime, which is also the TOCTOU
+   * defence: the file is read ONCE, fingerprinted, approved against that
+   * fingerprint, and the resolved members are what every later call uses. A
+   * later edit to the declaration cannot take effect without a restart — which
+   * is the point, not a limitation. Re-reading per call would reopen exactly
+   * the window between "the human approved X" and "we act on Y" (the same rule
+   * §2.1 states for migration: validate inside the lock).
+   */
+  private async groupMembers(agent: Agent): Promise<readonly ResolvedMember[]> {
+    const { cache } = this.groupState()
+    const cached = cache.get(agent.session.id)
+    if (cached !== undefined) return cached
+    const pending = this.resolveGroup(agent)
+    cache.set(agent.session.id, pending)
+    return pending
+  }
+
+  /** Foreign stores only — the shape the read paths consume. */
+  private async groupStores(agent: Agent): Promise<readonly OpenStore[]> {
+    return (await this.groupMembers(agent)).map((member) => member.store)
+  }
+
+  /**
+   * Read → fingerprint → approve → resolve, once per session.
+   *
+   * Fail CLOSED on a missing approval service: unlike `llm` (whose absence
+   * merely disables automatic extraction), approval is the only thing standing
+   * between a declaration file and reading another repository's memories. A
+   * degraded "no approver, so allow it" mode would make the file itself
+   * sufficient authority, which is what the gate exists to prevent.
+   *
+   * Every other failure is fail-open-but-loud: no cwd, no declaration, a bad
+   * declaration, or a rejected approval all leave this session behaving
+   * exactly as it does without the feature.
+   */
+  private async resolveGroup(agent: Agent): Promise<readonly ResolvedMember[]> {
+    try {
+      const cwd = agent.session.header.cwd
+      if (cwd === undefined) return []
+      const identity = deriveRepoIdentity(cwd)
+      if (identity === undefined) return []
+      const workspace = deriveWorkspaceRoot(cwd)
+      if (workspace === undefined) return []
+      // ONE read. `decl` is carried through approval and resolution unchanged;
+      // nothing below touches the file again.
+      const decl = readGroupDeclaration(workspace, this.ctx.logger)
+      if (decl === undefined) return []
+      const members = resolveGroupMembers(
+        decl,
+        this.stores,
+        identity.key,
+        workspace,
+        this.ctx.logger,
+      )
+      if (members.length === 0) return []
+
+      const approval = this.ctx.get('approval')
+      if (approval === undefined) {
+        this.ctx.logger.warn(
+          `strataloom: ${GROUP_FILE} declares a group but the approval service is absent; ` +
+            'the group is disabled (reading other repositories always requires a human)',
+        )
+        return []
+      }
+      // Authorization is keyed on (this repository, this member set): the same
+      // members approved in repository A grant nothing in repository B,
+      // because "who may read these" is a property of the ASKING side too.
+      const grantKey = `${identity.source}\u0000${decl.fingerprint}`
+      const { grants } = this.groupState()
+      if (!grants.has(grantKey)) {
+        const outcome = await approval.request({
+          agent,
+          toolName: 'memory_group',
+          reason: approvalReason(decl, members),
+        })
+        if (outcome !== 'allowed-once') {
+          this.ctx.logger.info(
+            `strataloom: group "${decl.group}" was not approved (${outcome}); ` +
+              'only this repository\'s memories are readable',
+          )
+          return []
+        }
+        grants.add(grantKey)
+      }
+      return members
+    } catch (error) {
+      // A group fault must never break recall: the session degrades to exactly
+      // today's behaviour rather than failing.
+      this.ctx.logger.warn('strataloom: group resolution failed (using this repo only):', error)
+      return []
+    }
   }
 
   /** Both predicates must hold for any write (spec §3.1). */
@@ -143,10 +294,22 @@ export class MemoryService extends Service {
     const personal = this.globalStore(false)
     const listings: MemoryScopeListing[] = []
     if (repo !== undefined) {
-      listings.push({ scope: 'repo', memories: queryAllMemories(repo, limit) })
+      listings.push({ scope: { kind: 'repo' }, memories: queryAllMemories(repo, limit) })
     }
     if (personal !== undefined) {
-      listings.push({ scope: 'personal', memories: queryAllMemories(personal, limit) })
+      listings.push({ scope: { kind: 'personal' }, memories: queryAllMemories(personal, limit) })
+    }
+    // One listing PER member, never merged into the repo listing. `limit` is a
+    // per-scope cap (see LIST_LIMIT) and stays one: it exists so a single huge
+    // store cannot flood a caller, and that reason applies per store. Merging
+    // would answer "completeness" while destroying "whose is this?" — and the
+    // only action this surface offers (`forget`) is refused for foreign rows,
+    // so a person must be able to see which entries those are.
+    for (const member of await this.groupMembers(agent)) {
+      listings.push({
+        scope: { kind: 'group', source: member.source, archived: member.archived },
+        memories: queryAllMemories(member.store, limit),
+      })
     }
     return listings
   }
@@ -169,20 +332,140 @@ export class MemoryService extends Service {
     // Recall spans both scopes: the user's durable preferences are as
     // relevant as this repo's facts, and the caller should not have to know
     // which store holds which.
-    const hits: MemoryHit[] = []
+    // Home rows are collected first and then spent against their OWN budget.
+    //
+    // That budget used to be applied by the tool's renderer instead, which was
+    // adequate only while home was the packet's sole occupant. It no longer is,
+    // and leaving it there would make the load-time packet guard assert
+    // something false: the guard prices home at RECALL_RESULT_BUDGET_TOKENS,
+    // so home has to actually be bounded by it before the renderer sees it.
+    // Measured without this clip, 20 home rows filled the whole packet and
+    // foreign delivery returned to zero — the very defect being fixed, moved
+    // one layer out rather than removed.
+    //
+    // The set is byte-identical to what the renderer used to select: the same
+    // `withinBudget`, the same budget, the same `withId`, the same order. This
+    // relocates where the rule runs, never what it decides.
+    const homeFound: MemoryHit[] = []
     for (const store of this.readableStores(agent, true)) {
       const found = queryRecallRows(store, text, query.kind)
+      // Usage is counted on what the STORE returned, exactly as before: this
+      // clip changes rendering, and quietly narrowing the decay signal with it
+      // would be an unrelated behaviour change smuggled in under a budget fix.
       this.touchUsage(store, found)
-      hits.push(...found)
+      homeFound.push(...found)
+    }
+    // No `source` on home rows: absence IS the statement "this repository's
+    // own", and it is what keeps the no-group packet byte-identical (see
+    // `AttributedMemoryHit`). Setting a home source and relying on the
+    // renderer to special-case it would put the same rule in two places.
+    const hits: AttributedMemoryHit[] = withinBudget(homeFound, RECALL_RESULT_BUDGET_TOKENS, true)
+    // Group members come AFTER, each with its OWN budget, and are never merged
+    // into the home ranking. Two measured facts force this shape:
+    //
+    // 1. A shared container lets foreign rows evict home rows — measured at
+    //    33.1%-40.9% of queries before the split, which is ADR 0007's failure
+    //    with new labels. Appending under separate budgets makes the home
+    //    result a function of the home stores alone: replayed over 1412
+    //    mechanically generated seeds, the home entries delivered are
+    //    byte-identical with the group on and off (1401/1401).
+    //
+    // 2. FTS5 `rank` is NOT COMPARABLE ACROSS STORES. It is negative BM25, and
+    //    BM25's IDF term is computed from each store's own N and df — so the
+    //    more central a word is to a repository, the WORSE its rank there.
+    //    Measured: 85.2% of queries (265/311) rank-invert against relevance.
+    //    The concrete case: for 部署 the best `rank` belongs to the frontend
+    //    repo with 1 incidental hit, while the operations repo that actually
+    //    owns deployment (14 hits, df/N 42.4%) sorts LAST. Any global ORDER BY
+    //    rank over merged rows therefore encodes the opposite of relevance,
+    //    which is why ordering here is positional (home first, then members in
+    //    declaration order) and never score-based.
+    for (const member of await this.groupMembers(agent)) {
+      // ATTRIBUTION is attached HERE, before the budget is spent, at the only
+      // point in the system that still knows which store a row came from. One
+      // line further on these rows are indistinguishable from home rows —
+      // which is precisely the state the packet used to reach the model in,
+      // under a header reading "in this repository".
+      //
+      // BEFORE the clip, not after, and that ordering is a correctness
+      // requirement rather than a style choice: `withinBudget` prices through
+      // the real `renderEntry`, so a label added afterwards would make every
+      // admitted row larger than the budget was told it is — the D8 failure of
+      // pricing a different string than the renderer emits, which this
+      // codebase has already paid for twice. Labelled first, priced as
+      // rendered.
+      const found = queryRecallRows(member.store, text, query.kind).map((hit) => ({
+        ...hit,
+        source: member.source,
+      }))
+      // Priced with `withId` because that is how the recall tool renders, and
+      // a budget that prices a different string than the renderer emits is the
+      // D8 failure this codebase has already paid for twice.
+      const admitted = withinBudget(found, RECALL_FOREIGN_BUDGET_TOKENS, true)
+      // NO `touchUsage` HERE, and that absence is load-bearing. Read the
+      // paragraph before deleting the comment or "restoring symmetry" with the
+      // home loop twenty lines up.
+      //
+      // The previous revision DID touch it, defended by "usage is
+      // non-authoritative (D4 permits a read-path write), and decay must see
+      // these rows being used or the group would decay the memories it exists
+      // to surface". Both halves were wrong, and measurement showed it.
+      //
+      // 1. IT IS NOT NON-AUTHORITATIVE ONCE IT CROSSES A REPOSITORY BOUNDARY.
+      //    `usage` is an input to `pipeline/decay.ts`, whose module comment
+      //    states the invariant this violated: "revival happens HERE, never on
+      //    the read path, because a read must not cause an authoritative
+      //    change (D4)". Decay reads `usage.last_hit_at` and writes
+      //    `memories.status`, which IS authoritative. Inside one repository
+      //    that chain is contained — the session that reads is the session
+      //    that owns the store. Across repositories it is not: measured on
+      //    copies of the real stores, a Backend store staged to 61 stale
+      //    active rows slept ALL 61 when it decayed on its own, and only 57
+      //    when a FullStack session ran 7 pure `recall` calls first — 4 rows
+      //    kept `active` in ANOTHER repository by a read in this one, and all
+      //    4 were rows this session had retrieved. A pure read here rewrote
+      //    authoritative state there.
+      //
+      // 2. THE DECAY WORRY DOES NOT SURVIVE EITHER BRANCH. If the member
+      //    repository has its own sessions, its own reads touch its own usage
+      //    and decay already sees them — this loop adds nothing. If it has no
+      //    sessions (the orphaned `…_Ops` store, no checkout on this machine),
+      //    then decaying on its own schedule is the CORRECT behaviour, and
+      //    propping it up with another repository's activity would keep an
+      //    abandoned store artificially awake for as long as anyone, anywhere,
+      //    keeps reading it. Measured: those writes reached that orphan too.
+      //
+      // 3. IT MADE THE APPROVAL PROMPT UNTRUE. `approvalReason` tells the
+      //    human "Nothing is ever written to them", and that sentence is the
+      //    load-bearing safety mechanism for a member whose `archived` claim
+      //    code cannot verify (see store/group.ts). It was false: recall moved
+      //    real bytes in the member's `memory.sqlite` (md5 and mtime both
+      //    changed, measured). A person consented on the strength of that
+      //    sentence, so the sentence is the specification and the code was the
+      //    defect.
+      //
+      // The group is a READ scope. This line is where that stops being a claim
+      // and becomes a property of the code.
+      hits.push(...admitted)
     }
     return { hits }
   }
 
   /**
-   * Non-authoritative usage counters. This is the one write on a read path
-   * (D4 permits it because `usage` is not authoritative state), so it takes a
-   * WAL write lock: the spec puts it under slow-statement warning coverage
-   * (§13). Any failure is swallowed — a counter must never fail a read.
+   * Usage counters for a store THIS SESSION OWNS. This is the one write on a
+   * read path, so it takes a WAL write lock: the spec puts it under
+   * slow-statement warning coverage (§13). Any failure is swallowed — a
+   * counter must never fail a read.
+   *
+   * CALLABLE ONLY WITH `readableStores()` MEMBERS — this session's own repo
+   * store and the global store. Never with a group member's store. The
+   * qualifier is not stylistic: `usage` is only "non-authoritative" as long as
+   * the thing that consumes it belongs to the same repository. `decay` turns
+   * `usage.last_hit_at` into `memories.status`, so calling this on a foreign
+   * store makes a read in THIS repository an authoritative write in ANOTHER
+   * one, which is exactly what D4 forbids and what the approval prompt
+   * promises does not happen. The measurement and the full argument are at the
+   * member loop in `recall`, which is where the call used to be.
    */
   private touchUsage(store: OpenStore, rows: readonly MemoryHit[]): void {
     if (rows.length === 0) return
@@ -216,7 +499,11 @@ export class MemoryService extends Service {
     if (!isLiveAgent(this.ctx, agent)) {
       throw new MemoryAccessError('agent is not live in this registry')
     }
-    const stores = this.readableStores(agent, true)
+    // `source` follows `recall` exactly, because it IS a mode of recall (see
+    // the note above): a memory this session can retrieve but whose evidence it
+    // cannot open is a claim without provenance, which D3 forbids. Widening
+    // recall without widening this would have shipped exactly that.
+    const stores = [...this.readableStores(agent, true), ...(await this.groupStores(agent))]
     for (const store of stores) {
       const cited = store.db
         .prepare(
@@ -398,11 +685,46 @@ export class MemoryService extends Service {
     this.assertPrincipal(agent)
     // Ids are unique across stores, so the caller forgets by id without
     // knowing (or being able to misstate) which scope holds it.
+    //
+    // PINNED to `readableStores` — group members are deliberately NOT searched
+    // here, and this comment is the only thing preventing a future "let's use
+    // the same store list everywhere" tidy-up from turning a read feature into
+    // a cross-repository WRITE capability.
+    //
+    // Two reasons, either sufficient:
+    //   - D1 says a write always lands in the session's own repository. A
+    //     cross-group forget is literally a write to another repository's
+    //     store, in direct contradiction of that.
+    //   - `recall` returns ids (`withId=true`, because forget needs them), so
+    //     if this list included members, the read widening would convert
+    //     directly into the power to destroy rows in repositories this session
+    //     was only ever granted READ access to. The approval prompt says
+    //     "nothing is ever written to them"; this line is what makes that true.
     const store = this.readableStores(agent, true).find(
       (candidate) =>
         candidate.db.prepare(`SELECT 1 FROM memories WHERE id = ?`).get(id) !== undefined,
     )
-    if (store === undefined) throw new MemoryInputError(`no memory with id ${id}`)
+    if (store === undefined) {
+      // Before the generic "no such id", check whether it is a group member's
+      // row: a caller who just recalled it needs to know it EXISTS and why it
+      // cannot be forgotten here, not to be told it does not exist.
+      const foreign = (await this.groupMembers(agent)).find(
+        (member) =>
+          member.store.db.prepare(`SELECT 1 FROM memories WHERE id = ?`).get(id) !== undefined,
+      )
+      if (foreign !== undefined) {
+        throw new MemoryInputError(
+          `${id} belongs to group member repository ${foreign.source}, not to this session's ` +
+            'repository. forget only acts on the repository this session is in. ' +
+            (foreign.archived
+              ? 'That repository is declared archived and has no checkout here, so there is ' +
+                'currently no session from which it can be forgotten — this entry cannot be ' +
+                'removed until a checkout of it exists again.'
+              : `Start a session inside the ${foreign.source} checkout and retry there.`),
+        )
+      }
+      throw new MemoryInputError(`no memory with id ${id}`)
+    }
     const suppressedRefs = commitL1Mutation(store, () => {
       const row = store.db
         .prepare(`SELECT status, derived FROM memories WHERE id = ?`)

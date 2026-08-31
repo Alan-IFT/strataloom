@@ -17,7 +17,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-commands'
 import { MemoryAccessError, MemoryInputError, type MemoryService } from './service.ts'
-import type { MemoryId } from './types.ts'
+import type { MemoryId, MemoryListingScope } from './types.ts'
 import { LIST_LIMIT } from './constants.ts'
 
 /**
@@ -70,6 +70,17 @@ const SCOPE_LABEL = {
 } as const
 
 /**
+ * A group member is labelled with its source and, when archived, said so out
+ * loud: those entries cannot be forgotten from here (no checkout exists), and
+ * the footer offers `forget` unconditionally. A heading that hid the
+ * distinction would send the reader to a refusal.
+ */
+const scopeLabel = (scope: MemoryListingScope): string =>
+  scope.kind === 'group'
+    ? `${scope.source}${scope.archived ? ' (archived — read-only, no checkout here)' : ' (group member — read-only here)'}`
+    : SCOPE_LABEL[scope.kind]
+
+/**
  * Render the listing. Ids are shown because the only action offered needs one,
  * and bodies are truncated because this is an index, not a reader — the whole
  * text stays reachable through `memory_recall`.
@@ -86,7 +97,7 @@ const renderList = async (
   const lines: string[] = []
   for (const { scope, memories } of listings) {
     if (memories.length === 0) continue
-    lines.push(`${SCOPE_LABEL[scope]} — ${memories.length}`)
+    lines.push(`${scopeLabel(scope)} — ${memories.length}`)
     for (const memory of memories) {
       const body = memory.body.replace(/\s+/g, ' ')
       const shown = body.length > 100 ? `${body.slice(0, 100)}…` : body

@@ -44,7 +44,52 @@ export interface RenderableHit {
   readonly kind: string
   readonly title: string
   readonly body: string
+  /**
+   * Which OTHER repository this entry came from, when it did not come from the
+   * session's own — the `deriveRepoIdentity` source string a group declaration
+   * names its members by.
+   *
+   * ABSENT means "this session's own repository or the user's personal store",
+   * and absence is what keeps every pre-group render byte-identical: nothing on
+   * the injection path, the `propose` near-duplicate list, or the `sourceOf`
+   * transcript mode ever sets it, so those outputs cannot move.
+   *
+   * It exists because the recall tool was delivering foreign content under a
+   * header that says "in this repository". Measured over 2792 queries against
+   * the real stores, 1508 (54.0%) returned results that were 100% foreign —
+   * deployment facts owned by an archived operations repo, build rules owned by
+   * the frontend repo — with nothing in the packet to say so. `/memory list`
+   * already solved this (see `MemoryListingScope`, whose own comment says
+   * "complete but unattributable is not complete"); this is the same rule
+   * reaching the same conclusion on the other read exit.
+   */
+  readonly source?: string
 }
+
+/**
+ * How many characters of a source string an entry may spend on its label.
+ *
+ * A cap is REQUIRED, not tidiness: the source comes from
+ * `.strataloom-group.json`, which is hand-written committed content of
+ * unbounded length, and it is rendered into a packet that a load-time guard
+ * has to price. Without a ceiling here, `worstForeignRowTokens` in
+ * `constants.ts` could not be computed at all and the per-member budget would
+ * bound nothing.
+ *
+ * 64, against real sources measured at 37-45 characters
+ * (`remote:github.com/Alan-IFT/NFBY_CMS_FullStack` is the longest at 45), so
+ * every real member is shown in full and the cap only ever engages on a
+ * pathological declaration. Truncation is marked with an ellipsis rather than
+ * silent, because a half-shown repository name that looks complete is worse
+ * than one that visibly is not.
+ */
+export const SOURCE_LABEL_MAX_CHARS = 64
+
+/** The source as it appears in an entry, truncated visibly rather than silently. */
+const sourceLabel = (source: string): string =>
+  source.length > SOURCE_LABEL_MAX_CHARS
+    ? `${source.slice(0, SOURCE_LABEL_MAX_CHARS - 1)}…`
+    : source
 
 /**
  * One memory → one list item. THE definition, and the only place a memory's
@@ -64,14 +109,25 @@ export interface RenderableHit {
  * 2. Pricing calls this too, so what the budget measures is byte-for-byte what
  *    the model receives. Estimating a different string than we render is how a
  *    budget silently stops meaning anything.
+ * 3. The provenance label is emitted HERE, per entry, and not as a section
+ *    heading above a group of entries. A heading is positional: the platform's
+ *    tool-result pruner deletes the MIDDLE of an over-long packet (head 4096 +
+ *    tail 1024), so a heading can be cut away while the entries it labelled
+ *    survive — attribution that disappears exactly when the packet is large is
+ *    attribution that fails when it matters. Per entry, an entry either arrives
+ *    with its origin or does not arrive.
+ *
+ *    A hit with no `source` renders EXACTLY as before, character for character.
+ *    That is the compatibility gate: injection, the near-duplicate list and the
+ *    `sourceOf` transcript never set it, so their output cannot move, and the
+ *    load-time injection guards keep pricing the same strings.
  * @param hit - the memory to render.
  * @param withId - include the id (callers that offer a follow-up action need it).
  */
 export const renderEntry = (hit: RenderableHit, withId: boolean): string =>
-  `- [${hit.kind}] ${withId ? `(id ${hit.id}) ` : ''}${hit.title}: ${hit.body}`.replaceAll(
-    '\n',
-    '\n  ',
-  )
+  `- [${hit.kind}] ${withId ? `(id ${hit.id}) ` : ''}${
+    hit.source === undefined ? '' : `(from ${sourceLabel(hit.source)}) `
+  }${hit.title}: ${hit.body}`.replaceAll('\n', '\n  ')
 
 /**
  * What a set of memories costs when rendered. Priced through `renderEntry`,

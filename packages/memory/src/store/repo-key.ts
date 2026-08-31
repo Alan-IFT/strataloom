@@ -63,8 +63,46 @@ export const normalizeRemoteUrl = (raw: string): string => {
   return rest.slice(0, slash).toLowerCase() + rest.slice(slash)
 }
 
+/**
+ * Canonicalize a HAND-WRITTEN source string the same way derivation canonicalizes
+ * a discovered one.
+ *
+ * `deriveRepoIdentity` always hashes `remote:` + `normalizeRemoteUrl(url)`, so a
+ * declaration that writes the remote in any other accepted spelling — a `.git`
+ * suffix, an upper-case host, a trailing slash, scp form — hashes to a DIFFERENT
+ * key and silently matches no store. Six spellings of one repository produced
+ * six keys before this existed.
+ *
+ * It is here rather than in `group.ts` for the reason `repoKeyFor` is: the rule
+ * that turns a remote into a comparable string must have exactly one
+ * implementation, or the declaration side and the derivation side agree only
+ * until someone touches one of them.
+ *
+ * A `path:` source is left alone deliberately — it is already a realpath, and
+ * remote normalization (which lower-cases a host and strips a `.git` suffix)
+ * would corrupt a legitimate directory name.
+ */
+export const normalizeSource = (raw: string): string => {
+  const trimmed = raw.trim()
+  const prefix = 'remote:'
+  if (!trimmed.startsWith(prefix)) return trimmed
+  return `${prefix}${normalizeRemoteUrl(trimmed.slice(prefix.length))}`
+}
+
 const hashKey = (source: string): string =>
   createHash('sha256').update(source).digest('hex').slice(0, 24)
+
+/**
+ * The store key for an already-known source string — the same hash the
+ * derivation above applies, exposed for the one caller that has a source
+ * WITHOUT a checkout to derive it from: a group declaration names its members
+ * by source, and an archived member has no working tree left to run git in.
+ *
+ * Exported rather than re-implemented there, because a second sha256-slice-24
+ * expression is the classic "same number typed twice": the day the key changes
+ * shape, group lookups would silently miss every store instead of failing.
+ */
+export const repoKeyFor = (source: string): string => hashKey(normalizeSource(source))
 
 /**
  * Derive the repo identity for a session cwd, or `undefined` when the cwd is

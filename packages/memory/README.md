@@ -70,6 +70,45 @@ session with no validated `cwd` inside a git work tree has no repo
 affiliation: writes are refused and injection is empty — never a fallback to
 `process.cwd()`.
 
+### Repo groups: reading a sibling repository's memories
+
+Because the key is the git remote, sibling repositories checked out inside one
+workspace have separate stores. A `.strataloom-group.json` at the workspace
+root declares which of them this session may **read**:
+
+```json
+{ "version": 1, "group": "nfby-cms",
+  "members": ["remote:github.com/Alan-IFT/NFBY_CMS_Backend",
+              { "source": "remote:github.com/Alan-IFT/NFBY_CMS_Ops", "archived": true }] }
+```
+
+The shorthand string means "a checkout inside this workspace";
+`archived: true` means "no checkout here", which is the only way to reach the
+orphaned store of a renamed or deleted repository — and is an assertion code
+cannot verify, which is why every one is listed individually in the approval
+prompt.
+
+Properties worth stating, because each is enforced rather than intended:
+
+- **Read only.** No member store is ever written — including its `usage`
+  counters, which feed `decay` and therefore `memories.status`. A read here
+  must not change authoritative state there (D4), and `forget` refuses a
+  member's row rather than reaching across.
+- **Declaration is the whole authority.** The workspace walk validates
+  declared members; it never supplies them.
+- **Approval per (workspace repo, member set), in memory only.** Fail closed
+  if the approval service is absent; re-approved after every restart; the file
+  is read once and the approved bytes are what the session uses (TOCTOU).
+- **Attributed at both read exits.** Recall marks foreign entries
+  `(from <source>)` and switches the packet header; `/memory` lists each
+  member separately.
+- **Bounded.** ≤ 6 members, one token budget per member, and a load-time guard
+  prices the worst rendered packet against the platform's 8192-character
+  tool-result container.
+- **Home recall is untouched**, entry for entry, group on or off.
+
+Design record: [ADR 0011](../../docs/decisions/0011-repo-groups-are-declared-read-scope.md).
+
 ## Invariants this code enforces
 
 - **D1** identity and permission derive from platform facts only. Writes

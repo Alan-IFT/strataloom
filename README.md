@@ -26,6 +26,50 @@ commit it to `.repo_memory/` for the team.
 pipeline distils durable facts from it — never trusting the model to declare
 where a memory came from.
 
+## Reading another repository's memories (repo groups)
+
+A memory store is keyed on the git remote, so sibling repositories checked out
+side by side inside one workspace cannot see each other's memories — even when
+one session routinely edits all of them. If that is your layout, a **repo
+group** lets a session READ the others.
+
+Write `.strataloom-group.json` at the root of the workspace repository:
+
+```json
+{ "version": 1, "group": "nfby-cms",
+  "members": ["remote:github.com/Alan-IFT/NFBY_CMS_Backend",
+              { "source": "remote:github.com/Alan-IFT/NFBY_CMS_Ops", "archived": true }] }
+```
+
+A member is the store's source string — the git remote, normalised, prefixed
+`remote:` (`/memory` prints it for every scope, which is the easiest way to
+get it right). The string shorthand means "checked out inside this workspace";
+`archived: true` means "this repository no longer has a checkout here", which
+is the only way to reach the orphaned store of a repository that was renamed
+or removed.
+
+What this is and is not:
+
+- **Read only.** Nothing is ever written to a member store — not a memory, not
+  a usage counter, not a byte of its file. `memory_forget` refuses a member's
+  entry and tells you which repository to run it in.
+- **Declared, never discovered.** A repository that is not named in `members`
+  does not participate, however plainly it sits in the tree. The workspace is
+  scanned only to CHECK a declaration, never to extend one.
+- **Human-approved, every session.** The first read raises an approval prompt
+  listing each member by name, flagging every `archived` one as an assertion
+  nothing can verify. Approval lives in memory only: restart the harness and
+  you are asked again. Editing the file mid-session has no effect until
+  restart — that is deliberate, not a limitation.
+- **Attributed.** A recall result marks each foreign entry `(from <source>)`,
+  and `/memory` lists every member under its own heading, because a fact from
+  another repository may simply not be true in this one.
+- At most six members, and this repository's own recall is unaffected by the
+  group — entry for entry, group on or off.
+
+The reasoning, the measurements, and the alternatives that were rejected are in
+[ADR 0011](docs/decisions/0011-repo-groups-are-declared-read-scope.md).
+
 ## Install
 
 One command, no clone and no build:

@@ -174,14 +174,55 @@ export interface MemoryHit {
   readonly body: string
 }
 
-/** One scope's memories, as `list()` returns them for review. */
+/**
+ * A hit plus the OTHER repository it came from — what `recall` returns once a
+ * group is approved.
+ *
+ * `source` is optional and set ONLY for group members, so a hit from this
+ * repository or from the personal store is `MemoryHit` unchanged. That is not
+ * a convenience: the renderer emits the label only when the field is present,
+ * so a store query that cannot produce foreign rows produces byte-identical
+ * output, and every read exit that predates groups is unaffected by
+ * construction rather than by a flag someone must remember to pass.
+ *
+ * It carries the member's `deriveRepoIdentity` source string — the same
+ * identifier `MemoryListingScope` carries for `/memory` and the same one the
+ * declaration names its members by. One name for one repository across both
+ * read surfaces: a person who sees `(from remote:…/NFBY_CMS_Backend)` in a
+ * recall result can find that exact string in `.strataloom-group.json`.
+ */
+export interface AttributedMemoryHit extends MemoryHit {
+  /** Absent for this repository's own rows and for personal rows. */
+  readonly source?: string
+}
+
+/**
+ * One scope's memories, as `list()` returns them for review.
+ *
+ * `scope` is widened beyond the two-valued {@link MemoryScope} because a group
+ * session lists SEVERAL repositories, and collapsing them under one `repo`
+ * heading would trade the completeness this surface exists for against the
+ * ability to tell whose memory is whose. `queryAllMemories` documents list's
+ * semantics as completeness; "complete but unattributable" is not that.
+ *
+ * A `group` listing therefore carries the member's source string, which is the
+ * name the declaration used and the only identifier a person can act on.
+ */
+export type MemoryListingScope =
+  | { readonly kind: 'repo' }
+  | { readonly kind: 'personal' }
+  | { readonly kind: 'group'; readonly source: string; readonly archived: boolean }
+
 export interface MemoryScopeListing {
-  readonly scope: MemoryScope
+  readonly scope: MemoryListingScope
   readonly memories: readonly MemoryHit[]
 }
 
-/** Public alias: what `recall()` hands back per hit. */
-export type RecallHit = MemoryHit
+/**
+ * Public alias: what `recall()` hands back per hit — attributed, because
+ * recall is the one read exit that can return another repository's rows.
+ */
+export type RecallHit = AttributedMemoryHit
 
 /** Recall result — rendered by the tool within the §4.3 budget. */
 export interface RecallResult {
