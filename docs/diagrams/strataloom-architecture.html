@@ -5039,7 +5039,7 @@
         <!-- Connection paths (before components for correct z-order) -->
         <path data-edge-from="agent" data-edge-to="capture" data-edge-label="turn 结束" data-edge-key="0" data-edge-id="agent-capture" data-composition-points="186,426;222.5,426;222.5,147;259,147" d="M 186 426 L 214.5 426 Q 222.5 426 222.5 418 L 222.5 155 Q 222.5 147 230.5 147 L 259 147" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
         <path data-edge-from="agent" data-edge-to="tools" data-edge-key="1" data-edge-id="agent-tools" data-composition-points="186,440;259,440" d="M 186 440 L 259 440" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="inject" data-edge-to="agent" data-edge-label="每轮注入 ≤1400 tok" data-edge-key="2" data-edge-id="inject-agent" data-composition-points="259,727;222.5,727;222.5,454;186,454" d="M 259 727 L 230.5 727 Q 222.5 727 222.5 719 L 222.5 462 Q 222.5 454 214.5 454 L 186 454" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="inject" data-edge-to="agent" data-edge-label="注入 ≤1400 tok" data-edge-key="2" data-edge-id="inject-agent" data-composition-points="259,727;222.5,727;222.5,454;186,454" d="M 259 727 L 230.5 727 Q 222.5 727 222.5 719 L 222.5 462 Q 222.5 454 214.5 454 L 186 454" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="capture" data-edge-to="l0" data-edge-label="写入调用与结果" data-edge-key="3" data-edge-id="capture-l0" data-composition-points="421,147;580.5,147;580.5,130;740,130" d="M 421 147 L 572.5 147 Q 580.5 147 580.5 139 L 580.5 138 Q 580.5 130 588.5 130 L 740 130" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="tools" data-edge-to="service" data-edge-key="4" data-edge-id="tools-service" data-composition-points="421,430;442.5,430;442.5,247;464,247" d="M 421 430 L 434.5 430 Q 442.5 430 442.5 422 L 442.5 255 Q 442.5 247 450.5 247 L 464 247" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="inject" data-edge-to="render" data-edge-label="1300 tok 预算" data-edge-key="5" data-edge-id="inject-render" data-composition-points="421,727;442.5,727;442.5,624;464,624" d="M 421 727 L 434.5 727 Q 442.5 727 442.5 719 L 442.5 632 Q 442.5 624 450.5 624 L 464 624" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
@@ -5049,7 +5049,7 @@
         <path data-edge-from="runner" data-edge-to="extract" data-edge-key="9" data-edge-id="runner-extract" data-composition-points="1107,174;1107,280" d="M 1107 174 L 1107 280" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="extract" data-edge-to="reconcile" data-edge-key="10" data-edge-id="extract-reconcile" data-composition-points="1107,346;1107,400" d="M 1107 346 L 1107 400" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="reconcile" data-edge-to="l1" data-edge-label="落库" data-edge-key="11" data-edge-id="reconcile-l1" data-composition-points="1026,433;967,433;967,347;908,347" d="M 1026 433 L 975 433 Q 967 433 967 425 L 967 355 Q 967 347 959 347 L 908 347" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="rebuild" data-edge-to="l2" data-edge-label="重建 L2/L3" data-edge-key="12" data-edge-id="rebuild-l2" data-composition-points="1026,613;967,613;967,597;908,597" d="M 1026 613 L 975 613 Q 967 613 967 605 L 967 605 Q 967 597 959 597 L 908 597" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="rebuild" data-edge-to="l2" data-edge-label="溢出时重建" data-edge-key="12" data-edge-id="rebuild-l2" data-composition-points="1026,613;967,613;967,597;908,597" d="M 1026 613 L 975 613 Q 967 613 967 605 L 967 605 Q 967 597 959 597 L 908 597" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="extract" data-edge-to="llm" data-edge-key="13" data-edge-id="extract-llm" data-composition-points="1188,313;1196,313;1196,213;1204,213" d="M 1188 313 L 1192 313 Q 1196 313 1196 309 L 1196 217 Q 1196 213 1200 213 L 1204 213" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="l0" data-edge-to="service" data-edge-label="sourceOf 回溯" data-edge-key="14" data-edge-id="l0-service" data-composition-points="740,144;687,144;687,240;634,240" d="M 740 144 L 695 144 Q 687 144 687 152 L 687 232 Q 687 240 679 240 L 634 240" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
         <path data-edge-from="render" data-edge-to="l2" data-edge-label="读 L1/L2/L3" data-edge-key="15" data-edge-id="render-derived" data-composition-points="634,617;687,617;687,597;740,597" d="M 634 617 L 679 617 Q 687 617 687 609 L 687 605 Q 687 597 695 597 L 740 597" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
@@ -5092,8 +5092,8 @@
         <text data-detail="context" x="340" y="451" class="t-muted" font-size="9" text-anchor="middle">recall / propose / forget</text>
         </g>
 
-        <g id="node-inject" data-node-id="inject" data-node-label="注入 Provider" tabindex="0" role="button" aria-label="聚焦注入 Provider，systemPrompt 变量, 插件进程" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="systemPrompt 变量" data-node-context="插件进程">
-          <title>注入 Provider · systemPrompt 变量 · 插件进程</title>
+        <g id="node-inject" data-node-id="inject" data-node-label="注入 Provider" tabindex="0" role="button" aria-label="聚焦注入 Provider，工作集 top-N · 不逐轮检索, 插件进程" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="工作集 top-N · 不逐轮检索" data-node-context="插件进程">
+          <title>注入 Provider · 工作集 top-N · 不逐轮检索 · 插件进程</title>
           <rect x="259" y="690" width="162" height="74" rx="6" class="c-mask"/>
           <rect x="259" y="690" width="162" height="74" rx="6" class="c-frontend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(265 696) scale(0.6875)">
@@ -5103,7 +5103,7 @@
             <circle cx="6.3" cy="4.8" r=".7" class="sigil-fill"/>
           </g>
           <text data-node-label="" data-detail-anchor="" x="340" y="725" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">注入 Provider</text>
-        <text data-detail="context" x="340" y="741" class="t-muted" font-size="9" text-anchor="middle">systemPrompt 变量</text>
+        <text data-detail="context" x="340" y="741" class="t-muted" font-size="9" text-anchor="middle">工作集 top-N · 不逐轮检索</text>
         </g>
 
         <g id="node-render" data-node-id="render" data-node-label="唯一渲染器" tabindex="0" role="button" aria-label="聚焦唯一渲染器，renderEntry · withinBudget, 插件进程" aria-pressed="false" data-node-kind="security" data-node-sublabel="renderEntry · withinBudget" data-node-context="插件进程">
@@ -5213,15 +5213,15 @@
         <text data-detail="context" x="1107" y="447" class="t-muted" font-size="9" text-anchor="middle">去重 · supersede</text>
         </g>
 
-        <g id="node-rebuild" data-node-id="rebuild" data-node-label="rebuild" tabindex="0" role="button" aria-label="聚焦rebuild，rollup / persona, 异步管线" aria-pressed="false" data-node-kind="backend" data-node-sublabel="rollup / persona" data-node-context="异步管线">
-          <title>rebuild · rollup / persona · 异步管线</title>
+        <g id="node-rebuild" data-node-id="rebuild" data-node-label="rebuild" tabindex="0" role="button" aria-label="聚焦rebuild，Packet 溢出才触发, 异步管线" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Packet 溢出才触发" data-node-context="异步管线">
+          <title>rebuild · Packet 溢出才触发 · 异步管线</title>
           <rect x="1026" y="580" width="162" height="66" rx="6" class="c-mask"/>
           <rect x="1026" y="580" width="162" height="66" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(1032 586) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
           <text data-node-label="" data-detail-anchor="" x="1107" y="611" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">rebuild</text>
-        <text data-detail="context" x="1107" y="627" class="t-muted" font-size="9" text-anchor="middle">rollup / persona</text>
+        <text data-detail="context" x="1107" y="627" class="t-muted" font-size="9" text-anchor="middle">Packet 溢出才触发</text>
         </g>
 
         <g id="node-decay" data-node-id="decay" data-node-label="decay" tabindex="0" role="button" aria-label="聚焦decay，L1 休眠·归档·引文老化, 异步管线" aria-pressed="false" data-node-kind="backend" data-node-sublabel="L1 休眠·归档·引文老化" data-node-context="异步管线">
@@ -5252,9 +5252,9 @@
           <text x="222.5" y="276.5" class="t-backend" font-size="8" text-anchor="middle">turn 结束</text>
         </g>
 
-        <g data-detail="context" data-edge-from="inject" data-edge-to="agent" data-edge-label="每轮注入 ≤1400 tok" data-edge-key="2" data-edge-id="inject-agent">
-          <rect x="174.3" y="570.5" width="96.39999999999999" height="14" rx="3" class="c-mask"/>
-          <text x="222.5" y="580.5" class="t-muted" font-size="8" text-anchor="middle">每轮注入 ≤1400 tok</text>
+        <g data-detail="context" data-edge-from="inject" data-edge-to="agent" data-edge-label="注入 ≤1400 tok" data-edge-key="2" data-edge-id="inject-agent">
+          <rect x="183.9" y="570.5" width="77.2" height="14" rx="3" class="c-mask"/>
+          <text x="222.5" y="580.5" class="t-muted" font-size="8" text-anchor="middle">注入 ≤1400 tok</text>
         </g>
         <g data-detail="context" data-edge-from="capture" data-edge-to="l0" data-edge-label="写入调用与结果" data-edge-key="3" data-edge-id="capture-l0">
           <rect x="541.9" y="118.5" width="77.2" height="14" rx="3" class="c-mask"/>
@@ -5283,9 +5283,9 @@
           <rect x="952" y="370" width="30" height="14" rx="3" class="c-mask"/>
           <text x="967" y="380" class="t-backend" font-size="8" text-anchor="middle">落库</text>
         </g>
-        <g data-detail="context" data-edge-from="rebuild" data-edge-to="l2" data-edge-label="重建 L2/L3" data-edge-key="12" data-edge-id="rebuild-l2">
+        <g data-detail="context" data-edge-from="rebuild" data-edge-to="l2" data-edge-label="溢出时重建" data-edge-key="12" data-edge-id="rebuild-l2">
           <rect x="938" y="585" width="58" height="14" rx="3" class="c-mask"/>
-          <text x="967" y="595" class="t-muted" font-size="8" text-anchor="middle">重建 L2/L3</text>
+          <text x="967" y="595" class="t-muted" font-size="8" text-anchor="middle">溢出时重建</text>
         </g>
 
         <g data-detail="context" data-edge-from="l0" data-edge-to="service" data-edge-label="sourceOf 回溯" data-edge-key="14" data-edge-id="l0-service">
@@ -5539,7 +5539,7 @@
         <ul>
           <li>&bull; L0→L3 是粒度轴，由管线逐层生长</li>
           <li>&bull; fact/coding/preference/procedure 是用途轴，只在 L1 有意义</li>
-          <li>&bull; 派生层按设计跨 kind 聚合，不是 4×4 网格</li>
+          <li>&bull; L2/L3 曾被初始规范否决（语义未定义），ADR 0002 补足边界后重开</li>
         </ul>
       </div>
 
@@ -5550,7 +5550,7 @@
         </div>
         <ul>
           <li>&bull; 三条读出口共用同一渲染器（D8）</li>
-          <li>&bull; 写侧豁免集 ≡ 读侧可达集，同一个 status 谓词</li>
+          <li>&bull; prune 豁免与 sourceOf 可达共用同一个 status 谓词</li>
           <li>&bull; 派生层由 D9 触发器统一失效，不靠调用方记得清理</li>
         </ul>
       </div>
@@ -5562,8 +5562,8 @@
         </div>
         <ul>
           <li>&bull; SOURCE_TURN_LIMIT 不绑定：token 预算先截断</li>
-          <li>&bull; sourceOf 兑现率 2.1%–4.3%，但零使用实例</li>
-          <li>&bull; 90 天 L0 保留期尚未触发，例外集恒等于全集</li>
+          <li>&bull; sourceOf 兑现率 2.1%–4.3%（零使用实例，故登记不修）</li>
+          <li>&bull; 90 天 L0 保留期尚未触发：豁免集恒等于全集</li>
         </ul>
       </div>
     </div>

@@ -47,5 +47,25 @@ scripts/diagram.sh --watch   # 编辑时自动重建（约 1 秒内响应）
 | revision 围栏 | `rebuild.ts` 的 `readRevision` 前置检查 |
 | L2 ≤620 / L3 ≤600 | `ROLLUP_TARGET_CHARS` / `PERSONA_TARGET_CHARS` |
 
+| 注入是工作集 top-N、不逐轮检索 | `fts.ts` 的 `queryInjectableSet`：只有 `ORDER BY 优先级, updated_at`，不接受查询串 |
+| 派生层由 Packet 溢出触发 | `rebuild.ts` 的 `if (!packetOverflows(store)) return false` |
+
 第三张卡片列的三条「已登记未修」缺口出自
 [ADR 0009](../decisions/0009-measure-at-the-outermost-ruler.md)。
+
+## 与初始规范的偏差（只有一处，且是显式推翻）
+
+初始 `plugin-architecture.md` **三处否决**过 L2/L3 双派生粒度（§2.2、§12、
+§13），理由不是「没必要」，而是**两个粒度的语义差异从未被定义**。
+
+而今天的实现是两层。这不是漂移：
+[ADR 0002](../decisions/0002-l2-l3-need-defined-boundaries.md) 先用
+**作用域 + 数量 + 失效条件**把边界定死，再写代码，并把 `derived` 从布尔
+**加宽**而非新增列（11 处消费者中 10 处问的是 `derived = 0`，加宽后一字不改）。
+图上第一张卡片如实记着这段历史，**因为一个被推翻过的决定比一个从未被质疑的
+决定更需要写下来**。
+
+其余元素与初始规范逐条一致，包括：单一全局 context 提供方（§4.1）、
+两条读出口共用同一句框定头（§4.3，即今天的 D8 唯一渲染器）、
+fencing 先于业务写入（§5.2）、`chars/4` 的统一 token 口径（§4.3）、
+L0 无条件写入与不建 FTS（§v2.7）。

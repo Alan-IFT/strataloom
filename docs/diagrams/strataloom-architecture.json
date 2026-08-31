@@ -99,7 +99,7 @@
       "id": "inject",
       "type": "frontend",
       "label": "注入 Provider",
-      "sublabel": "systemPrompt 变量",
+      "sublabel": "工作集 top-N · 不逐轮检索",
       "pos": [
         259,
         690
@@ -239,7 +239,7 @@
       "id": "rebuild",
       "type": "backend",
       "label": "rebuild",
-      "sublabel": "rollup / persona",
+      "sublabel": "Packet 溢出才触发",
       "pos": [
         1026,
         580
@@ -329,7 +329,7 @@
       "id": "inject-agent",
       "from": "inject",
       "to": "agent",
-      "label": "每轮注入 ≤1400 tok"
+      "label": "注入 ≤1400 tok"
     },
     {
       "id": "capture-l0",
@@ -387,7 +387,7 @@
       "id": "rebuild-l2",
       "from": "rebuild",
       "to": "l2",
-      "label": "重建 L2/L3"
+      "label": "溢出时重建"
     },
     {
       "id": "extract-llm",
@@ -415,7 +415,7 @@
       "items": [
         "L0→L3 是粒度轴，由管线逐层生长",
         "fact/coding/preference/procedure 是用途轴，只在 L1 有意义",
-        "派生层按设计跨 kind 聚合，不是 4×4 网格"
+        "L2/L3 曾被初始规范否决（语义未定义），ADR 0002 补足边界后重开"
       ]
     },
     {
@@ -423,7 +423,7 @@
       "title": "一条规则一个实现",
       "items": [
         "三条读出口共用同一渲染器（D8）",
-        "写侧豁免集 ≡ 读侧可达集，同一个 status 谓词",
+        "prune 豁免与 sourceOf 可达共用同一个 status 谓词",
         "派生层由 D9 触发器统一失效，不靠调用方记得清理"
       ]
     },
@@ -432,8 +432,8 @@
       "title": "已登记未修（ADR 0009）",
       "items": [
         "SOURCE_TURN_LIMIT 不绑定：token 预算先截断",
-        "sourceOf 兑现率 2.1%–4.3%，但零使用实例",
-        "90 天 L0 保留期尚未触发，例外集恒等于全集"
+        "sourceOf 兑现率 2.1%–4.3%（零使用实例，故登记不修）",
+        "90 天 L0 保留期尚未触发：豁免集恒等于全集"
       ]
     }
   ]
