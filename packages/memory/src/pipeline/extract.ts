@@ -21,6 +21,7 @@ import {
   EXTRACT_TRANSCRIPT_CHARS,
   TITLE_MAX_CHARS,
   BODY_MAX_CHARS,
+  WORST_SOURCE_SEQS,
 } from '../constants.ts'
 import { callPipelineLlm, parseStrictJson, PipelineLlmError, type PinnedRoute } from './llm-call.ts'
 import { extractSystemPrompt, PAYLOAD_VERSION, PROMPT_VERSION } from './prompts.ts'
@@ -36,6 +37,35 @@ export interface ExtractPayload {
   readonly payloadVersion: number
 }
 
+
+/**
+ * Cut one event's text to the per-event cap, marking the cut.
+ *
+ * ONE function because `EXTRACT_EVENT_EXCERPT_CHARS` is one rule with two
+ * execution points — the transcript the model reads and the excerpt the
+ * evidence row stores — and a rule enforced in two places must be one rule.
+ * Written out twice, the two copies drift in exactly the way that is invisible
+ * from either side: the same constant would produce a trailing `…` in the
+ * prompt and a hard cut in the audit trail, so a reviewer comparing an excerpt
+ * against the transcript could not tell a truncation from a verbatim quote.
+ *
+ * The ellipsis is part of the rule, not decoration: it is the only signal in
+ * the stored bytes that says "there was more". Its cost is +1 over the cap and
+ * that is deliberate — `EXTRACT_EVENT_EXCERPT_CHARS` bounds the TEXT kept, and
+ * the mark is what tells a reader the text was bounded at all.
+ *
+ * NOT for `transcript.ts`'s `summarizeArguments`, which spends the same
+ * constant with a DIFFERENT degradation: it replaces an over-long argument
+ * value wholesale with `<N chars>` rather than keeping a truncated head. That
+ * asymmetry is the design (`constants.ts` states it): a quote is worth reading
+ * in part, an argument value is not. Two execution points share this function;
+ * the third shares only the number, and folding it in here would trade a
+ * documented difference for a false uniformity.
+ */
+const capEventText = (text: string): string =>
+  text.length > EXTRACT_EVENT_EXCERPT_CHARS
+    ? `${text.slice(0, EXTRACT_EVENT_EXCERPT_CHARS)}…`
+    : text
 
 /** One transcript event as the model receives it (spec §5.1 input shape). */
 interface PromptEvent {
@@ -120,11 +150,11 @@ const renderTranscript = (events: readonly TranscriptEvent[]): PromptTranscript 
   const kept: PromptEvent[] = []
   let budget = EXTRACT_TRANSCRIPT_CHARS - JSON.stringify({ events: [] }).length
   for (const event of events) {
-    const text =
-      event.text.length > EXTRACT_EVENT_EXCERPT_CHARS
-        ? `${event.text.slice(0, EXTRACT_EVENT_EXCERPT_CHARS)}…`
-        : event.text
-    const entry: PromptEvent = { seq: event.seq, label: event.label, text }
+    const entry: PromptEvent = {
+      seq: event.seq,
+      label: event.label,
+      text: capEventText(event.text),
+    }
     // The comma joining this entry to the previous one is part of what it
     // adds, so it is part of what it costs.
     const cost = JSON.stringify(entry).length + (kept.length === 0 ? 0 : 1)
@@ -192,7 +222,46 @@ const parseCandidates = (raw: unknown): RawCandidate[] => {
       title,
       body,
       kind: candidate.kind as MemoryKind,
-      sourceSeqs: candidate.sourceSeqs.filter((seq): seq is number => typeof seq === 'number'),
+      // Bounded like every other field of a reply — this was the one that was
+      // not. `candidates`, `title` and `body` are all cut to a constant above;
+      // `sourceSeqs` was filtered for type and then trusted for length, and
+      // two things downstream depended on a bound nobody enforced.
+      //
+      // `WORST_SOURCE_SEQS` is that bound, IMPORTED rather than re-typed:
+      // `constants.ts` builds the worst permitted reply from it and asserts
+      // `EXTRACT_TRANSCRIPT_CHARS + worstExtractReplyChars() <= LLM_MAX_TOKENS`.
+      // At 10 that solves to 5300 + 6682 = 11982 against a 12000 cap — 18
+      // characters of margin — and at 11 to 12017, over it. The guard already
+      // priced the reply as if this cap existed; until now the parse did not
+      // apply it, so the guard was certifying a shape the code permitted the
+      // model to exceed. Whether an over-long reply actually costs anything
+      // depends on the provider: `maxTokens` may count the completion alone or
+      // the whole exchange, and which of the two a route means is not visible
+      // from here (see the note above `worstExchangeChars`). ON A PROVIDER
+      // THAT PRICES THE WHOLE EXCHANGE, the reply comes back truncated,
+      // `llm-call.ts` reads the non-`stop` finish as a failure, the job
+      // retries and eventually dead-letters. That is a conditional failure
+      // mode, not a certain one — the bound exists because the guard is
+      // otherwise asserting something no code keeps.
+      //
+      // ORDER IS LOAD-BEARING: filter, then DEDUPE, then slice. Truncating
+      // before de-duplicating would let ten repetitions of one seq evict ten
+      // distinct sources, so the reply that cites its evidence worst would
+      // keep the most of it. De-duplication is also what bounds the EXCERPT
+      // below, which repeats each cited event's text: measured by reverting
+      // this line, 200 copies of one legal seq pointing at a 5000-character
+      // row render an 82595-character excerpt out of a 400-character rule, and
+      // the old join-then-truncate hid that by cutting the result rather than
+      // by never building it.
+      //
+      // Dropping duplicates cannot change provenance: `provenanceFor` maps
+      // then reduces to the minimum `PROVENANCE_PRIORITY`, and min is
+      // idempotent — a repeated seq contributes nothing a single one does not.
+      // The empty case is answered before the reduce, and de-duplication never
+      // turns a non-empty list empty.
+      sourceSeqs: [
+        ...new Set(candidate.sourceSeqs.filter((seq): seq is number => typeof seq === 'number')),
+      ].slice(0, WORST_SOURCE_SEQS),
     })
   }
   return out
@@ -272,12 +341,57 @@ export const runExtractJob = async (
       insertMemory.run(id, candidate.kind, candidate.title, candidate.body, provenance, now, now)
       // The excerpt is the actual cited source text (audit value, D3) — a
       // list of seq numbers would prove nothing to a human reviewing it.
+      //
+      // The cap is applied PER SEGMENT, which is what the constant has always
+      // said it is ("Per-event excerpt cap") and what `capEventText` does for
+      // the transcript one screen up. It used to be applied to the JOINED
+      // string, so a candidate citing four events got 400 characters to share
+      // between them: measured on this repo's own stores, 218 of 241 excerpts
+      // were exactly 400 characters long, with no natural tail below it — the
+      // second citation onwards was routinely cut mid-word or lost outright,
+      // while the row still read as a complete quotation. An auditor
+      // reconstructing which sources a memory came from got the wrong answer
+      // from it, which is the one thing this column exists to answer.
+      //
+      // Per-segment truncation is safe only because `sourceSeqs` is bounded
+      // above: the excerpt is now at most WORST_SOURCE_SEQS segments and the
+      // whole-string cut is no longer what stands between this and an
+      // unbounded write. That is the same bound, doing its second job.
+      //
+      // Only the TEXT is cut; `[label]` is always emitted whole. Cutting the
+      // prefix would produce `[tool:ba` — a segment whose source cannot be
+      // read at all — and a truncation that destroys the attribution is worse
+      // than one that shortens the quote.
+      //
+      // KNOWN LIMIT, stated rather than papered over: `\n---\n` is a
+      // separator an event's own text can WRITE.
+      //
+      // Measured across this machine's seven stores at 2026-08-31T13:37Z
+      // (absolutes are timestamped because L0 grows: this same scan read 4702
+      // rows earlier in the session and 4763 an hour later). Denominators are
+      // named because two different ratios are easy to confuse here:
+      //   - 116 of 4763 L0 rows (2.44%) — denominator: ALL `conversations`
+      //     rows — carry the literal sequence in their own text.
+      //   - 20 of 241 stored excerpts (8.30%) — denominator: NON-EMPTY
+      //     excerpts — already split into at least one segment with no
+      //     `[label] ` opener, i.e. cannot be decomposed back into sources.
+      // A third figure, 142 of 241 (58.92%), counts excerpts merely CONTAINING
+      // the separator; that is mostly this writer's own legitimate joins and
+      // is NOT a defect rate. Only the second number measures ambiguity.
+      //
+      // The excerpt is audit material for a HUMAN reader, and for that a
+      // separator that is occasionally ambiguous is acceptable; it is NOT a
+      // machine-parseable format and no consumer should treat it as one.
+      // A consumer that needs
+      // reliable per-source segmentation should get structured storage (a row
+      // per cited seq), not a cleverer delimiter — escaping or lengthening the
+      // separator would only move the ambiguity, and it would break the
+      // readability of every excerpt already written.
       const excerpt = candidate.sourceSeqs
         .map((seq) => bySeq.get(seq))
         .filter((cited) => cited !== undefined)
-        .map((cited) => `[${cited.label}] ${cited.text}`)
+        .map((cited) => `[${cited.label}] ${capEventText(cited.text)}`)
         .join('\n---\n')
-        .slice(0, EXTRACT_EVENT_EXCERPT_CHARS)
       insertEvidence.run(id, sessionRef, excerpt === '' ? null : excerpt)
       candidateIds.push(id)
     }

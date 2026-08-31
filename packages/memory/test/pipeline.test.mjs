@@ -1042,6 +1042,290 @@ test('a turn whose every event is budgeted out settles without calling the model
   cleanup(root)
 })
 
+// ---- the evidence excerpt: what an auditor is shown -----------------------
+
+/**
+ * Run one extract with a scripted reply and return the excerpt actually
+ * STORED, split into its segments.
+ *
+ * Driven through `runExtractJob` and read back out of the `evidence` table on
+ * purpose: this file's own history says a hand-written `INSERT INTO evidence`
+ * fixture proves nothing about the writer, because it bypasses the code under
+ * test and pins whatever the test author believed the writer does. Every
+ * assertion below therefore travels the real capture -> extract -> commit
+ * path, and reads the same bytes an auditor would read.
+ */
+const excerptFor = async (events, sourceSeqs) => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  seedL0(store, events)
+  enqueueJob(store, 'extract', 'e1', extractPayload, 0)
+  const reply = JSON.stringify({
+    candidates: [{ title: 'cited', body: 'cited body', kind: 'fact', sourceSeqs }],
+  })
+  const ctx = fakeCtx({ services: { llm: { stream: () => textStream(reply) } } })
+  await runExtractJob(ctx, store, claim(store), extractPayload, new AbortController().signal)
+  const excerpt = store.db.prepare(`SELECT excerpt FROM evidence`).get()?.excerpt ?? ''
+  registry.dispose()
+  cleanup(root)
+  return { excerpt, segments: excerpt === '' ? [] : excerpt.split('\n---\n') }
+}
+
+test('the excerpt cap is PER EVENT, not shared across the citations', async () => {
+  // The defect: `EXTRACT_EVENT_EXCERPT_CHARS` is documented as a per-event cap
+  // ("extraction cuts every event to this") and `renderTranscript` uses it that
+  // way, but the excerpt writer applied it to the JOINED string. A candidate
+  // citing four events got 400 characters to share between them, so the second
+  // citation onward was cut mid-word or lost entirely while the row still read
+  // as a complete quotation. Measured on this machine's stores before the fix:
+  // 218 of 241 excerpts sat at exactly 400 characters, with no natural tail.
+  const long = (ch) => ch.repeat(EXTRACT_EVENT_EXCERPT_CHARS + 200)
+  const { segments } = await excerptFor(
+    turnEvents(1, [
+      userMessageEvent(long('u')),
+      assistantMessageEvent(1, long('a')),
+      toolCallEvent(1, 'c1', 'bash'),
+      toolResultEvent(1, 'c1', long('t')),
+    ]),
+    [2, 3, 5],
+  )
+  assert.equal(segments.length, 3, 'every cited event contributes a segment of its own')
+  for (const [i, segment] of segments.entries()) {
+    // Each segment carries its OWN full allowance, not a share of one.
+    const text = segment.replace(/^\[[^\]]+\] /, '')
+    assert.equal(
+      text.length,
+      EXTRACT_EVENT_EXCERPT_CHARS + 1,
+      `segment ${i} gets the whole per-event cap plus the ellipsis, not a slice of a shared one`,
+    )
+    assert.ok(text.endsWith('…'), `segment ${i} marks the cut the same way the transcript does`)
+  }
+  // The property stated the other way round, which is what actually fails
+  // under a join-then-truncate writer: the total EXCEEDS the per-event cap,
+  // because the cap was never a budget for the whole string.
+  assert.ok(
+    segments.join('\n---\n').length > EXTRACT_EVENT_EXCERPT_CHARS,
+    'three cited events must not be squeezed into one event`s allowance',
+  )
+})
+
+test('the excerpt truncates the quote, never the [label] that attributes it', async () => {
+  // A segment cut through its prefix (`[tool:ba`) loses the one thing the
+  // excerpt exists to record: which source the words came from. Auditors read
+  // these back with `^\[([^\]]+)\]`, so a half-written label is not a shorter
+  // answer, it is an unreadable one.
+  const { segments } = await excerptFor(
+    turnEvents(1, [
+      userMessageEvent('u'.repeat(EXTRACT_EVENT_EXCERPT_CHARS + 200)),
+      toolCallEvent(1, 'c1', 'a-tool-with-a-deliberately-long-name'),
+      toolResultEvent(1, 'c1', 't'.repeat(EXTRACT_EVENT_EXCERPT_CHARS + 200)),
+    ]),
+    [2, 4],
+  )
+  assert.equal(segments.length, 2)
+  const labels = segments.map((segment) => /^\[([^\]]+)\] /.exec(segment)?.[1])
+  assert.deepEqual(
+    labels,
+    ['user', 'tool:a-tool-with-a-deliberately-long-name'],
+    'every segment opens with a complete, parseable label',
+  )
+  // The prefix is preserved IN ADDITION TO the quote's allowance, not out of
+  // it — which is the property that distinguishes "cap the text" from "cap the
+  // whole segment". A label-inclusive cut leaves labels intact whenever they
+  // are short, so checking only for parseability would pass against it and
+  // catch the bug solely by luck of the fixture's names. Here the two labels
+  // differ in length by 37 characters: if the cap were applied to the segment,
+  // the long-labelled quote would be 37 characters shorter than the other.
+  const quotes = segments.map((segment) => segment.replace(/^\[[^\]]+\] /, ''))
+  assert.equal(
+    quotes[0].length,
+    quotes[1].length,
+    'a longer label must not buy a shorter quote — the cap is on the text alone',
+  )
+  for (const quote of quotes) assert.equal(quote.length, EXTRACT_EVENT_EXCERPT_CHARS + 1)
+})
+
+test('a reply repeating one seq 200 times cannot write an unbounded excerpt', async () => {
+  // `sourceSeqs` was the one field of a reply with no length bound, and the
+  // old join-then-truncate ACCIDENTALLY hid it: 200 repetitions of one legal
+  // seq pointing at a 5000-character row build an 82595-character excerpt, and
+  // cutting the joined result to 400 disguised that as a well-behaved row.
+  // Moving the cap per-segment removes that accident, so the bound has to be
+  // real — deduplicate, then cap at WORST_SOURCE_SEQS.
+  const { WORST_SOURCE_SEQS } = await import('../lib/constants.js')
+  const { excerpt, segments } = await excerptFor(
+    turnEvents(1, [userMessageEvent('x'.repeat(5_000))]),
+    Array.from({ length: 200 }, () => 2),
+  )
+  assert.equal(segments.length, 1, 'one cited event is one segment, however often it is named')
+
+  // The bound is asserted as the two RULES that produce it — segment count and
+  // per-segment quote length — rather than as a total-length number.
+  //
+  // A draft of this test did assert a total, built as
+  // `WORST_SOURCE_SEQS * (EXTRACT_EVENT_EXCERPT_CHARS + 1 + '[subagent:abcdef01] '.length + 5)`.
+  // That hardcodes a label as a stand-in for a bound the label module owns,
+  // and it is wrong in the direction that matters: labels are variable-length,
+  // and `tool-call:` + `TOOL_NAME_MAX` (64) permits a 77-character prefix
+  // against the 20 that literal assumes. Ten cited RESULTS with max-length
+  // legal tool names (`tool:` + 64, a 72-character prefix) build a
+  // 4775-character excerpt, and ten cited CALLS build 4825 — both of which
+  // that expression rejects at 4260, failing on input the code must accept.
+  // Re-deriving it here from `transcript.ts`'s private label constants would
+  // just move the copy, so the total is not asserted at all: it is not the
+  // invariant this fix establishes.
+  assert.ok(
+    segments.length <= WORST_SOURCE_SEQS,
+    `segment count is the real bound: ${segments.length} > ${WORST_SOURCE_SEQS}`,
+  )
+  for (const [i, segment] of segments.entries()) {
+    const quote = segment.replace(/^\[[^\]]+\] /, '')
+    assert.ok(
+      quote.length <= EXTRACT_EVENT_EXCERPT_CHARS + 1,
+      `segment ${i}: each quote carries the per-event cap, and no more`,
+    )
+  }
+  // And the magnitude, against what this exact fixture produced BEFORE the
+  // fix: 200 segments totalling 82595 characters, measured by reverting the
+  // dedupe. An order-of-magnitude assertion, not a precise one — the point is
+  // that the amplification is gone, and a precise total would re-introduce the
+  // label dependency this test just removed.
+  assert.ok(
+    excerpt.length < 82_595 / 10,
+    `the 202x amplification is gone: ${excerpt.length} must be far below the unbounded 82595`,
+  )
+})
+
+test('the bound the extract WRITER enforces is the one the exchange guard PRICES', async () => {
+  // `constants.ts` builds its worst permitted reply from `WORST_SOURCE_SEQS`
+  // and asserts EXTRACT_TRANSCRIPT_CHARS + worstExtractReplyChars() fits
+  // LLM_MAX_TOKENS — and until now nothing made the parser honour it, so the
+  // guard certified a shape the code allowed the model to exceed. Binding both
+  // sides to the SAME constant is the point: raising either alone must fail
+  // here rather than in production.
+  const { WORST_SOURCE_SEQS } = await import('../lib/constants.js')
+  const events = turnEvents(
+    1,
+    Array.from({ length: WORST_SOURCE_SEQS + 15 }, (_, i) => userMessageEvent(`source ${i}`)),
+  )
+  // Every seq DISTINCT and legal, so nothing but the cap can shorten the list.
+  const seqs = Array.from({ length: WORST_SOURCE_SEQS + 15 }, (_, i) => i + 2)
+  const { segments } = await excerptFor(events, seqs)
+  assert.equal(
+    segments.length,
+    WORST_SOURCE_SEQS,
+    'the writer keeps at most as many citations as the guard priced',
+  )
+
+  // ORDER, pinned as a property rather than left to the reading of the code:
+  // deduplicate FIRST, then cap. Both orders bound the array, so every
+  // assertion above passes against either — the difference is only visible on
+  // a reply that repeats a seq AHEAD of distinct ones. Capping first spends
+  // the whole allowance on repetitions of one source and discards the rest, so
+  // the reply that cites its evidence worst would keep the least of it, and
+  // the excerpt an auditor reads would name one source where the model named
+  // eleven.
+  const repeatedFirst = [
+    ...Array.from({ length: WORST_SOURCE_SEQS }, () => 2),
+    ...Array.from({ length: WORST_SOURCE_SEQS }, (_, i) => i + 3),
+  ]
+  const { segments: mixed } = await excerptFor(events, repeatedFirst)
+  assert.equal(
+    mixed.length,
+    WORST_SOURCE_SEQS,
+    'repeated citations must not evict the distinct sources queued behind them',
+  )
+  assert.equal(
+    new Set(mixed).size,
+    mixed.length,
+    'and every kept segment is a DISTINCT source, not the same one re-quoted',
+  )
+
+  // The guard's own inequality, re-solved at the enforced N and at N+1: the
+  // constant is a DERIVED bound (the largest array the exchange holds), not a
+  // number chosen to look roomy. This is the assertion that catches a future
+  // "10 is arbitrary, make it 20".
+  const {
+    LLM_MAX_TOKENS,
+    EXTRACT_TRANSCRIPT_CHARS,
+    EXTRACT_MAX_CANDIDATES,
+    EXTRACT_TITLE_TARGET_CHARS,
+    EXTRACT_BODY_TARGET_CHARS,
+    REPLY_WORST_ESCAPE_RATE,
+    worstExtractReplyChars,
+  } = await import('../lib/constants.js')
+  const { MEMORY_KINDS } = await import('../lib/types.js')
+  const worstEscaped = (chars) => {
+    const period = Math.max(2, Math.floor(1 / REPLY_WORST_ESCAPE_RATE))
+    let out = ''
+    for (let i = 0; i < chars; i++) out += (i + 1) % period === 0 ? '\u001f' : 'x'
+    return out
+  }
+  const replyChars = (n) => {
+    const candidate = {
+      title: worstEscaped(EXTRACT_TITLE_TARGET_CHARS),
+      body: worstEscaped(EXTRACT_BODY_TARGET_CHARS),
+      kind: [...MEMORY_KINDS].sort((a, b) => b.length - a.length)[0] ?? '',
+      sourceSeqs: Array.from({ length: n }, () => 999_999),
+    }
+    return (
+      EXTRACT_MAX_CANDIDATES * (JSON.stringify(candidate).length + 1) +
+      JSON.stringify({ candidates: [] }).length
+    )
+  }
+  // Reconstructed independently and required to MATCH the shipped guard, so a
+  // drift in either expression is caught rather than silently tolerated.
+  assert.equal(
+    replyChars(WORST_SOURCE_SEQS),
+    worstExtractReplyChars(),
+    'the enforced N is the N the guard prices its worst reply with',
+  )
+  assert.ok(
+    EXTRACT_TRANSCRIPT_CHARS + replyChars(WORST_SOURCE_SEQS) <= LLM_MAX_TOKENS,
+    'the enforced bound fits the exchange',
+  )
+  assert.ok(
+    EXTRACT_TRANSCRIPT_CHARS + replyChars(WORST_SOURCE_SEQS + 1) > LLM_MAX_TOKENS,
+    'and one more citation would not — the bound is derived, not decorative',
+  )
+})
+
+test('deduplicating citations does not move provenance', async () => {
+  // The de-duplication added above sits directly upstream of `provenanceFor`,
+  // and provenance is a TRUST decision — so the claim "min is idempotent, so
+  // duplicates contribute nothing" is asserted rather than reasoned about. The
+  // hostile shape is the one that matters: a low-trust source named many times
+  // beside a high-trust one must still drag the result down.
+  const events = turnEvents(1, [
+    userMessageEvent('the human said this'),
+    toolCallEvent(1, 'c1', 'bash'),
+    toolResultEvent(1, 'c1', 'tool output, lowest trust'),
+  ])
+  const cases = [
+    { seqs: [2, 2, 2], expected: 'human' },
+    { seqs: [2, 4, 4, 4, 2], expected: 'tool-output' },
+    { seqs: Array.from({ length: 200 }, (_, i) => (i === 0 ? 4 : 2)), expected: 'tool-output' },
+  ]
+  for (const { seqs, expected } of cases) {
+    const { root, registry } = openRegistry()
+    const store = registry.open('k1')
+    seedL0(store, events)
+    enqueueJob(store, 'extract', 'e1', extractPayload, 0)
+    const reply = JSON.stringify({
+      candidates: [{ title: 't', body: 'b', kind: 'fact', sourceSeqs: seqs }],
+    })
+    const ctx = fakeCtx({ services: { llm: { stream: () => textStream(reply) } } })
+    await runExtractJob(ctx, store, claim(store), extractPayload, new AbortController().signal)
+    assert.equal(
+      store.db.prepare(`SELECT provenance FROM memories`).get().provenance,
+      expected,
+      `${JSON.stringify(seqs.slice(0, 6))}: mixed sources still take the minimum trust`,
+    )
+    registry.dispose()
+    cleanup(root)
+  }
+})
+
 // ---- reconcile: batch decisions in one commit -----------------------------
 
 const insertCandidate = (store, id, kind, title) =>

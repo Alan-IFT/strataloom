@@ -564,10 +564,26 @@ export const REPLY_WORST_ESCAPE_RATE = 0.06
  * occupy, rather than what someone counted by eye; every hand-count attempted
  * during this fix (60, 104, 136) was wrong, in both directions.
  *
- * `WORST_SOURCE_SEQS` is 10 against a measured maximum of 6 cited segments per
- * candidate (167 memories with session evidence: p50 2, p90 3, p99 5, max 6);
- * the prompt sets no cap on the array, so the bound has to be chosen rather
- * than derived, and it is chosen well clear of the data.
+ * `WORST_SOURCE_SEQS` is 10 because that is what the exchange inequality
+ * SOLVES TO, and `pipeline/extract.ts: parseCandidates` now enforces it on the
+ * reply — so it is a derived bound the writer keeps, not a bound assumed here
+ * and left unchecked. Parameterising `worstExtractReplyChars` over the array
+ * length and re-running `EXTRACT_TRANSCRIPT_CHARS + reply <= LLM_MAX_TOKENS`
+ * puts the break at N=11: N=10 prices the exchange at 5300 + 6682 = 11982 (18
+ * characters of margin), N=11 at 5300 + 6717 = 12017, over the cap by 17. So
+ * 10 is the largest array this exchange can hold, and 11 is not a smaller
+ * safety margin — it is a violated guard.
+ *
+ * It used to be a CHOSEN number, justified as "well clear" of a measured
+ * maximum of 6 cited segments per candidate (167 memories with session
+ * evidence: p50 2, p90 3, p99 5, max 6). That measurement is kept as reference
+ * data but it does NOT derive this bound, in either direction: those excerpts
+ * were written through a truncation that cut the JOINED string to
+ * `EXTRACT_EVENT_EXCERPT_CHARS`, and 90.5% of them (218 of 241) came out at
+ * exactly 400 characters — so "max 6" is a count of the segments that survived
+ * the cut, a LOWER bound on what the model actually cited. An upper bound can
+ * never be read off it. The prompt still sets no cap on the array, which is
+ * precisely why the parse has to.
  *
  * `WORST_SEQ` is 999999, and the first version of this guard got it wrong in
  * the same way the `+ 60` did — by assuming instead of looking. It used 9999
@@ -590,7 +606,7 @@ export const REPLY_WORST_ESCAPE_RATE = 0.06
  * twice, here and in `test/pipeline-e2e.test.mjs`, and the exchange guard below
  * needs it a third time.
  */
-const WORST_SOURCE_SEQS = 10
+export const WORST_SOURCE_SEQS = 10
 const WORST_SEQ = 999_999
 
 /**
