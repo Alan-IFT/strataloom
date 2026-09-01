@@ -2,37 +2,41 @@
  * Decay (spec §12): the daily batch that keeps recall's signal-to-noise from
  * degrading as a store grows.
  *
- * Three rules, one transaction, no LLM:
+ * Two rules, one transaction, no LLM:
  *   1. an active memory nobody has retrieved for a long time goes `dormant`;
  *   2. a dormant memory retrieved recently comes BACK to active — revival
  *      happens HERE, never on the read path, because a read must not cause
- *      an authoritative change (D4);
- *   3. evidence excerpts older than the compaction window are dropped —
- *      their audit value has expired but the ref (source suppression) stays.
+ *      an authoritative change (D4).
  *
  * `dormant` is not deletion: the row keeps its content and can revive. It
  * only leaves the read surfaces, which is exactly what "noise" means.
+ *
+ * A THIRD rule used to live here: excerpts older than `EXCERPT_COMPACT_MS`
+ * were nulled while their refs survived, and the job reported an
+ * `excerptsCompacted` count. Both are gone. `service.source` now reads
+ * `evidence.excerpt` as its primary evidence path, which changes that
+ * statement from "drop an unread column" into "destroy the proof D3
+ * promises" — and destroy it against words that, thanks to
+ * `pruneConversations`'s exemption for cited sessions, never expire at all.
+ * The deleted constant in `constants.ts` carries the full argument and the
+ * measurements. The count went with the rule rather than staying as a
+ * permanent zero: an observable that can only report 0 invites the reader to
+ * conclude something was checked.
+ *
+ * Decay no longer touches `evidence` in any way. This job ages MEMORIES; how
+ * long their evidence lives is defined once, by that exemption clause.
  * @module @strataloom/dsh-memory/pipeline/decay
  */
 import type { OpenStore } from '../store/store.ts'
 import { commitClaimedJob, type ClaimedJob } from './jobs.ts'
-import {
-  DECAY_IDLE_MS,
-  DECAY_REVIVE_MS,
-  EXCERPT_COMPACT_MS,
-  DECAY_MIN_ACTIVE,
-} from '../constants.ts'
+import { DECAY_IDLE_MS, DECAY_REVIVE_MS, DECAY_MIN_ACTIVE } from '../constants.ts'
 
 /**
  * Run one claimed decay job. Pure SQL inside the job's single commit, so it
  * inherits the fencing guarantee without adding machinery (D6).
  */
 export const runDecayJob = (store: OpenStore, job: ClaimedJob, now: number) => {
-  const report: { slept: number; revived: number; excerptsCompacted: number } = {
-    slept: 0,
-    revived: 0,
-    excerptsCompacted: 0,
-  }
+  const report: { slept: number; revived: number } = { slept: 0, revived: 0 }
   commitClaimedJob(store, job.id, job.leaseToken, () => {
     // Below the floor, aging out entries would cost recall more than the
     // noise it removes: a small store has no noise problem to solve.
@@ -63,17 +67,6 @@ export const runDecayJob = (store: OpenStore, job: ClaimedJob, now: number) => {
       )
       .run(now, now - DECAY_REVIVE_MS)
     report.revived = Number(revived.changes)
-
-    // Excerpt compaction: the quote ages out, the ref never does.
-    const compacted = store.db
-      .prepare(
-        `UPDATE evidence SET excerpt = NULL
-         WHERE excerpt IS NOT NULL AND memory_id IN (
-           SELECT id FROM memories WHERE updated_at < ?
-         )`,
-      )
-      .run(now - EXCERPT_COMPACT_MS)
-    report.excerptsCompacted = Number(compacted.changes)
   })
   return report
 }

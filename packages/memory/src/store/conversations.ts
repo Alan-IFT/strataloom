@@ -59,8 +59,22 @@ export const readTurn = (
     .all(sessionId, turn) as unknown as TranscriptEvent[]
 
 /**
- * Read the stored conversation behind a memory's session ref — the "show me
- * the original words" path (spec: L0 answers 核对原话/时间/来源).
+ * Read the tail of a stored session — the FALLBACK half of the "show me the
+ * original words" path (spec: L0 answers 核对原话/时间/来源).
+ *
+ * Not the primary half, and the distinction matters to anyone reading this as
+ * the answer to "what did a memory come from". `service.source` calls this
+ * only when the memory's evidence row carries no stored quotation; when one
+ * exists, it returns `evidence.excerpt` — the passage actually cited — and
+ * never reaches here.
+ *
+ * The reason is in the ORDER BY: this returns the LAST `limit` rows of the
+ * session, and cited lines are distributed evenly through a session
+ * (p25=0.24 / p50=0.57 / p75=0.80), so only 9.3% of them fall in this window.
+ * What this function returns is late-session CONTEXT, which is genuinely
+ * useful when nothing better was recorded and is honestly labelled as such by
+ * the caller — but it is not the same fact as "the words this memory quotes",
+ * and it must not be presented as one.
  */
 export const readSessionTurns = (
   store: OpenStore,

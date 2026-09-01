@@ -34,7 +34,7 @@ injection, and forgetting all work; only automatic extraction is disabled
 | context injection | principal only | Personal memories first, then repo working set; framed, ≤1400 tok |
 | L0 capture | principal turns | Every turn recorded in our own store — provenance never depends on the platform log |
 | auto-extract | principal turns | Reads our L0, extract → batch reconcile, leased jobs, one commit each |
-| decay | daily job | Idle entries sleep, recently used ones revive, excerpts compact — never on the read path |
+| decay | daily job | Idle entries sleep, recently used ones revive — never on the read path, and never touching evidence |
 | derived rollup | on overflow | One LLM summary replaces the raw set while it exceeds budget; revision-fenced |
 | projection | on approval | Team-shareable memories written to `.repo_memory/`, secret-scanned |
 

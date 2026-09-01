@@ -174,3 +174,93 @@ export const withinBudget = <T extends RenderableHit>(
   }
   return kept
 }
+
+/**
+ * The visible mark that a body was cut to fit the budget — the ONE string that
+ * distinguishes "incomplete delivery" from "no delivery".
+ *
+ * It is a suffix on the BODY, not a separate entry and not a header, for the
+ * reason `renderEntry` already gives about per-entry provenance labels:
+ * anything positional can be separated from the content it qualifies (the
+ * platform pruner deletes the middle of a long packet). A mark carried inside
+ * the bullet arrives exactly when the truncated bytes arrive.
+ *
+ * Annotated `: string` rather than left to infer its literal type. The guard in
+ * `tools.ts` must be able to ask whether this is EMPTY — `''.includes('')` is
+ * true, so a mark-presence test alone silently certifies every packet the
+ * moment someone blanks this constant — and under the inferred literal type
+ * that comparison is a compile error rather than a check. Widening the type is
+ * what keeps the guard able to fail.
+ */
+export const TRUNCATION_MARK: string = ' […truncated to fit the recall budget]'
+
+/**
+ * Cut ONE hit's body until the rendered entry fits `budgetTokens`, marking the
+ * cut — the escape hatch for a body `withinBudget` would otherwise drop whole.
+ *
+ * ## Why this exists (the render-budget cliff)
+ *
+ * `withinBudget` SKIPS an entry it cannot afford, which is right when entries
+ * are alternatives: the cheaper ones behind it still arrive. It is wrong when
+ * the entry IS the answer. `service.source`'s quotation path returns exactly
+ * one hit, so "skip it" and "return nothing" are the same event, and `tools.ts`
+ * then rendered '' as `RECALL_NO_MATCH` — telling the model that no memory
+ * matched, about a memory that had just been found, authorised, and read. An
+ * actively false denial is worse than a partial answer, and it hides the
+ * memory's existence rather than its size.
+ *
+ * Measured, with the real renderer at `RECALL_PACKET_BUDGET_TOKENS` (1820):
+ * the worst excerpt `pipeline/extract.ts` can legally store renders at 3226
+ * tokens, 1.8x the budget, and delivered 0 characters.
+ *
+ * ## Why the cut is HERE and not on the write path
+ *
+ * `ROLLUP_TRANSCRIPT_CHARS` says truncating an output twice is "对同一根因的第
+ * 二次绕行；约束输入才消除它", and that precedent was checked rather than
+ * assumed to apply. It governs an input the CODE CHOOSES TO BUILD — a prompt.
+ * Here the input is the stored audit record itself. `renderEntry` indents each
+ * `\n` by two spaces, so a rendered excerpt costs up to 3x its stored length; a
+ * write-side cap guaranteeing a fit would have to cut quotations to ~2412
+ * characters against the ~4010 the writer legitimately cites. That destroys
+ * evidence permanently, in the store, to satisfy a DISPLAY container — the
+ * inversion of D3 — and it would not repair a single excerpt already written.
+ * The bytes are correct where they are; only this one view of them is too
+ * small, so the loss is taken here, and taken visibly.
+ *
+ * ## Bounded by construction
+ *
+ * The mark costs tokens too, so a budget too small to hold it cannot be
+ * satisfied: this returns `undefined` rather than emitting a marked entry that
+ * still overflows, giving the caller an honest "nothing could be rendered".
+ * Slicing is by CODE POINT (`[...body]`), because a cut through a surrogate
+ * pair yields a lone half that is not text.
+ * @param hit - the single hit whose body may be cut.
+ * @param budgetTokens - the budget the rendered entry must fit.
+ * @param withId - price as the caller will render.
+ * @returns the hit unchanged when it fits; a cut, marked copy when it does
+ *   not; `undefined` when even the mark cannot fit.
+ */
+export const truncatedToBudget = <T extends RenderableHit>(
+  hit: T,
+  budgetTokens: number,
+  withId = false,
+): T | undefined => {
+  if (estimateTokens(renderEntry(hit, withId)) <= budgetTokens) return hit
+  const points = [...hit.body]
+  // Binary search on the number of code points kept. The rendered cost is
+  // monotonic in that count, and a linear walk would price thousands of
+  // renders of a multi-kilobyte body on a read path.
+  let low = 0
+  let high = points.length
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2)
+    const candidate = { ...hit, body: points.slice(0, mid).join('') + TRUNCATION_MARK }
+    if (estimateTokens(renderEntry(candidate, withId)) <= budgetTokens) low = mid
+    else high = mid - 1
+  }
+  const cut = { ...hit, body: points.slice(0, low).join('') + TRUNCATION_MARK }
+  // `low === 0` is still PRICED rather than assumed to fit: against a tiny
+  // budget even the bare mark overflows, and returning it would reintroduce
+  // the overflow this function exists to bound.
+  return estimateTokens(renderEntry(cut, withId)) <= budgetTokens ? cut : undefined
+}

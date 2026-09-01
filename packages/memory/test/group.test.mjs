@@ -1411,9 +1411,24 @@ test('18. ATTRIBUTION: a foreign entry says which repository it came from, and t
 test('18b. NO-GROUP OUTPUT IS BYTE-IDENTICAL: attribution costs nothing where there is nothing to attribute', async () => {
   // The hard compatibility gate. `recall/inject.ts` was zero-change until this
   // round, and the one permitted exception must be invisible everywhere the
-  // group is not involved — which is nearly everywhere: every injection packet,
-  // every `propose` near-duplicate list, every `sourceOf` transcript, and every
-  // recall in a repository with no declaration.
+  // group is not involved.
+  //
+  // SCOPE, stated exactly, because the previous wording claimed more than the
+  // body delivers: what follows exercises the RECALL QUERY path in a
+  // declaration-less repository, and nothing else. It listed "every injection
+  // packet, every `propose` near-duplicate list, every `sourceOf` transcript"
+  // among the things it gated, while its assertions never call `source`,
+  // `propose` or the context provider at all. That was an empty promise before
+  // this round and a false one after it, since `sourceOf`'s output bytes were
+  // deliberately changed (it now returns the stored quotation) — a comment
+  // asserting a coverage the code does not have is precisely the defect
+  // `tools.ts`'s packet guard has already recorded once, and repeating it in
+  // the test suite would be the second occurrence.
+  //
+  // `sourceOf`'s bytes are guarded separately, in `layers.test.mjs`: the quote
+  // and fallback shapes, the render-budget truncation, and the empty-result
+  // text each have their own test there. Injection packets are guarded by
+  // `inject.test.mjs`.
   const s = setup({ declaration: undefined })
   seed(
     s.stores.parent,

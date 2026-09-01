@@ -334,17 +334,37 @@ export const GROUP_MAX_MEMBERS = 6
 export const RECALL_PACKET_BUDGET_TOKENS =
   RECALL_RESULT_BUDGET_TOKENS + GROUP_MAX_MEMBERS * RECALL_FOREIGN_BUDGET_TOKENS
 /**
- * Rows returned by the L0 drill-down mode of memory_recall (`sourceOf`).
+ * Rows returned by the FALLBACK path of memory_recall's drill-down
+ * (`sourceOf`) — the one taken only when the cited evidence row carries no
+ * stored quotation.
  *
- * MEASURED NON-BINDING (ADR 0009). `sourceOf`'s rows are rendered through the
- * recall tool's renderer, and that budget truncates first: an L0 row costs
- * p50=41 but p90=516 tokens, and 10.2% of rows exceed 500 on their own.
- * Replayed across all 11 cited sessions, raising this value moves delivery from
- * a mean of 6.45 rows (at 20) to 6.82 (at 34) to 7.64 (at 100), and 100 to 5000
- * changes nothing at all. Coverage of the actually-cited lines does not move.
+ * SCOPE CHANGED, and everything below must be read under the new scope. This
+ * used to govern the only path `sourceOf` had. `service.source` now returns
+ * `evidence.excerpt` — the passage the extractor actually cited — whenever one
+ * exists, and that path ignores this constant entirely: it is one hit, whole,
+ * unsplit, with no row budget to spend. This limit now governs the remaining
+ * cases only, which are not rare: 80 of 403 real evidence rows (19.9%, all
+ * `principal-explicit`) have no excerpt, so about a fifth of reads land here.
  *
- * That render budget is now `RECALL_PACKET_BUDGET_TOKENS` (1700) rather than
- * `RECALL_RESULT_BUDGET_TOKENS` (500), and the effect on THIS path was measured
+ * The reason the primary path exists at all is that this one does not answer
+ * the question the tool asks. It reads the session's LAST rows, while cited
+ * lines are spread evenly through a session (p25=0.24 / p50=0.57 / p75=0.80):
+ * 9.3% of cited passages fell in the window, and 6-8% survived to the model.
+ * That is a property of the ANCHOR, not of the row count — which is exactly
+ * why raising this constant was measured and found inert (ADR 0009 §6(a)), and
+ * why it must not be re-raised in the hope of fixing coverage. For the rows it
+ * does deliver — surrounding context, honestly labelled as such — the
+ * derivation below still holds, and it is still the right value.
+ *
+ * MEASURED NON-BINDING (ADR 0009). These rows are rendered through the recall
+ * tool's renderer, and that budget truncates first: an L0 row costs p50=41 but
+ * p90=516 tokens, and 10.2% of rows exceed 500 on their own. Replayed across
+ * all 11 cited sessions, raising this value moves delivery from a mean of 6.45
+ * rows (at 20) to 6.82 (at 34) to 7.64 (at 100), and 100 to 5000 changes
+ * nothing at all. Coverage of the actually-cited lines does not move.
+ *
+ * That render budget is `RECALL_PACKET_BUDGET_TOKENS` rather than
+ * `RECALL_RESULT_BUDGET_TOKENS`, and the effect on THIS path was measured
  * rather than assumed: replayed over the 13 real L0 sessions on this machine,
  * delivery rises from a mean of 11.92 rows to 14.92 (+25.2%), changing 12 of
  * 13. That is a widening of the drill-down window, and it is ACCEPTABLE for the
@@ -354,10 +374,15 @@ export const RECALL_PACKET_BUDGET_TOKENS =
  * It is also SAFE against the container: `sourceOf` carries no per-store budget
  * of its own, but `renderFramed` spends the same token budget whatever the hits
  * are, and the packet guard in `tools.ts` prices the maximum characters that
- * budget can buy (4 chars per token, tight). Measured worst case at 1700 is
- * 7429 characters against the 8192 container, and the largest real L0 packet
- * measured 6998. The bound therefore covers both modes of the tool, not just
- * the group case it was derived for.
+ * budget can buy (4 chars per token, tight). That guard is the live authority
+ * on the number and `worstRecallPacketChars()` reports it — deliberately not
+ * restated here, because the two numbers this paragraph used to quote (a
+ * budget of 1700, a worst case of 7429) had both been stale since the budget
+ * last moved, while the test that checks the bound called the function and
+ * stayed green. The largest real L0 packet measured 6998 characters against
+ * the 8192 container. The bound covers both modes of the tool, not just the
+ * group case it was derived for; the quotation path is far cheaper still
+ * (max 471 tokens rendered, 2086 characters, over all 322 real excerpts).
  *
  * So the derivation kept below is not wrong — it measured row density at the
  * SQL exit accurately, and raising 20 to 34 really does fetch +93.5% more
@@ -433,8 +458,41 @@ export const CLEANUP_INTERVAL_MS = 6 * 3_600_000
 export const DECAY_IDLE_MS = 60 * 86_400_000
 /** A dormant memory hit within this window revives. */
 export const DECAY_REVIVE_MS = 14 * 86_400_000
-/** Evidence excerpts are dropped after this long; refs are kept forever. */
-export const EXCERPT_COMPACT_MS = 30 * 86_400_000
+/*
+ * `EXCERPT_COMPACT_MS` (30 days) was DELETED here, not raised, and the reason
+ * is recorded so it is not reintroduced.
+ *
+ * It nulled `evidence.excerpt` for memories untouched for 30 days, on the
+ * theory that a quote nobody reads is storage nobody needs. `service.source`
+ * now reads that column as its PRIMARY evidence path, which turns the same
+ * statement from "drop an unread column" into "destroy the proof D3 promises".
+ *
+ * The invariant it violated is that EVIDENCE MUST NOT DIE BEFORE THE MEMORY
+ * IT SUPPORTS OR THE WORDS IT QUOTES. Note what that is NOT: it is not "the
+ * excerpt died 60 days before L0's 90". `pruneConversations` exempts any
+ * session a surviving memory cites, so a cited conversation is never pruned
+ * at all — measured over the 9 real stores, 6273 of 6321 L0 rows (99.2%) are
+ * held by that exemption. The gap was therefore not 60 days but unbounded:
+ * the evidence expired while the words it quoted lived forever.
+ *
+ * Raising it to 90 days was rejected for the same reason. Against a lifetime
+ * with no upper bound, any finite window is either a data-loss bug or code
+ * that can never fire.
+ *
+ * Deleting rather than re-timing is the D7-D9 point. "How long evidence lives"
+ * is a fact ALREADY defined, once, by `pruneConversations`'s exemption clause;
+ * a second independent rule for the same fact is exactly the duplicate
+ * implementation the design rules forbid, and this is what it looks like when
+ * the two copies drift.
+ *
+ * Urgency, measured rather than assumed: the rule was clearing 0 rows, so
+ * nothing observable had broken yet. The oldest memory carrying an excerpt has
+ * `updated_at = 2026-08-23T15:29:03.655Z` (9 stores, read 2026-09-01), so the
+ * rule begins biting 2026-09-22 and would blank all 322 excerpts over the
+ * following 30 days. Shipping the read-path fix without this deletion would
+ * have restored today's behaviour automatically three weeks later — silently,
+ * with every test still green.
+ */
 /** Below this many active memories a store has no noise problem to solve. */
 export const DECAY_MIN_ACTIVE = 50
 /** Memories fed into one rollup (spec §12 derived layer). */

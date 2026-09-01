@@ -11,12 +11,21 @@ import { join } from 'node:path'
 import { MemoryService } from '../lib/service.js'
 import { GLOBAL_STORE_KEY } from '../lib/store/store.js'
 import { captureTurn, readTurn, pruneConversations } from '../lib/store/conversations.js'
-import { collectTurnEvents } from '../lib/transcript.js'
-import { buildContextProvider, renderFramed } from '../lib/recall/inject.js'
+import { collectTurnEvents, QUOTE_LABEL, QUOTE_SEQ } from '../lib/transcript.js'
+import { runExtractJob } from '../lib/pipeline/extract.js'
+import { buildContextProvider, renderFramed, FRAMING_HEADER } from '../lib/recall/inject.js'
+import { renderEntry, TRUNCATION_MARK } from '../lib/recall/render.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
-import { L0_RETENTION_MS, ROLLUP_TRANSCRIPT_CHARS, SOURCE_TURN_LIMIT } from '../lib/constants.js'
+import {
+  EXTRACT_EVENT_EXCERPT_CHARS,
+  L0_RETENTION_MS,
+  RECALL_PACKET_BUDGET_TOKENS,
+  ROLLUP_TRANSCRIPT_CHARS,
+  SOURCE_TURN_LIMIT,
+  WORST_SOURCE_SEQS,
+} from '../lib/constants.js'
 import { collectMetrics } from '../lib/metrics.js'
-import { RECALL_NO_MATCH } from '../lib/tools.js'
+import { RECALL_NO_MATCH, SOURCE_NOT_SHOWN, registerTools } from '../lib/tools.js'
 import { runDecayJob } from '../lib/pipeline/decay.js'
 import {
   enqueueRebuildIfOverflowing,
@@ -133,7 +142,185 @@ test('L0: pruning drops aged turns but never those a live memory cites', () => {
   cleanup(root)
 })
 
-test('L0 drill-down: memory_recall sourceOf returns the original conversation', async () => {
+/** One scripted LLM reply, shaped like the stream `llm-call.ts` consumes. */
+const textStream = (text) => ({
+  async *[Symbol.asyncIterator]() {
+    yield { type: 'text-delta', index: 0, text }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  },
+})
+
+/**
+ * Build a memory whose evidence row carries a REAL excerpt, by running the
+ * real extract job against real captured L0.
+ *
+ * Every byte here travels the production writer — `collectTurnEvents` ->
+ * `captureTurn` -> `runExtractJob` -> the `INSERT INTO evidence` inside it.
+ * A hand-written `INSERT INTO evidence (…, excerpt) VALUES (…)` was the
+ * obvious shortcut and is refused on purpose: ADR 0009 lesson 7 records what
+ * it costs. A change that violated D5 turned only 1 of 171 tests red precisely
+ * because the semantic tests played writer themselves, so they asserted what
+ * their author believed the writer did rather than what it does. A test for
+ * "`source` returns what the extractor stored" is worthless if the test is
+ * the thing that stored it.
+ * @param sessionId - the session the memory will cite.
+ * @param entries - raw session events for turn 1.
+ * @param sourceSeqs - the seqs the scripted model cites.
+ * @returns the store, the memory id, and the excerpt bytes as stored.
+ */
+const memoryWithExcerpt = async (service, principal, sessionId, entries, sourceSeqs) => {
+  const store = service.storeFor(principal, true)
+  store.tx(() => captureTurn(store, sessionId, 1, collectTurnEvents(turnEvents(1, entries), 1)))
+  const payload = {
+    sessionId,
+    turn: 1,
+    provider: 'p',
+    model: 'm',
+    promptVersion: 1,
+    payloadVersion: 1,
+  }
+  enqueueJob(store, 'extract', `e-${sessionId}`, payload, 0)
+  const reply = JSON.stringify({
+    candidates: [{ title: 'cited memory', body: 'cited body', kind: 'fact', sourceSeqs }],
+  })
+  const ctx = fakeCtx({ services: { llm: { stream: () => textStream(reply) } } })
+  const now = Date.now()
+  await runExtractJob(
+    ctx,
+    store,
+    claimNextJob(store, now, now + 60_000),
+    payload,
+    new AbortController().signal,
+  )
+  const row = store.db
+    .prepare(`SELECT memory_id, excerpt FROM evidence WHERE ref = ?`)
+    .get(sessionId)
+  return { store, id: row.memory_id, excerpt: row.excerpt }
+}
+
+test('L0 drill-down: sourceOf returns the CITED QUOTE, not the tail of the session', async () => {
+  // The defect this locks (ADR 0009): `source` used to read the session's last
+  // `SOURCE_TURN_LIMIT` rows, while cited lines sit anywhere in the session
+  // (measured p25=0.24 / p50=0.57 / p75=0.80). Only 9.3% of cited passages
+  // landed in that window and 6-8% survived the render budget, so a tool that
+  // promises 核对原话 answered with late-session context instead.
+  //
+  // The fixture reproduces exactly that geometry: the cited line is FIRST and
+  // is then buried under far more than any window holds. A tail read cannot
+  // reach it; reading the stored excerpt cannot miss it.
+  const { root, registry, principal, service } = setup()
+  const entries = [userMessageEvent('the cited sentence: we deploy with make deploy')]
+  for (let i = 0; i < SOURCE_TURN_LIMIT * 2; i++) {
+    entries.push(assistantMessageEvent(1, `later unrelated chatter number ${i}`))
+  }
+  const { id, excerpt } = await memoryWithExcerpt(service, principal, 'sess-quote', entries, [2])
+
+  const turns = await service.source(id, principal, SOURCE_TURN_LIMIT)
+  assert.equal(turns.length, 1, 'the quotation is ONE hit, whole and unsplit')
+  assert.match(
+    turns[0].text,
+    /the cited sentence/,
+    'the passage the extractor actually cited must reach the caller, however deep it is buried',
+  )
+  // The bytes are the stored bytes, unmodified. `deepEqual` on the string
+  // rather than a regex: "returned verbatim" is the promise.
+  assert.equal(turns[0].text, excerpt, 'the excerpt is returned byte-for-byte')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('sourceOf marks a quote as a quote, and conversation as conversation', async () => {
+  // ADR 0009 §5.3: an auditor must be able to tell "this is the passage the
+  // memory quotes" from "this is a slice of the surrounding conversation".
+  // Returning both as one undifferentiated batch of hits lets context be read
+  // as evidence, which is the confusion D3 exists to prevent. The fallback is
+  // not rare — 80 of 403 real evidence rows (19.9%) have no excerpt — so both
+  // shapes are live and both must name themselves.
+  const { root, registry, principal, service } = setup()
+
+  // (1) quote path — real extract writer, so a real excerpt exists.
+  const quoted = await memoryWithExcerpt(
+    service,
+    principal,
+    'sess-marked',
+    [userMessageEvent('the quoted words themselves')],
+    [2],
+  )
+  const quoteTurns = await service.source(quoted.id, principal, SOURCE_TURN_LIMIT)
+  assert.equal(quoteTurns.length, 1)
+  assert.equal(quoteTurns[0].label, QUOTE_LABEL, 'the quote says it is a quote')
+  assert.equal(quoteTurns[0].seq, QUOTE_SEQ, 'and carries no line number it does not have')
+
+  // (2) fallback path — `propose` writes evidence with no excerpt (real
+  // writer, real gap: propose runs mid-turn, so the L0 rows do not exist yet).
+  const store = service.storeFor(principal, false)
+  const { id: proposedId } = await service.propose(
+    { title: 'deploy with make', body: 'make deploy', kind: 'procedure' },
+    principal,
+  )
+  assert.equal(
+    store.db.prepare(`SELECT excerpt FROM evidence WHERE memory_id = ?`).get(proposedId).excerpt,
+    null,
+    'the fixture must reach the fallback for the reason production does: no excerpt',
+  )
+  store.tx(() =>
+    captureTurn(
+      store,
+      principal.session.id,
+      1,
+      collectTurnEvents(turnEvents(1, [userMessageEvent('we deploy with make deploy')]), 1),
+    ),
+  )
+  const fallbackTurns = await service.source(proposedId, principal, SOURCE_TURN_LIMIT)
+  assert.ok(fallbackTurns.length > 0)
+  for (const row of fallbackTurns) {
+    assert.notEqual(row.label, QUOTE_LABEL, 'conversation must never masquerade as a quotation')
+    assert.ok(row.seq >= 0, 'a captured line keeps its real seq')
+  }
+
+  // The distinction stated as the property that matters: the two paths are
+  // TELLABLE APART by a reader holding only the returned rows.
+  assert.notEqual(
+    quoteTurns[0].label,
+    fallbackTurns[0].label,
+    'an auditor can separate evidence from context using only what was returned',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('sourceOf never splits an excerpt, even one containing the separator', async () => {
+  // The forbidden shortcut, locked out. `extract.ts` joins cited segments with
+  // `\n---\n` and states at length that this is human audit material and NOT a
+  // machine-parseable format, because an event's own text can WRITE that
+  // sequence — measured, 25 of 778 real segments (3.21%) are already ambiguous.
+  // Splitting on it inside a fix meant to honour D3 would manufacture exactly
+  // the misattribution the comment warns about, so the excerpt is returned as
+  // one opaque blob.
+  //
+  // The fixture makes a HOSTILE case: the user's own message contains the
+  // separator. A consumer that splits sees a segment with no `[label]` and
+  // attributes it to nobody, or to the wrong source.
+  const { root, registry, principal, service } = setup()
+  const evil = 'first part\n---\nsecond part that no splitter may attribute'
+  const { id, excerpt } = await memoryWithExcerpt(
+    service,
+    principal,
+    'sess-evil',
+    [userMessageEvent(evil)],
+    [2],
+  )
+  assert.ok(excerpt.includes('\n---\n'), 'the fixture really does contain the separator')
+
+  const turns = await service.source(id, principal, SOURCE_TURN_LIMIT)
+  assert.equal(turns.length, 1, 'a separator inside the text must not become a second hit')
+  assert.equal(turns[0].text, excerpt, 'the excerpt is passed through byte-for-byte')
+  assert.ok(turns[0].text.includes(evil), 'including the caller`s own separator, unescaped')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('L0 drill-down FALLBACK: sourceOf returns the conversation when no quote was stored', async () => {
   const { root, registry, principal, service } = setup()
   const { id } = await service.propose(
     { title: 'deploy with make', body: 'make deploy', kind: 'procedure' },
@@ -153,7 +340,34 @@ test('L0 drill-down: memory_recall sourceOf returns the original conversation', 
   cleanup(root)
 })
 
-test('the L0 drill-down window survives the tool/call row-density change', async () => {
+/**
+ * A turn with more material than any window holds, shaped the way real
+ * sessions are: assistant reasoning interleaved with the calls it made and the
+ * results they returned.
+ */
+const denseTurnEntries = (rounds) => {
+  const entries = []
+  for (let i = 0; i < rounds; i++) {
+    entries.push(toolCallEvent(1, `c${i}`, 'bash', JSON.stringify({ command: `step ${i}` })))
+    entries.push(assistantMessageEvent(1, `assistant reasoning number ${i}`))
+    entries.push(toolResultEvent(1, `c${i}`, `result ${i}`))
+  }
+  return entries
+}
+
+/**
+ * The row-density rule below now applies to ONE of `source`'s two paths, so it
+ * is asserted as two tests instead of one.
+ *
+ * The single test it replaces would have stayed green through the change while
+ * quietly stopping to guard what it claimed. Its fixture used `propose`, whose
+ * evidence has no excerpt, so it silently became a fallback-only test — the
+ * `SOURCE_TURN_LIMIT` rule it names no longer governs the path most reads take,
+ * and nothing on screen would have said so. Splitting it states which path each
+ * rule belongs to, and adds the assertion the row rule cannot make: that the
+ * quote path is NOT row-budgeted at all.
+ */
+test('the L0 drill-down FALLBACK window survives the tool/call row-density change', async () => {
   // The read-side cost that nearly shipped unrecorded. `SOURCE_TURN_LIMIT` is a
   // ROW budget over a table whose density rose ~68% when `tool/call` capture
   // landed, so the same 20 rows bought a third less conversation — measured on
@@ -170,22 +384,20 @@ test('the L0 drill-down window survives the tool/call row-density change', async
   // because back then every row in the window was conversation.
   const PRE_CHANGE_LIMIT = 20
   const { root, registry, principal, service } = setup()
+  // `propose` is what puts this on the fallback path — it writes evidence with
+  // no excerpt — and the test now SAYS so rather than depending on it silently.
   const { id } = await service.propose(
     { title: 'deploy with make', body: 'make deploy', kind: 'procedure' },
     principal,
   )
   const store = service.storeFor(principal, false)
+  assert.equal(
+    store.db.prepare(`SELECT excerpt FROM evidence WHERE memory_id = ?`).get(id).excerpt,
+    null,
+    'this test governs the no-excerpt path; if this row ever gains one it is testing nothing',
+  )
 
-  // A turn with more material than any window will hold, shaped the way real
-  // sessions are: assistant reasoning interleaved with the calls it made and
-  // the results they returned.
-  const entries = []
-  for (let i = 0; i < PRE_CHANGE_LIMIT * 3; i++) {
-    entries.push(toolCallEvent(1, `c${i}`, 'bash', JSON.stringify({ command: `step ${i}` })))
-    entries.push(assistantMessageEvent(1, `assistant reasoning number ${i}`))
-    entries.push(toolResultEvent(1, `c${i}`, `result ${i}`))
-  }
-  const events = collectTurnEvents(turnEvents(1, entries), 1)
+  const events = collectTurnEvents(turnEvents(1, denseTurnEntries(PRE_CHANGE_LIMIT * 3)), 1)
   store.tx(() => captureTurn(store, principal.session.id, 1, events))
 
   const window = await service.source(id, principal, SOURCE_TURN_LIMIT)
@@ -203,6 +415,225 @@ test('the L0 drill-down window survives the tool/call row-density change', async
     window.some((row) => row.label.startsWith('tool-call:')),
     'the drill-down shows the request, not only the result',
   )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('the QUOTE path ignores SOURCE_TURN_LIMIT (it is still token-budgeted)', async () => {
+  // RENAMED. This was "the QUOTE path is not row-budgeted", which read as "no
+  // budget constrains it" — and that is false in a way that mattered: the
+  // render TOKEN budget constrains it very much, and an excerpt over that
+  // budget used to be dropped whole and reported as `RECALL_NO_MATCH`. The
+  // name is now the exact claim: this test governs `SOURCE_TURN_LIMIT` and
+  // NOTHING else. The token budget is governed at the tool layer, by
+  // 'sourceOf delivers a LONG excerpt through the real render' below.
+  //
+  // The complement of the test above, and the reason the split was necessary.
+  // `SOURCE_TURN_LIMIT` governs a window over L0 rows; a stored quotation is
+  // not a window over anything, so density cannot erode it and the row limit
+  // must not apply. The same dense turn that forces the fallback to spend its
+  // whole budget yields exactly one hit here.
+  const { root, registry, principal, service } = setup()
+  const entries = denseTurnEntries(20)
+  entries.push(userMessageEvent('the decisive sentence, cited by the model'))
+  const citedSeq = turnEvents(1, entries).find(
+    (event) => event.type === 'user/message',
+  ).seq
+  const { id, excerpt } = await memoryWithExcerpt(
+    service,
+    principal,
+    'sess-dense',
+    entries,
+    [citedSeq],
+  )
+
+  const turns = await service.source(id, principal, SOURCE_TURN_LIMIT)
+  assert.equal(turns.length, 1, 'a quotation is one hit, not a windowful of rows')
+  assert.equal(turns[0].label, QUOTE_LABEL)
+  assert.equal(turns[0].text, excerpt, 'delivered whole — no row budget was spent on it')
+  assert.match(turns[0].text, /the decisive sentence/)
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * Drive the REAL `memory_recall` tool — execute plus the output renderer — and
+ * return both the structured value and the exact text a model would receive.
+ *
+ * The renderer is the point. Three separate mutation experiments survived the
+ * whole suite before this existed (silently truncating the excerpt in
+ * `service.source`; hard-coding the hit's `kind` to `'fact'`; and the budget
+ * cliff itself), because no test carried a quotation through `renderFramed` to
+ * the bytes that actually reach the model. Asserting on `service.source`'s
+ * return value alone cannot see any of them: it stops one layer above where
+ * the damage happens.
+ */
+const realRecallTool = (ctx, memory) => {
+  let captured
+  registerTools({ ...ctx, tools: { register: (tool) => {
+    if (tool.name === 'memory_recall') captured = tool
+  } } }, memory)
+  assert.ok(captured, 'memory_recall must be registered')
+  return async (args, agent) => {
+    const value = await captured.execute(args, { agent })
+    const text = captured.output.render(args, value).map((block) => block.text).join('')
+    return { value, text }
+  }
+}
+
+test('sourceOf delivers a LONG excerpt through the real render, marked, never as "no match"', async () => {
+  // THE regression for the render-budget cliff, and the one test that runs the
+  // whole path: real writer -> real `service.source` -> real tool execute ->
+  // real `renderFramed`, at the real budget.
+  //
+  // The defect: `renderEntry` indents every `\n` by two spaces, so a stored
+  // excerpt renders at up to 3x its stored length. The quotation path returns
+  // exactly ONE hit, so when that hit priced over `RECALL_PACKET_BUDGET_TOKENS`
+  // `withinBudget` skipped it, `renderFramed` returned '', and `tools.ts`
+  // substituted `RECALL_NO_MATCH` — telling the model "No stored memories
+  // matched." about a memory it had just found and read. Measured with the
+  // real renderer: 4165 stored chars -> 8236 rendered -> 2059 tokens against a
+  // 1820 budget -> 0 characters delivered.
+  //
+  // The fixture is built from the WRITER's own constants, so it is a shape the
+  // writer can really produce rather than a number copied here: newline-dense
+  // text (deep-indented YAML and line-per-value tool output are its everyday
+  // forms) at the per-event cap, cited `WORST_SOURCE_SEQS` times.
+  const { root, registry, principal, ctx, service } = setup()
+  const lines = Array.from({ length: EXTRACT_EVENT_EXCERPT_CHARS / 2 }, (_, i) => `${i % 10}`)
+  const entries = Array.from({ length: WORST_SOURCE_SEQS }, () =>
+    userMessageEvent(`the cited passage\n${lines.join('\n')}`),
+  )
+  const citedSeqs = turnEvents(1, entries)
+    .filter((event) => event.type === 'user/message')
+    .map((event) => event.seq)
+  const { id, excerpt } = await memoryWithExcerpt(
+    service,
+    principal,
+    'sess-long',
+    entries,
+    citedSeqs,
+  )
+  // The fixture must actually exceed the budget, or this test proves nothing.
+  // Asserted rather than assumed: every excerpt in every other fixture is
+  // under 64 characters, which is exactly why the length dimension — the
+  // dimension the defect lives in — went uncovered.
+  const renderedTokens = estimateTokens(
+    renderEntry({ id: `seq ${QUOTE_SEQ}`, kind: QUOTE_LABEL, title: 'human', body: excerpt }, true),
+  )
+  assert.ok(
+    renderedTokens > RECALL_PACKET_BUDGET_TOKENS,
+    `the fixture renders at ${renderedTokens} tokens, inside the ${RECALL_PACKET_BUDGET_TOKENS} ` +
+      'budget — it no longer reproduces the cliff and must be made denser',
+  )
+
+  const recall = realRecallTool(ctx, service)
+  const { value, text } = await recall({ sourceOf: id }, principal)
+
+  // 1. The cliff itself: the model is NOT told the memory does not exist.
+  assert.notEqual(text, RECALL_NO_MATCH, 'an existing, readable memory is never "no match"')
+  assert.doesNotMatch(text, /No stored memories matched/)
+  // 2. Something real arrives, and it is the cited words.
+  assert.ok(text.length > 0, 'the drill-down delivers a packet, not the empty string')
+  assert.match(text, /the cited passage/, 'the passage the extractor cited reaches the model')
+  // 3. Incomplete delivery SAYS it is incomplete — a cut quotation presented as
+  //    a whole one would be a worse audit failure than the empty packet was.
+  assert.ok(text.includes(TRUNCATION_MARK), 'the truncation is visible, not silent')
+  assert.ok(TRUNCATION_MARK !== '', 'an empty mark would make the assertion above vacuous')
+  // 4. It fits the budget it was cut to fit.
+  assert.ok(
+    estimateTokens(text) <= RECALL_PACKET_BUDGET_TOKENS + estimateTokens(FRAMING_HEADER) + 2,
+    'the cut packet is inside the budget that forced the cut',
+  )
+  // 5. BLIND SPOT 2: the quote/context distinction survives to the rendered
+  //    text. Hard-coding `kind: turn.label` to `'fact'` in `tools.ts` left all
+  //    216 tests green; §5.3's promise that an auditor can tell a quotation
+  //    from surrounding conversation had no guard at the layer that delivers it.
+  assert.equal(value.hits[0].kind, QUOTE_LABEL, 'the hit names itself a quotation')
+  assert.match(text, /^- \[quote\] /m, 'and the RENDERED bullet says so too')
+  assert.equal(value.hits[0].id, `seq ${QUOTE_SEQ}`, 'at an id no L0 line can hold')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('sourceOf never silently shortens a quotation that fits', async () => {
+  // BLIND SPOT 1. Adding `cited.excerpt.slice(0, 200)` to the quotation branch
+  // of `service.source` left all 216 tests green: every fixture excerpt was
+  // under 64 characters, and `assert.equal(turns[0].text, excerpt)` compares
+  // the function's output against the value that same function read — it
+  // cannot see a truncation that happens before both.
+  //
+  // So this asserts LENGTH against the writer's own output, with an excerpt
+  // comfortably past any plausible silent cut but inside the render budget:
+  // what arrives at the model must contain the END of the quotation, not just
+  // its head.
+  const { root, registry, principal, ctx, service } = setup()
+  // Sized against the WRITER's own per-segment cap, not a number picked here:
+  // `capEventText` cuts each cited event at `EXTRACT_EVENT_EXCERPT_CHARS`, so a
+  // longer fixture would lose its tail to a legitimate, marked truncation and
+  // this test would be asserting the writer's cap rather than the read path's
+  // fidelity. Just under the cap is the longest excerpt that must arrive whole.
+  const tail = 'CLOSING-MARKER'
+  const head = 'OPENING-MARKER '
+  const filler = 'the middle of the quotation, '.repeat(
+    Math.floor((EXTRACT_EVENT_EXCERPT_CHARS - head.length - tail.length - 10) / 29),
+  )
+  const entries = [userMessageEvent(`${head}${filler}${tail}`)]
+  const citedSeq = turnEvents(1, entries).find((e) => e.type === 'user/message').seq
+  const { id, excerpt } = await memoryWithExcerpt(service, principal, 'sess-mid', entries, [
+    citedSeq,
+  ])
+  // Far past any plausible silent `slice()`, and — critically — past the 64
+  // characters every other fixture stops at, which is why this dimension was
+  // uncovered. Also verified UNCUT by the writer, so a missing tail below can
+  // only be the read path's doing.
+  assert.ok(excerpt.length > 300, `the writer stored ${excerpt.length} chars; too short to test`)
+  assert.ok(!excerpt.endsWith('…'), 'the writer stored this whole; it did not cap it')
+
+  const { value, text } = await realRecallTool(ctx, service)({ sourceOf: id }, principal)
+  // The whole excerpt fits this budget, so nothing may be cut at all.
+  assert.equal(value.hits[0].body, excerpt, 'the stored bytes arrive whole')
+  assert.ok(!text.includes(TRUNCATION_MARK), 'an excerpt that fits is not marked as cut')
+  // Both ENDS must be present. Head-only assertions are what a `slice()` passes.
+  assert.match(text, /OPENING-MARKER/)
+  assert.match(text, /CLOSING-MARKER/, 'the TAIL of the quotation survives to the model')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('an unshowable sourceOf reports the SOURCE as missing, never the memory', async () => {
+  // D-1b. `tools.ts` shared `RECALL_NO_MATCH` between both modes. In query mode
+  // it is right; in `sourceOf` mode it is ALWAYS false, because reaching the
+  // renderer means the memory was found, authorised and read.
+  //
+  // It also polluted a decision input: `metrics.ts` counts that exact string in
+  // L0 to compute the recall miss rate that ADR 0005 uses to decide whether
+  // retrieval needs embeddings. A drill-down showing nothing is not a failed
+  // SEARCH, and counting it as one biases that number.
+  const { root, registry, principal, ctx, service } = setup()
+  // `propose` writes evidence with no excerpt and captures no turn, so neither
+  // path can show anything — the real shape of "the source cannot be shown".
+  const { id } = await service.propose(
+    { title: 'deploy with make', body: 'make deploy', kind: 'procedure' },
+    principal,
+  )
+  const { value, text } = await realRecallTool(ctx, service)({ sourceOf: id }, principal)
+  assert.equal(value.hits.length, 0, 'nothing could be shown')
+  assert.equal(text, SOURCE_NOT_SHOWN)
+  assert.notEqual(text, RECALL_NO_MATCH, 'the memory exists; saying otherwise is a lie')
+  assert.doesNotMatch(
+    text,
+    /No stored memories matched/,
+    'and the miss-rate metric must not count this drill-down as a search miss',
+  )
+  // The two causes are distinguished for the reader: evidence too large to
+  // render is not the same event as a conversation that cannot be reached.
+  assert.match(text, /too large|not readable/)
+
+  // The query mode is UNCHANGED — the shared constant keeps its meaning and
+  // its bytes, so the historical miss-rate series stays comparable.
+  const miss = await realRecallTool(ctx, service)({ query: 'nothing matches this' }, principal)
+  assert.equal(miss.text, RECALL_NO_MATCH, 'a real search miss still reads as one')
   registry.dispose()
   cleanup(root)
 })
@@ -679,26 +1110,49 @@ test('decay: revival happens in the batch, never on the read path (D4)', async (
   cleanup(root)
 })
 
-test('decay: excerpts compact but refs survive (suppression outlives the quote)', () => {
-  const { root, registry } = openRegistry()
-  const store = registry.open('k1')
-  const old = Date.now() - 200 * 86_400_000
-  store.tx(() => {
-    store.db
-      .prepare(
-        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
-         VALUES ('m1','fact','repo-local','active','t','b','human',0,?)`,
-      )
-      .run(old)
-    store.db
-      .prepare(`INSERT INTO evidence (memory_id, kind, ref, excerpt) VALUES ('m1','session','sess-9','the exact words')`)
-      .run()
-  })
-  const report = runDecayJob(store, claimDecay(store), Date.now())
-  assert.equal(report.excerptsCompacted, 1)
-  const row = store.db.prepare(`SELECT ref, excerpt FROM evidence WHERE memory_id = 'm1'`).get()
-  assert.equal(row.excerpt, null, 'the quote ages out')
-  assert.equal(row.ref, 'sess-9', 'the ref never does — source suppression depends on it')
+test('decay leaves evidence entirely alone: the quote outlives any age', async () => {
+  // Replaces 'decay: excerpts compact but refs survive'. That test asserted the
+  // 30-day `EXCERPT_COMPACT_MS` rule, which is DELETED: once `service.source`
+  // reads `evidence.excerpt` as its primary evidence path, nulling it stops
+  // being "drop an unread column" and becomes "destroy the proof D3 promises".
+  //
+  // The old test's second assertion is kept and STRENGTHENED rather than
+  // dropped, because it carried independent value that no other test covers:
+  // `extract.ts`'s source suppression looks tombstoned memories up by
+  // `evidence.ref`, and only this test watched decay leave that ref alone.
+  // (`service.test.mjs` checks `forget` keeps the ref; nothing else checked
+  // decay.) Its assertion is now the stronger one the deletion licenses: decay
+  // must not modify the evidence row AT ALL.
+  //
+  // Ages are deliberately absurd — 200 days is past every window this codebase
+  // has ever had, including the 90-day L0 retention — so the test states "no
+  // finite age compacts an excerpt" rather than pinning a specific threshold
+  // that a future constant could quietly slip under.
+  const { root, registry, principal, service } = setup()
+  const { store, id, excerpt } = await memoryWithExcerpt(
+    service,
+    principal,
+    'sess-9',
+    [userMessageEvent('the exact words an auditor will want')],
+    [2],
+  )
+  assert.ok(excerpt, 'the real writer stored a quotation to begin with')
+  const before = store.db.prepare(`SELECT ref, excerpt FROM evidence WHERE memory_id = ?`).get(id)
+  // Age the memory far past every retention window in the system.
+  store.db
+    .prepare(`UPDATE memories SET updated_at = ? WHERE id = ?`)
+    .run(Date.now() - 200 * 86_400_000, id)
+
+  runDecayJob(store, claimDecay(store), Date.now())
+
+  const after = store.db.prepare(`SELECT ref, excerpt FROM evidence WHERE memory_id = ?`).get(id)
+  assert.equal(after.excerpt, before.excerpt, 'the quote does NOT age out — it is the evidence')
+  assert.equal(after.ref, before.ref, 'the ref never does — source suppression depends on it')
+  // The end-to-end consequence, which is what actually regressed: the audit
+  // path still answers after the memory has sat untouched for 200 days.
+  const turns = await service.source(id, principal, SOURCE_TURN_LIMIT)
+  assert.equal(turns.length, 1)
+  assert.equal(turns[0].text, excerpt, 'sourceOf still shows the cited words after decay ran')
   registry.dispose()
   cleanup(root)
 })

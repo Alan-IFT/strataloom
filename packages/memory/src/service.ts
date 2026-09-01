@@ -22,6 +22,7 @@ import {
   type ResolvedMember,
 } from './store/group.ts'
 import type { TranscriptEvent } from './transcript.ts'
+import { QUOTE_LABEL, QUOTE_SEQ } from './transcript.ts'
 import {
   BODY_MAX_CHARS,
   TITLE_MAX_CHARS,
@@ -37,6 +38,7 @@ import type {
   MemoryHit,
   MemoryScopeListing,
   AttributedMemoryHit,
+  Provenance,
   ProposeResult,
   ShareReport,
   RecallQuery,
@@ -487,13 +489,132 @@ export class MemoryService extends Service {
   }
 
   /**
-   * The conversation behind one memory (L0 drill-down). Returns the stored
-   * turns of the session that memory cites — the "show me the original
-   * words" path that makes provenance checkable rather than merely claimed.
+   * The words behind one memory (L0 drill-down). Returns the QUOTATION the
+   * extractor actually cited when it wrote the memory, and falls back to a
+   * window of the cited session's stored turns when no quotation exists —
+   * the "show me the original words" path that makes provenance checkable
+   * rather than merely claimed.
    *
    * This is a MODE of recall, not a fourth tool: "what was actually said" is
    * a narrowing of "what do we know", and the spec rejects growing the tool
    * surface for it.
+   *
+   * ## Why the quotation is the primary path (ADR 0009)
+   *
+   * The fallback used to be the ONLY path, and it did not answer the question
+   * the tool asks. `readSessionTurns` reads the session's LAST
+   * `SOURCE_TURN_LIMIT` rows, while the lines a memory actually cites are
+   * spread evenly through the session (measured relative position p25=0.24 /
+   * p50=0.57 / p75=0.80): only 9.3% of cited passages fell inside that tail
+   * window at all, and the render budget then cut a further 34.3%. Two
+   * independent methods over WAL-safe copies of all 9 real stores agree that
+   * 6-8% of cited passages reached the model, and that 88-93% of memories
+   * delivered not one cited character. The control rules out "the words are
+   * gone": the same probes hit 99.5% against full-session L0. The content was
+   * in the store; it was not being delivered.
+   *
+   * `evidence.excerpt` already holds exactly the right bytes — the passages
+   * the extractor quoted when it distilled the memory — so the fix is to
+   * return what was already stored rather than to search for it again.
+   *
+   * ## The excerpt is returned WHOLE, deliberately unparsed
+   *
+   * `extract.ts` joins the cited segments with `\n---\n` and states, at
+   * length, that this is human-readable audit material and NOT a
+   * machine-parseable format: an event's own text can write that separator,
+   * and 25 of 778 real segments (3.21%) are already ambiguous because of it.
+   * Splitting here — inside a fix whose entire purpose is to honour D3 —
+   * would reintroduce the misattribution that comment exists to warn about.
+   *
+   * Not splitting also costs nothing on today's data. Replayed over every
+   * excerpt stored on this machine through the real `renderFramed` at
+   * `RECALL_PACKET_BUDGET_TOKENS` (322 excerpts across the 9 stores, read
+   * 2026-09-01 — an absolute that grows, hence the timestamp and the store
+   * set): 322/322 (100%) delivered whole, render cost p50=112 / p90=205 /
+   * max=471 tokens, largest rendered packet 2086 characters. So this method
+   * returns the excerpt byte-for-byte: no split, no truncation, no reordering.
+   *
+   * ## What that measurement does NOT license
+   *
+   * "It fits" is a fact about the excerpts that HAPPEN to be stored, not about
+   * the excerpts the writer may store, and an earlier revision of this comment
+   * asserted the second while measuring only the first ("the whole excerpt
+   * fits with room to spare"). It is false as a general claim: `renderEntry`
+   * indents every `\n` by two spaces, so a rendered excerpt costs up to 3x its
+   * stored length, and the worst excerpt `extract.ts` can legally write —
+   * `WORST_SOURCE_SEQS` segments of `EXTRACT_EVENT_EXCERPT_CHARS` — prices at
+   * roughly 1.8x this budget. Deep-indented YAML and line-per-value output are
+   * the ordinary shapes that approach it. Today's margin is ~3.9x on p99, so
+   * nothing is broken now; the point is that the margin is DATA, not a bound.
+   *
+   * Where the bound actually lives: this method never truncates, and the
+   * renderer takes the loss visibly instead. `tools.ts` passes this hit through
+   * `truncatedToBudget`, which cuts and MARKS an over-budget body rather than
+   * letting `withinBudget` drop it whole — because dropping the only hit made
+   * the tool answer `RECALL_NO_MATCH` for a memory it had just found. The
+   * write path is deliberately not capped to fit the read budget: that would
+   * destroy stored evidence to satisfy a display container (see
+   * `truncatedToBudget` for the rejected alternatives and the measurements).
+   *
+   * ## Both paths self-identify (ADR 0009 §5.3)
+   *
+   * An auditor must be able to tell "this is the quotation the extractor
+   * used" from "this is a slice of the surrounding conversation", and the
+   * fallback is not an edge case: 80 of 403 real evidence rows (19.9%, all of
+   * them `principal-explicit`) have no excerpt, so roughly a fifth of reads
+   * take it. The two paths therefore differ in fields the tool ALREADY
+   * renders, with no new schema and no second renderer:
+   *
+   *   - `label` (rendered as the hit's `kind`) is `quote` on this path.
+   *     `classify` in `transcript.ts` is the only producer of L0 labels and
+   *     its range is exactly `user` / `assistant` / `context` / `subagent[:id]`
+   *     / `tool:<name>` / `tool-call:<name>`, so a fallback row can never
+   *     read `quote` — a hostile tool name yields `tool:quote`, never the
+   *     bare word. This is the signal an auditor reads.
+   *   - `seq` is `QUOTE_SEQ` rather than a line number, because a quotation
+   *     is not located at one L0 row: it is the join of every row the
+   *     extractor cited. A session event's `seq` is a non-negative counter,
+   *     so a negative value cannot collide with a real line, and rendering it
+   *     as an id that is obviously not a line number is the point — the
+   *     alternative, borrowing some cited row's seq, would state a precise
+   *     origin the excerpt does not have.
+   *
+   * `provenance` (rendered as the hit's `title`) is the MEMORY's own stored
+   * provenance, not an invented value. That column is written by
+   * `provenanceFor` as the minimum trust across exactly the seqs this excerpt
+   * quotes, so it is already the correct trust label for these bytes,
+   * computed once by the single implementation that owns the rule and stored
+   * in a `CHECK`-constrained domain that this path must not step outside.
+   *
+   * ## ACCEPTED TRADE-OFF: the label is the excerpt's floor, not each line's
+   *
+   * Consequence, recorded rather than discovered later. `provenanceFor` takes
+   * the MINIMUM trust over every cited seq, and the excerpt concatenates those
+   * seqs' texts — so a quotation mixing a human sentence with a tool result is
+   * labelled `tool-output` as a whole, and the human sentence inside it is
+   * rendered under that label. Measured over the real stores (2026-09-01):
+   * 127 of 322 excerpts (39.4%) carry a label lower than some segment they
+   * contain. The rendered line then reads
+   * `- [quote] (id seq -1) tool-output: [user] <a human sentence>`, in which
+   * the `[user]` segment prefix and the `tool-output` title appear to
+   * disagree.
+   *
+   * They do not disagree; they answer different questions. The title is the
+   * trust of the excerpt AS ONE OBJECT — the level at which it may be acted on
+   * — and the per-segment `[label]` written by `extract.ts` says where each
+   * piece came from. Both are true, and the direction is fail-CLOSED: the
+   * error is always toward less trust. Measured over the same population,
+   * over-trust occurs 0 times — no tool bytes are ever labelled `human`.
+   *
+   * NOT FIXED, deliberately. The only fix that would make the title
+   * per-segment is to split the excerpt on `\n---\n` and label the pieces,
+   * which is precisely what `extract.ts` (366-389) forbids in writing and what
+   * 25 of 778 real segments already defeat by containing the separator. The
+   * alternatives — a new schema, a second renderer, a per-segment provenance
+   * column — all buy a cosmetic improvement with the misattribution risk this
+   * whole change exists to remove. A conservative label plus honest per-segment
+   * prefixes is the correct trade; the confusion is a labelling artifact, not a
+   * trust failure.
    */
   async source(id: MemoryId, agent: Agent, limit: number): Promise<readonly TranscriptEvent[]> {
     if (!isLiveAgent(this.ctx, agent)) {
@@ -505,21 +626,54 @@ export class MemoryService extends Service {
     // recall without widening this would have shipped exactly that.
     const stores = [...this.readableStores(agent, true), ...(await this.groupStores(agent))]
     for (const store of stores) {
+      // ONE query for both paths. The excerpt and the ref are two columns of
+      // the same evidence row and the provenance is one join away, so a second
+      // lookup would only create a window in which they could disagree.
       const cited = store.db
         .prepare(
-          `SELECT e.ref FROM evidence e JOIN memories m ON m.id = e.memory_id
+          `SELECT e.ref, e.excerpt, m.provenance FROM evidence e JOIN memories m ON m.id = e.memory_id
            WHERE e.memory_id = ? AND e.kind = 'session' AND m.status != 'tombstone'
            LIMIT 1`,
         )
-        .get(id) as { ref: string } | undefined
+        .get(id) as { ref: string; excerpt: string | null; provenance: Provenance } | undefined
       if (cited === undefined) continue
+      // `trim() !== ''`, not merely `!== null`. A whitespace-only excerpt would
+      // otherwise take the quotation branch and render as a `[quote]` entry
+      // with a label, an id and no readable content — a claim to be showing
+      // the cited words while showing none. Falling through to the session
+      // window instead gives the caller something real. Measured: 0 such rows
+      // exist today across the 9 stores (2026-09-01), so this changes no
+      // current behaviour; it is here because "the writer never emits that"
+      // is a fact about today's data, and the branch above it is the one that
+      // has to be true for every input.
+      if (cited.excerpt !== null && cited.excerpt.trim() !== '') {
+        // Verbatim, whole, one hit. See the header: splitting on `\n---\n` is
+        // what `extract.ts` forbids, and delivery is already 100% without it.
+        return [
+          { seq: QUOTE_SEQ, label: QUOTE_LABEL, text: cited.excerpt, provenance: cited.provenance },
+        ]
+      }
+      // No quotation was stored (every real case is `principal-explicit`,
+      // whose writer has no cited seqs to quote): fall back to the session
+      // window, whose behaviour is unchanged.
+      //
       // A personal memory can cite a session whose transcript lives in the
       // repo store, so look for the turns in every readable store.
       for (const source of stores) {
         const turns = readSessionTurns(source, cited.ref, limit)
         if (turns.length > 0) return turns
       }
-      return [] // cited, but the conversation has aged out of retention
+      // Cited, but no readable store holds that session's turns. Retention is
+      // only ONE of the reasons, and the comment here used to name it as the
+      // only one — untrue, and measurably so: the cited session may simply
+      // live in a store this agent cannot read (a personal memory citing
+      // another repository's transcript), which several rows in the real
+      // global store are. `pruneConversations` also exempts any session a
+      // live memory cites, so ageing out is the rarer branch, not the common
+      // one. The two are indistinguishable from here — both are "absent" —
+      // and `tools.ts` therefore reports the disjunction rather than picking
+      // a cause it cannot know.
+      return []
     }
     throw new MemoryInputError(`no memory with id ${id}, or it was forgotten`)
   }
@@ -745,6 +899,19 @@ export class MemoryService extends Service {
            WHERE id = ?`,
         )
         .run(Date.now(), id)
+      // This statement's MEANING changed when `source` began reading
+      // `evidence.excerpt`, even though its bytes did not. It used to be
+      // hygiene — dropping a quote nobody would read again. It is now the
+      // byte-level execution point of D5: forgetting a memory must destroy the
+      // words it quoted, not merely hide the row. It pairs with `source`'s
+      // `m.status != 'tombstone'` filter, which stops the read one layer
+      // earlier; keeping both is defence in depth, and this is the half that
+      // survives a bug in the other.
+      //
+      // It is also, today, UNREACHABLE as a data-loss risk: the same
+      // transaction has already tombstoned the memory, so no read path can
+      // reach this row's excerpt anyway. Kept rather than deleted precisely
+      // because the filter it backs up is one predicate in one query.
       store.db.prepare(`UPDATE evidence SET excerpt = NULL WHERE memory_id = ?`).run(id)
       const count = store.db
         .prepare(`SELECT count(*) AS n FROM evidence WHERE memory_id = ?`)

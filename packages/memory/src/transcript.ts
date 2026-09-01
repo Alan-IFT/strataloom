@@ -23,6 +23,34 @@ export interface TranscriptEvent {
 }
 
 /**
+ * The two markers that identify a `TranscriptEvent` carrying a stored
+ * QUOTATION (`evidence.excerpt`) rather than a captured L0 line.
+ *
+ * They live HERE, beside `classify`, because `classify` is what makes them
+ * safe. It is the only producer of L0 labels, and its total range is `user`,
+ * `assistant`, `context`, `subagent[:<id>]`, `tool:<name>` and
+ * `tool-call:<name>` — every dynamic form carries a prefix and a `:`, so no
+ * captured row can ever be labelled the bare word `quote`, not even from a
+ * tool that names itself `quote` (that yields `tool:quote`). Putting the
+ * marker in any other module would leave that non-collision argument at a
+ * distance from the code it depends on, and the next person to widen
+ * `classify`'s range would have no reason to look for it.
+ *
+ * This is why `service.source` needs no new column and no schema change: the
+ * distinction an auditor must be able to draw — "am I reading the extractor's
+ * quotation, or a slice of surrounding conversation?" — rides fields that
+ * `tools.ts` already maps onto the hit shape (`label` → `kind`, `seq` → `id`).
+ *
+ * `QUOTE_SEQ` is negative on purpose. A session event's `seq` is a
+ * non-negative counter, so this cannot collide with a real line, and it must
+ * NOT be readable as one: an excerpt is the join of every row the extractor
+ * cited, so it has no single originating line. Borrowing one cited row's seq
+ * would state a precise origin the bytes do not have.
+ */
+export const QUOTE_LABEL = 'quote'
+export const QUOTE_SEQ = -1
+
+/**
  * Tool names whose results carry a child agent's own words.
  *
  * Only true in FOREGROUND delegation (`backgroundMode: one-shot`, or an
@@ -70,7 +98,14 @@ const SENDER_ID_PREFIX = 8
  * arbitrarily long is a channel.
  */
 const TOOL_NAME_CHARS = /[^A-Za-z0-9_.:-]/g
-const TOOL_NAME_MAX = 64
+/**
+ * Exported because the quotation guard in `tools.ts` must build the LONGEST
+ * label `classify` can emit in order to price the worst stored excerpt, and
+ * retyping 64 there would be the "restate the number" failure that file has
+ * already paid for once. The guard points at this constant, so widening a
+ * label moves the guard by itself.
+ */
+export const TOOL_NAME_MAX = 64
 
 /** Characters a sender's session id may keep in a label. */
 const SENDER_ID_CHARS = /[^A-Za-z0-9_-]/g

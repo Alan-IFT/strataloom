@@ -161,7 +161,7 @@ packages/memory/                      # 实际布局（v2.7 校准，src 约 1.9
 │       ├── prompts.ts    # 管线提示词（带版本号；长度目标由 constants 插值）
 │       ├── extract.ts    # 读自有 L0 ⇒ 候选 + 代码判定 provenance
 │       ├── reconcile.ts  # 批量去重/冲突/取代，一次提交
-│       ├── decay.ts      # 每日：沉睡 / 复活 / excerpt 压实（纯 SQL）
+│       ├── decay.ts      # 每日：沉睡 / 复活（纯 SQL；不碰 evidence）
 │       └── rebuild.ts    # 溢出时的 rollup，revision 双重围栏
 ├── test/                 # §10（153 测试）
 └── package.json          # peer: @deepseek-ai/dsh-*；node >= 22（node:sqlite）
@@ -831,7 +831,7 @@ P2 增补：`metrics.jsonl` 汇总、retrieved 率、overturn 率、条目分布
 |---|---|---|
 | ~~**derived 摘要层**~~ **已实现 v2.8**（**未引入 PacketCache**——产物落库后读路径仍是一条毫秒级 SQL，缓存仍是纯概念成本） | Packet 溢出率高 / L1 直注信噪比不足 / 注入 SQL 慢语句告警成为常态 | 先**一个** derived 层（非 L2/L3——两个粒度是未验证假设，且 v2.3 从未定义二者语义差异）。重建从毫秒级 SQL 变 LLM 级 ⇒ 此时才引入 PacketCache 与 store_revision（schema v3，meta 存储）：失效由 **schema v5 触发器**承担（v2.7 更正：原设计挂在 commitL1Mutation 上，漏掉走 commitClaimedJob 的管线写入 ⇒ 过期摘要遮蔽新事实且不自愈）；入队 rebuild(expectedRevision)；rebuild **认领后先做 revision 预检**（不符围栏 done，不烧 LLM）、提交时再围栏；缓存一致性承诺按当时进程模型如实声明（v2.4 教训：勿把单进程说成单 host）；产物 provenance='derived'、注入资格随最低来源；compact 键含 revision；forget 拒绝 derived id |
 | **连续 trust 公式**（历轮评审拒绝，维持） | 离散规则出现真实误判样本 | 乘法模型存分量读时计算（v2.3 §2.3 存档）；常数集中、边界测试锁定、不 settings 化 |
-| ~~**dormant/decay/archived**~~ **已实现 v2.8** | 库条目数使 recall 信噪比下降 | decay 每日批量 commitL1Mutation；**复活由 decay 批量完成（近期 last_hit_at ⇒ 回 active），不在 recall 读路径**（读操作不得触发权威变化）；excerpt 30 天压实由 decay 顺带 |
+| ~~**dormant/decay/archived**~~ **已实现 v2.8** | 库条目数使 recall 信噪比下降 | decay 每日批量 commitL1Mutation；**复活由 decay 批量完成（近期 last_hit_at ⇒ 回 active），不在 recall 读路径**（读操作不得触发权威变化）；**decay 不再触碰 evidence**——原 30 天 excerpt 压实已删除，因 `sourceOf` 现以 excerpt 为主证据源，压实即销毁 D3 证据 |
 | ~~global 库 / preference~~ **已实现 v2.7** | ~~用户明确需要跨仓库偏好~~ 触发条件已满足 | 已落地：`scope:'personal'` 显式入口（不经内容分类隐式跨库）+ 数据驱动双向 guard。**仍延后**：global 库的自动 extract（跨仓偏好的自动提取尚无信噪比数据，显式入口已覆盖当前需求） |
 | ~~**投影 + 审批**~~ **已实现 v2.8** | 团队共享需求出现 | team-shareable 白名单 + 秘密扫描 + revision 自弃（v2.3 §7 存档）；human_confirmed 经平台 approval |
 | **向量索引 / 多 host 一致性 / rekey**（向量索引在拒绝清单，维持） | 各自指标 | P3 |
@@ -848,7 +848,7 @@ P2 增补：`metrics.jsonl` 汇总、retrieved 率、overturn 率、条目分布
 |---|---|---|
 | **显式去重/更新** | `propose` 返回 `similar`（同 kind 的近义活跃条目），模型下次保存时用 `replaces` 收敛；替换与退役同事务 | 不新增 LLM 调用——调用方模型本就看得见既有条目，**语义判断留给模型，簿记留给代码**。这是唯一一条原设计承诺而 v2.6 漏掉的能力（实测：同一偏好存 3 次得 3 份） |
 | **§9 观测指标** | 每周期一条结构化日志：packet tokens、retrieved 率、overturn 率、pending job 最老年龄、dead-letter 数、L0 行数 | **全部由 SQL 快照算出，零内存计数器**——计数器要在每个写入点维护、跨进程漂移、重启归零 |
-| **dormant/decay** | 每日 job：闲置沉睡 / 近期命中复活 / excerpt 压实；`dormant` 加入排除集 | 复活在 batch 内完成，**读路径零权威写**（D4）；活跃条目低于阈值时整个 pass 空转——小库没有噪音问题可解 |
+| **dormant/decay** | 每日 job：闲置沉睡 / 近期命中复活；`dormant` 加入排除集 | 复活在 batch 内完成，**读路径零权威写**（D4）；活跃条目低于阈值时整个 pass 空转——小库没有噪音问题可解；**证据存活期只由 `pruneConversations` 的豁免子句定义一次**（D7–D9） |
 | **derived 摘要层 + 投影审批** | 溢出时 rebuild 出一条 rollup 行替代原始集；revision 双重围栏（认领后预检不烧 LLM、提交时再检）。**失效由 schema v5 的三个触发器承担**（v2.7 修正，见下）。投影三道闸：白名单 → 平台 approval → 秘密扫描 | **未引入 PacketCache**：产物落库后读路径仍是一条 SQL，v2.5 的论证依然成立。**未加第四个工具**：share 是 `memory_forget` 的一个模式（同为"按 id 操作既有记忆"） |
 
 **实现后的减法轮**（同一原则施于新代码）：注入集的定义（active ∧ ¬derived ∧
@@ -1074,7 +1074,7 @@ SQLite 断言当时以一次性脚本固化（6/6 过），现已全部转为常
 | 平台接口误用风险 | `readSession` 不宣称可取消；LLM 面明确为 stream 消费协议；`ctx.interval` + tick 单飞；`agents.list()` 枚举；created listener 不被 await ⇒ 安装函数同步启动自持 fiber |
 | **不变量混入实现策略** | 压缩为 D1–D6 领域不变量；revision/零 IO/离散策略等列为可替换实现约束 |
 | superseded_by 可指向派生物 | 应用层断言 + 注释（启用 derived 层时补 CHECK） |
-| excerpt 压实无归属 | 明确 decay 顺带（随 §12 启用） |
+| excerpt 压实无归属 | **规则已删除**：excerpt 是 `sourceOf` 的主证据源，不得定期销毁 |
 | recall 写 usage 与 WAL 争锁 | 纳入慢语句告警覆盖；usage 为非权威表不触发 revision |
 
 ### 原则修订
