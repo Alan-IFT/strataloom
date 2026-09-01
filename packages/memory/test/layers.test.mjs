@@ -6,6 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { MemoryService } from '../lib/service.js'
@@ -15,6 +16,7 @@ import { collectTurnEvents, QUOTE_LABEL, QUOTE_SEQ } from '../lib/transcript.js'
 import { runExtractJob } from '../lib/pipeline/extract.js'
 import {
   buildContextProvider,
+  countEntries,
   packetTokens,
   renderFramed,
   withinBudget,
@@ -32,6 +34,10 @@ import {
   ROLLUP_TARGET_CHARS,
   ROLLUP_TITLE_TARGET_CHARS,
   ROLLUP_TRANSCRIPT_CHARS,
+  PERSONA_MAX_TOKENS,
+  PERSONA_TARGET_CHARS,
+  PERSONA_TITLE,
+  SCENARIO_MAX_TOKENS,
   SOURCE_TURN_LIMIT,
   WORST_SOURCE_SEQS,
   worstPersonaTokens,
@@ -1686,6 +1692,352 @@ test('L3: the portrait is written once, and "keep" does not churn it', async () 
   const after = global.db.prepare(`SELECT body FROM memories WHERE derived = 3`).all()
   assert.equal(after.length, 1, 'still exactly one portrait')
   assert.match(after[0].body, /English/)
+  registry.dispose()
+  cleanup(root)
+})
+
+/* ── The write path is bounded in the unit its container spends ─────────────
+
+   Seven tests for one defect: the derived write path bounded CHARACTERS
+   (`slice(0, ROLLUP_TARGET_CHARS)`) while the container that spends the rows
+   prices RENDERED TOKENS, and `renderEntry` indents every `\n` by two
+   characters. A fully compliant row could therefore be unaffordable, and
+   `withinBudget` SKIPS what it cannot afford, so it was not shortened — it
+   disappeared.
+
+   Each test below names the ONE line whose reversion turns it red, because a
+   test that would survive the bug is decoration. */
+
+/** A body of `chars` characters carrying a line break every `every` characters. */
+const dense = (chars, every) => {
+  let body = ''
+  for (let i = 0; i < chars; i++) body += (i + 1) % every === 0 ? '\n' : 'x'
+  return body
+}
+
+test('L2 write path: a scenario block is bounded by rendered tokens, not characters', async () => {
+  // Reverting `parseScenarios` to `.slice(0, ROLLUP_TARGET_CHARS)` turns this
+  // red. The fixture is a block at exactly the CHARACTER target and a density
+  // the character rule cannot see, so the two candidate implementations
+  // disagree on it: `slice` passes it through whole (620 chars, over the
+  // ceiling once rendered), the token cut trims it.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await overflow(service, principal)
+
+  const body = dense(ROLLUP_TARGET_CHARS, 3)
+  // Precondition: the character rule would ADMIT this unchanged, and the row
+  // it admits does not fit. Without this the test could pass against either
+  // implementation and would be asserting nothing.
+  assert.equal(body.length, ROLLUP_TARGET_CHARS, 'the fixture is exactly at the character target')
+  assert.ok(
+    estimateTokens(renderEntry({ id: '', kind: 'fact', title: 'Dense', body }, false)) >
+      SCENARIO_MAX_TOKENS,
+    'precondition: the character-legal body is over the token ceiling, so the rules differ here',
+  )
+
+  ctx.get = (name) => (name === 'llm' ? rollupReply([{ title: 'Dense', body }]) : undefined)
+  const rev = readRevision(store)
+  enqueueJob(store, 'rebuild', 'rb-tok-l2', { expectedRevision: rev, provider: 'p', model: 'm' }, 0)
+  await runRebuildJob(
+    ctx, store, claimNextJob(store, Date.now(), Date.now() + 60_000),
+    { expectedRevision: rev, provider: 'p', model: 'm' }, new AbortController().signal,
+  )
+
+  const rows = queryInjectionRows(store)
+  assert.equal(rows.length, 1, 'the block was written')
+  assert.ok(
+    packetTokens(rows) <= SCENARIO_MAX_TOKENS,
+    `the stored block renders within its ceiling (${packetTokens(rows)} <= ${SCENARIO_MAX_TOKENS})`,
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('L3 write path: the portrait is bounded by rendered tokens, not characters', async () => {
+  // The SECOND execution point, asserted separately on purpose: these are two
+  // call sites of one rule, and ADR 0007's lesson 6 is that a paired fix which
+  // ships half-applied degrades silently. Reverting `parsePersona` alone to
+  // `.slice(0, PERSONA_TARGET_CHARS)` turns this red while the L2 test above
+  // stays green — which is exactly the half-fix this guards against.
+  const { root, registry, principal, ctx } = setup()
+  await (async () => {})()
+  const global = registry.get(GLOBAL_STORE_KEY) ?? registry.openGlobal()
+  global.tx(() => {
+    global.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+         VALUES (?, 'preference', 'private', 'active', 'be terse', 'short answers', 'human', 0, 0)`,
+      )
+      .run(randomUUID())
+  })
+
+  const body = dense(PERSONA_TARGET_CHARS, 4)
+  assert.equal(body.length, PERSONA_TARGET_CHARS, 'the fixture is exactly at the character target')
+  assert.ok(
+    estimateTokens(renderEntry({ id: '', kind: 'preference', title: PERSONA_TITLE, body }, false)) >
+      PERSONA_MAX_TOKENS,
+    'precondition: character-legal, token-illegal — the two rules disagree on this fixture',
+  )
+
+  await judgePersona(ctx, global, personaReply(body), 'pj-tok')
+  const stored = global.db.prepare(`SELECT title, body FROM memories WHERE derived = 3`).all()
+  assert.equal(stored.length, 1, 'a portrait was written')
+  assert.ok(
+    estimateTokens(renderEntry({ id: '', kind: 'preference', ...stored[0] }, false)) <=
+      PERSONA_MAX_TOKENS,
+    'the stored portrait renders within the cap injection will apply to it',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('the derived REGRESSION: a compliant dense portrait reaches the packet instead of vanishing', async () => {
+  // Defect A itself, end to end, through the real writer and the real
+  // injection path. Before this round: a portrait at exactly
+  // PERSONA_TARGET_CHARS carrying 21 line breaks priced 172 against a cap of
+  // 171, and `withinBudget` skipped it WHOLE — zero personal rows injected,
+  // in every repository. The live portrait on this machine renders at 163,
+  // i.e. production was running on 8 tokens of luck.
+  //
+  // The assertion is that the content ARRIVES, not that it is short: the
+  // failure mode was silent absence, so absence is what must be caught.
+  const { root, registry, principal, ctx, service } = setup()
+  const global = registry.get(GLOBAL_STORE_KEY) ?? registry.openGlobal()
+  global.tx(() => {
+    global.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+         VALUES (?, 'preference', 'private', 'active', 'be terse', 'short answers', 'human', 0, 0)`,
+      )
+      .run(randomUUID())
+  })
+
+  // 600 characters with 21 newlines: the exact shape measured at 172 tokens.
+  const marker = 'PORTRAIT-MARKER'
+  const body = marker + dense(PERSONA_TARGET_CHARS - marker.length, 27)
+  assert.equal(body.length, PERSONA_TARGET_CHARS, 'exactly at the target the prompt asks for')
+  assert.ok((body.match(/\n/g) ?? []).length >= 21, 'and carrying the density that broke it')
+  assert.ok(
+    estimateTokens(renderEntry({ id: '', kind: 'preference', title: PERSONA_TITLE, body }, false)) >
+      PERSONA_MAX_TOKENS,
+    'precondition: stored verbatim this portrait is unaffordable, which is why it used to vanish',
+  )
+
+  await judgePersona(ctx, global, personaReply(body), 'pj-regress')
+  const packet = buildContextProvider(ctx, service)({ agent: principal })
+  assert.match(packet, /PORTRAIT-MARKER/, 'the portrait reaches the packet rather than being dropped')
+  assert.ok(packet.includes(TRUNCATION_MARK), 'and arrives visibly cut rather than silently partial')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('end to end: a dense rollup delivers ALL six blocks AND the portrait', async () => {
+  // The capacity guard's arithmetic, executed rather than restated: the whole
+  // point of solving 171 + 6 x 188 <= 1300 is that a full derived layer fits
+  // at once. Every row here goes in through `runRebuildJob` — no hand-written
+  // INSERT — because a test that fabricates derived rows validates the
+  // fabricator's assumptions about the writer, not the writer (ADR 0009 §7).
+  //
+  // lineLen 6 is chosen to be far denser than `DERIVED_WORST_LINE_CHARS` (30)
+  // prices: under the old character rule this is the case where the blocks
+  // were dropped one by one (measured: 6/6 at 1 per 30, 5/6 at 1 per 10, 4/6
+  // at 1 per 3). Reverting either write point turns this red.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await overflow(service, principal)
+
+  const global = registry.get(GLOBAL_STORE_KEY) ?? registry.openGlobal()
+  global.tx(() => {
+    global.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+         VALUES (?, 'preference', 'private', 'active', 'be terse', 'short answers', 'human', 0, 0)`,
+      )
+      .run(randomUUID())
+  })
+  await judgePersona(ctx, global, personaReply(dense(PERSONA_TARGET_CHARS, 6)), 'pj-e2e')
+
+  const blocks = Array.from({ length: ROLLUP_MAX_SCENARIOS }, (_, i) => ({
+    title: `SCENARIO-${i} `.padEnd(ROLLUP_TITLE_TARGET_CHARS, 'x'),
+    body: `SCEN${i}\n${dense(ROLLUP_TARGET_CHARS, 6)}`,
+  }))
+  ctx.get = (name) => (name === 'llm' ? rollupReply(blocks) : undefined)
+  const rev = readRevision(store)
+  enqueueJob(store, 'rebuild', 'rb-e2e', { expectedRevision: rev, provider: 'p', model: 'm' }, 0)
+  await runRebuildJob(
+    ctx, store, claimNextJob(store, Date.now(), Date.now() + 60_000),
+    { expectedRevision: rev, provider: 'p', model: 'm' }, new AbortController().signal,
+  )
+  assert.equal(
+    queryInjectionRows(store).length,
+    ROLLUP_MAX_SCENARIOS,
+    'precondition: the writer stored a full derived layer',
+  )
+
+  // Every block AND the portrait survive the real budget, in one packet.
+  const packet = buildContextProvider(ctx, service)({ agent: principal })
+  for (let i = 0; i < ROLLUP_MAX_SCENARIOS; i++) {
+    assert.match(packet, new RegExp(`SCENARIO-${i}`), `block ${i} reached the packet`)
+  }
+  assert.match(packet, /How to work with this user/, 'and so did the portrait')
+  // Nothing was dropped — stated as a COUNT rather than a token total. The
+  // budget the guard solves is spent per entry (`withinBudget` subtracts
+  // `estimateTokens(renderEntry(hit))` one row at a time), so the guarantee is
+  // "all seven rows are affordable", not "the concatenated packet re-measures
+  // under 1299": re-estimating the joined string rounds once instead of seven
+  // times and adds the newlines that join the bullets, which is a different
+  // quantity that no code anywhere checks. Asserting that one would be
+  // inventing a third ruler for a container that already has one.
+  assert.equal(
+    countEntries(packet),
+    ROLLUP_MAX_SCENARIOS + 1,
+    'all six blocks and the portrait were affordable at once — nothing was skipped',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('the token ceilings are SOLVED, not chosen: one more token overflows the packet', async () => {
+  // The 1 token of slack in 171 + 6 x 188 = 1299 <= 1300 is deliberate, and
+  // deliberate is only distinguishable from lucky if something breaks when it
+  // is spent. Patching SCENARIO_MAX_TOKENS to 189 must fail AT LOAD.
+  //
+  // A guard nothing can trip is not a guard (the lesson `10b` in group.test
+  // records): without this, the ceilings could drift upward and the capacity
+  // inequality would be a comment rather than a check.
+  const { readFileSync, writeFileSync, rmSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const libDir = join(import.meta.dirname, '..', 'lib')
+  const source = readFileSync(join(libDir, 'constants.js'), 'utf8')
+  const patched = source.replace(
+    /export const SCENARIO_MAX_TOKENS = [\d_]+;/,
+    'export const SCENARIO_MAX_TOKENS = 189;',
+  )
+  assert.notEqual(patched, source, 'the probe must actually rewrite the ceiling')
+
+  const probe = join(libDir, `constants.ceiling-probe.${randomUUID()}.js`)
+  writeFileSync(probe, patched)
+  try {
+    await assert.rejects(import(`file://${probe}`), (error) => {
+      assert.match(error.message, /derived layer cannot fit/, 'names the rule it broke')
+      assert.match(error.message, /INJECT_BODY_BUDGET_TOKENS \(\d+\)/, 'reports the budget')
+      return true
+    })
+  } finally {
+    rmSync(probe, { force: true })
+  }
+})
+
+test('the truncation mark does not name a container it is not confined to', async () => {
+  // The mark used to read "…truncated to fit the recall budget", which was
+  // true while recall was the only caller. The derived write path cuts against
+  // the INJECTION budget and PERSISTS the result, so that wording became a
+  // false sentence written into SQLite and shipped to the model on every turn.
+  //
+  // ## This is a BLACKLIST, and it is worth saying so
+  //
+  // The property one would want is "the mark names no container at all". That
+  // is not machine-checkable: naming a container is a fact about English, and
+  // any predicate for it is a word list wearing a property's clothes. This
+  // assertion is therefore an enumeration of the container names REACHABLE
+  // FROM THIS CODEBASE, not a proof of the general property.
+  //
+  // Its limit is known and measured: a wording that names a container using
+  // vocabulary absent from the list — "…to fit the context packet budget" —
+  // passes here (verified: 231/231 green with that wording). So this catches a
+  // REGRESSION to a previously-shipped phrasing, and does not catch an
+  // invented one. A reviewer changing this string still has to think; this
+  // only stops the specific slide back to naming `recall` or `inject`.
+  //
+  // Kept as a blacklist rather than upgraded to an equality on today's exact
+  // text: an equality would forbid ever rephrasing the mark, which is a real
+  // cost, and it would still not express the property. Honest and narrow beats
+  // a broad-sounding assertion that is narrow underneath.
+  const { TRUNCATION_MARK: mark } = await import('../lib/recall/render.js')
+  assert.notEqual(mark, '', 'an empty mark would make every assertion here vacuous')
+  // Every container this mark can currently be produced under. `budget` alone
+  // is deliberately NOT listed: the mark must be free to say it was cut to fit
+  // *a* budget — what it must not do is say WHICH.
+  for (const container of ['recall', 'inject', 'injection', 'packet', 'context', 'memory budget of']) {
+    assert.doesNotMatch(
+      mark,
+      new RegExp(container, 'i'),
+      `the mark (${JSON.stringify(mark)}) names "${container}". It is written into stored ` +
+        'derived bodies by pipeline/rebuild.ts and into transient recall packets by ' +
+        'tools.ts — naming either container makes it a false sentence in the other, and ' +
+        'it is ONE constant precisely so there is no second one to keep in step',
+    )
+  }
+
+  // And it really is the SAME constant on the write path, not a lookalike:
+  // a stored derived body carries this exact string.
+  const { root, registry, ctx } = setup()
+  const global = registry.get(GLOBAL_STORE_KEY) ?? registry.openGlobal()
+  global.tx(() => {
+    global.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+         VALUES (?, 'preference', 'private', 'active', 'be terse', 'short answers', 'human', 0, 0)`,
+      )
+      .run(randomUUID())
+  })
+  await judgePersona(ctx, global, personaReply('y'.repeat(4_000)), 'pj-mark')
+  const stored = global.db.prepare(`SELECT body FROM memories WHERE derived = 3`).get()
+  assert.ok(
+    stored.body.endsWith(mark),
+    'the stored portrait ends with the one shared mark, so the wording above is the wording persisted',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('a body too dense to cut is DROPPED, not stored as undefined', async () => {
+  // `truncatedToBudget` returns `undefined` when even the bare mark overflows
+  // the budget. At the shipped ceilings that is unreachable, so the branch is
+  // proven at the unit — a row whose title alone exhausts the budget — and
+  // then the write path is shown to refuse it rather than let `undefined`
+  // reach SQLite (where `body` would become NULL and inject as an empty
+  // bullet that still costs the packet a line).
+  const { truncatedToBudget } = await import('../lib/recall/render.js')
+  const unfittable = truncatedToBudget(
+    { id: '', kind: 'fact', title: 'x'.repeat(400), body: 'anything at all' },
+    4,
+  )
+  assert.equal(unfittable, undefined, 'precondition: the budget cannot hold even the mark')
+
+  // And the shipped ceilings are on the other side of that line, which is what
+  // makes the `continue` a safety net rather than the normal path.
+  assert.ok(
+    truncatedToBudget(
+      { id: '', kind: 'fact', title: 'x'.repeat(ROLLUP_TITLE_TARGET_CHARS), body: 'x'.repeat(9_000) },
+      SCENARIO_MAX_TOKENS,
+    ) !== undefined,
+    'a real oversized block is cut rather than dropped',
+  )
+
+  // The portrait path refuses rather than storing an empty body: there is no
+  // sibling row to fall back on, so '' would blank the portrait everywhere.
+  const { root, registry, ctx } = setup()
+  const global = registry.get(GLOBAL_STORE_KEY) ?? registry.openGlobal()
+  global.tx(() => {
+    global.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+         VALUES (?, 'preference', 'private', 'active', 'be terse', 'short answers', 'human', 0, 0)`,
+      )
+      .run(randomUUID())
+  })
+  await assert.rejects(
+    judgePersona(ctx, global, personaReply('   '), 'pj-empty'),
+    /carries no body/,
+    'an unusable portrait reaches the retry exit instead of being stored',
+  )
+  assert.equal(
+    global.db.prepare(`SELECT count(*) c FROM memories WHERE derived = 3`).get().c,
+    0,
+    'and nothing was written',
+  )
   registry.dispose()
   cleanup(root)
 })

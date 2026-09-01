@@ -46,14 +46,15 @@ import {
   ROLLUP_MAX_SCENARIOS,
   ROLLUP_SOURCE_LIMIT,
   ROLLUP_TRANSCRIPT_CHARS,
-  ROLLUP_TARGET_CHARS,
   ROLLUP_TITLE_TARGET_CHARS,
-  PERSONA_TARGET_CHARS,
+  PERSONA_MAX_TOKENS,
+  SCENARIO_MAX_TOKENS,
   PERSONA_TITLE,
 } from '../constants.ts'
 import { LAYER, type MemoryHit } from '../types.ts'
 import { queryInjectableSet } from '../store/fts.ts'
 import { packetTokens } from '../recall/inject.ts'
+import { truncatedToBudget } from '../recall/render.ts'
 
 /** Payload of one rebuild job: the snapshot it was queued for. */
 export interface RebuildPayload {
@@ -75,44 +76,44 @@ export const readRevision = (store: OpenStore): number => {
  * that both enables and disables the derived layer. Priced with the packet's
  * own estimator so the trigger means what the budget means.
  *
- * The container is `queryInjectableSet`, and it has to stay that way. Pricing
- * `queryInjectionRows` instead — what injection actually carries — reads like
- * the more honest measurement and is a self-reference that freezes the layer.
- * The argument is arithmetic rather than today's numbers, because a rebuild
- * heals the data and would retire any argument made from it:
+ * The container is `queryInjectableSet` — the RAW set — and it has to stay that
+ * way. Pricing `queryInjectionRows` instead (what injection actually carries)
+ * reads like the more honest measurement and is a self-reference: once a
+ * rollup exists, the trigger would be asking about the summary's own size,
+ * which the summary is built to keep small, so it would answer "no" forever and
+ * the blocks would go on describing a snapshot that has since moved.
  *
- *   worstPersonaTokens() + ROLLUP_MAX_SCENARIOS x worstScenarioTokens()
- *       <= INJECT_BODY_BUDGET_TOKENS
+ * ## Why this container keeps the trigger alive, measured
  *
- * — the invariant `constants.ts` throws on at load. So for a derived layer
- * whose rows are priced no worse than that invariant assumes,
- * `packetTokens(queryInjectionRows(store)) > INJECT_BODY_BUDGET_TOKENS` is
- * false: the first rollup would be the last this store ever gets, and its
- * blocks would go on summarizing a snapshot that has since moved.
+ * The RAW rows are not consumed by a rollup: the commit runs
+ * `DELETE FROM memories WHERE derived != RAW`, which replaces the derived
+ * layer and leaves every raw row in place. So the quantity this prices does not
+ * shrink when a rollup succeeds, and the next snapshot is re-evaluated on the
+ * same material. End to end through the real writer, 60 raw rows:
  *
- * The qualifier is load-bearing rather than a hedge, because TWO kinds of
- * derived layer price worse than the invariant assumes and can exceed the
- * budget:
+ *     before rollup   raw set 4670 tok   -> packetOverflows true
+ *     after  rollup   derived rows 6, injection 1038 tok
+ *                     raw rows still 60, raw set still 4670 tok
+ *                     -> packetOverflows STILL true
  *
- * - legacy rows, written before `ROLLUP_TARGET_CHARS` was enforced, whose
- *   bodies simply exceed it;
- * - conforming rows whose newline density is higher than
- *   `DERIVED_WORST_LINE_CHARS` prices. The write path bounds a body's
- *   CHARACTERS, while `renderEntry` indents a body's own newlines and so bills
- *   for them — a gap `constants.ts` records on that constant, and one a
- *   measurement confirms is reachable, not theoretical, for shapes like ASCII
- *   art or a one-word-per-line list.
+ * An earlier revision of this comment argued the opposite — that the derived
+ * layer's own cheapness would freeze the trigger permanently, and that the
+ * store was saved only by two ESCAPE HATCHES (legacy oversized rows, and
+ * conforming rows whose newline density outprices `DERIVED_WORST_LINE_CHARS`).
+ * Both halves were wrong, and the correction is worth keeping because the shape
+ * recurs: the argument reasoned about the wrong container. It priced the
+ * derived rows, which is what `queryInjectionRows` would have measured, while
+ * the code prices the raw set. There was never a freeze to escape.
  *
- * The freeze is therefore not universal; it is permanent for the layers this
- * store will normally hold, which is what makes it a real hazard rather than a
- * curiosity. Nothing above argues for changing the container: a trigger that
- * stops firing for most stores is broken whether or not an exotic body shape
- * could still trip it, and the exception is a pricing gap logged elsewhere,
- * not a property anyone should rely on to keep rebuilds alive.
+ * The second "escape hatch" is also gone on its own terms: the write path now
+ * bounds a row by its RENDERED TOKENS (`SCENARIO_MAX_TOKENS` /
+ * `PERSONA_MAX_TOKENS`, see `parseScenarios`), so a dense body is truncated to
+ * fit rather than silently exceeding the budget. Nothing depends on that
+ * change here — this trigger never looked at derived rows — which is precisely
+ * why the unit change did not move it.
  *
  * Either way the trigger's question is about the material ("does the raw set
- * still need summarizing?"), not about the summary's own size, which the write
- * path bounds in characters.
+ * still need summarizing?"), and never about the summary's own size.
  *
  * `ROLLUP_SOURCE_LIMIT` rather than `INJECT_TOP_N` for the same reason: the
  * job summarizes the sources, so the test must see all of them.
@@ -305,6 +306,29 @@ interface Scenario {
  * the rejected alternative: it is the same request, and it already failed six
  * times out of six.
  *
+ * ## The bound is in TOKENS, and the title's is not
+ *
+ * The body is cut with `truncatedToBudget` against `SCENARIO_MAX_TOKENS`, not
+ * sliced to `ROLLUP_TARGET_CHARS`. The container that spends this row —
+ * `renderFramed` against `INJECT_BODY_BUDGET_TOKENS` — prices RENDERED TOKENS,
+ * and `renderEntry` indents every `\n` by two characters, so a character limit
+ * cannot see part of what the row costs. Bounding the write in one unit while
+ * the consumer bills in another is how a fully compliant row became
+ * unaffordable: `withinBudget` SKIPS what it cannot pay for, so the row was not
+ * shortened, it vanished (see `PERSONA_MAX_TOKENS`).
+ *
+ * `ROLLUP_TARGET_CHARS` keeps its job on the OTHER side of the exchange:
+ * `prompts.ts` still asks the model for a character count, because a model
+ * cannot count our tokens. The load-time satisfiability guard ties the two
+ * together — the requested length must price under the ceiling at the worst
+ * density we bill for — so what we ask for and what we enforce cannot drift
+ * apart even though they are stated in different units.
+ *
+ * The TITLE is still cut by characters, and that is not an oversight. It has no
+ * budget of its own; it is priced as part of the rendered row, whose bound is
+ * the body's. A title carries no newlines in practice, and cutting it in tokens
+ * would need a second budget nothing spends.
+ *
  * Cutting rather than rejecting the block: a briefing whose last sentence is
  * clipped still restores a working context, while throwing away the whole
  * rollup because the model was verbose costs the layer entirely — and the
@@ -322,7 +346,19 @@ const parseScenarios = (raw: unknown): Scenario[] => {
       throw new PipelineLlmError('malformed scenario in rollup reply')
     }
     const title = scenario.title.trim().slice(0, ROLLUP_TITLE_TARGET_CHARS)
-    const body = scenario.body.trim().slice(0, ROLLUP_TARGET_CHARS)
+    // Cut against the rendered cost of the WHOLE entry, title included, which
+    // is what the packet will actually be charged.
+    const bounded = truncatedToBudget(
+      { id: '', kind: 'fact', title, body: scenario.body.trim() },
+      SCENARIO_MAX_TOKENS,
+    )
+    // `undefined` means the ceiling could not hold even a truncated body. It
+    // cannot happen at the shipped constants (the load-time guards prove a
+    // full-length block fits), but it is dropped rather than coerced: storing
+    // an empty or `undefined` body would inject a bullet that says nothing
+    // while still costing the budget a line.
+    if (bounded === undefined) continue
+    const body = bounded.body
     if (title === '' || body === '') continue
     out.push({ title, body })
   }
@@ -401,11 +437,20 @@ const runPersonaJob = async (
  * is malformed and reaches the retry exit rather than storing an empty
  * portrait that would inject as nothing.
  *
- * The body is cut to `PERSONA_TARGET_CHARS` for the reason given on
+ * The body is cut to `PERSONA_MAX_TOKENS` for the reason given on
  * `parseScenarios`: the target was a request the model ignored (all six blocks
  * measured on a live store overshot it), and the portrait is spent from the
  * SAME injection budget in every repository — an oversized one does not merely
  * overrun, it evicts the scenario blocks queued behind it.
+ *
+ * Cut in TOKENS and with the same function as the scenario path, because this
+ * is one rule with two execution points and the portrait is where the unit
+ * mismatch actually bit: `worstPersonaTokens()` is the cap `recall/inject.ts`
+ * applies to the personal side at runtime, and a portrait at exactly
+ * `PERSONA_TARGET_CHARS` carrying 21 line breaks priced 172 against it. The
+ * write path passed it, the read path skipped it whole, and the user got no
+ * portrait at all. Fixing only one of the two points would leave the other
+ * writing rows in a unit its container does not spend.
  */
 const parsePersona = (raw: unknown): { keep: boolean; body: string } => {
   const root = raw as { verdict?: unknown; body?: unknown }
@@ -416,7 +461,18 @@ const parsePersona = (raw: unknown): { keep: boolean; body: string } => {
     throw new PipelineLlmError('portrait reply has no usable verdict')
   }
   if (root.verdict === 'keep') return { keep: true, body: '' }
-  const body = typeof root.body === 'string' ? root.body.trim().slice(0, PERSONA_TARGET_CHARS) : ''
+  const bounded =
+    typeof root.body === 'string'
+      ? truncatedToBudget(
+          { id: '', kind: 'preference', title: PERSONA_TITLE, body: root.body.trim() },
+          PERSONA_MAX_TOKENS,
+        )
+      : undefined
+  // A portrait that could not be cut to fit reaches the same exit as a missing
+  // one: the retry path. Unlike a scenario block there is no sibling row to
+  // fall back on — storing '' here would replace the portrait with a bullet
+  // that says nothing, in every repository at once.
+  const body = bounded?.body ?? ''
   if (body === '') throw new PipelineLlmError('portrait rewrite carries no body')
   return { keep: false, body }
 }

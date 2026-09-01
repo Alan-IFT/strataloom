@@ -31,6 +31,7 @@ import {
   RECALL_PACKET_MAX_CHARS,
   ROLLUP_TARGET_CHARS,
   ROLLUP_TITLE_TARGET_CHARS,
+  SCENARIO_MAX_TOKENS,
   worstForeignRowCost,
   worstPacketFillEntry,
   worstShapedBody,
@@ -42,6 +43,7 @@ import {
   renderEntry,
   estimateTokens,
   withinBudget,
+  truncatedToBudget,
   SOURCE_LABEL_MAX_CHARS,
 } from '../lib/recall/render.js'
 import { openRegistry, cleanup, fakeAgent, fakeCtx, tempRoot } from './helpers.mjs'
@@ -668,19 +670,60 @@ test('10. the worst recall PACKET is priced at load against the real container, 
   // what makes the packet say whose memory it is showing. Pricing this shape
   // WITHOUT the label is how the budget would silently stop admitting the row
   // it exists to admit.
-  const row = {
+  //
+  // What "worst" MEANS here changed with the write path. The bound the writer
+  // enforces is now `SCENARIO_MAX_TOKENS` on the RENDERED entry, not
+  // `ROLLUP_TARGET_CHARS` on the stored string, so the dearest foreign row is
+  // no longer "the longest legal body" — it is "the body that saturates the
+  // injection cap", which is a different string and costs more. Asserting the
+  // old shape would now price a row the writer cannot produce and would
+  // UNDER-price the one it can.
+  const asStored = (body) =>
+    truncatedToBudget(
+      { id: '', kind: 'fact', title: 'x'.repeat(ROLLUP_TITLE_TARGET_CHARS), body },
+      SCENARIO_MAX_TOKENS,
+    )
+  const foreign = (stored) => ({
     id: '123e4567-e89b-12d3-a456-426614174000',
     kind: 'fact',
     title: 'x'.repeat(ROLLUP_TITLE_TARGET_CHARS),
-    body: worstShapedBody(ROLLUP_TARGET_CHARS),
+    body: stored.body,
     source: 'x'.repeat(SOURCE_LABEL_MAX_CHARS),
-  }
+  })
+  const row = foreign(asStored(worstShapedBody(ROLLUP_TARGET_CHARS * 4)))
   const shapedCost = estimateTokens(renderEntry(row, true))
   const flatCost = estimateTokens(
     renderEntry({ ...row, body: 'x'.repeat(ROLLUP_TARGET_CHARS) }, true),
   )
   assert.ok(shapedCost > flatCost, 'the shaped body really is dearer, or this test proves nothing')
   assert.equal(worstForeignRowCost(), shapedCost, 'the guard prices this shape')
+
+  // The bound BINDS, which is the claim the title makes and the one the old
+  // fixed shape stopped supporting: every body the write path can store must
+  // price at or under it on the recall path. Candidates span the dimensions
+  // that pull in opposite directions — length, newline density, and the
+  // previously-assumed worst case — so a guard priced on any single one of
+  // them fails here rather than passing by coincidence.
+  for (const [name, body] of [
+    ['the old character-shaped worst case', worstShapedBody(ROLLUP_TARGET_CHARS)],
+    ['a flat body at the old target', 'x'.repeat(ROLLUP_TARGET_CHARS)],
+    ['an all-newline body', '\n'.repeat(4 * SCENARIO_MAX_TOKENS)],
+    ['a body far past any target', worstShapedBody(ROLLUP_TARGET_CHARS * 6)],
+    ['a one-word-per-line list', 'word\n'.repeat(400)],
+  ]) {
+    const stored = asStored(body)
+    assert.ok(stored !== undefined, `${name}: the writer can store something`)
+    assert.ok(
+      estimateTokens(renderEntry({ ...foreign(stored), source: undefined, id: '' }, false)) <=
+        SCENARIO_MAX_TOKENS,
+      `${name}: precondition — the write path really did bound it`,
+    )
+    assert.ok(
+      estimateTokens(renderEntry(foreign(stored), true)) <= worstForeignRowCost(),
+      `${name}: costs ${estimateTokens(renderEntry(foreign(stored), true))} on the recall ` +
+        `path, above the guard's ${worstForeignRowCost()} — the floor does not bound it`,
+    )
+  }
   // The label is not free, and the guard must be pricing it rather than a
   // bare row that happens to fit: without this, dropping `source` from the
   // guard's shape would leave every assertion here green while the budget

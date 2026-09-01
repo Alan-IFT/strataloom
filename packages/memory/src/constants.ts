@@ -4,7 +4,12 @@
  * design constants).
  * @module @strataloom/dsh-memory/constants
  */
-import { estimateTokens, renderEntry, SOURCE_LABEL_MAX_CHARS } from './recall/render.ts'
+import {
+  estimateTokens,
+  renderEntry,
+  truncatedToBudget,
+  SOURCE_LABEL_MAX_CHARS,
+} from './recall/render.ts'
 // `types.ts` imports nothing, so this cannot close a cycle the way importing
 // from `inject.ts` would (see the note on `recall/render.ts`). The kind enum is
 // read rather than quoted so the extract reply guard prices whatever kinds
@@ -768,9 +773,30 @@ export const BODY_MAX_CHARS = 2_000
 export const EXTRACT_TITLE_TARGET_CHARS = 120
 export const EXTRACT_BODY_TARGET_CHARS = 800
 /**
- * Body length asked of — and, since this fix, ENFORCED on — each scenario
- * briefing (L2). See `parseScenarios`: the write path truncates to this, so
- * the number below is a property of the data, not a hope about the model.
+ * Body length ASKED OF each scenario briefing (L2) — the number interpolated
+ * into the rollup prompt by `prompts.ts`.
+ *
+ * ## What this constant is now, and what it stopped being
+ *
+ * It is no longer the enforced bound. The write path cuts to
+ * `SCENARIO_MAX_TOKENS` (rendered tokens), not to this (characters), because
+ * the container that spends the row prices tokens and a character limit cannot
+ * see the two characters `renderEntry` adds per newline. The history below is
+ * kept because it explains where 620 came from — but read it knowing that its
+ * conclusion has changed roles:
+ *
+ * - THEN: this arithmetic DEFINED the ceiling, and the write path enforced the
+ *   character count it produced.
+ * - NOW: `SCENARIO_MAX_TOKENS` (188) is the ceiling and the write path enforces
+ *   that. This value is a REQUEST — a model cannot count our tokens, so the
+ *   prompt must ask in characters — and the satisfiability guard at the bottom
+ *   of this file CERTIFIES that request: a body of this length, at the worst
+ *   density we bill for, must price under the ceiling.
+ *
+ * That guard is this constant's only keeper; measured, removing it lets 640,
+ * 700 and 900 all load silently. So the arithmetic below is still live, but it
+ * now answers "is what we ask for satisfiable?" rather than "what is the
+ * limit?".
  *
  * 620 is DERIVED, not chosen. The load-time guard at the bottom of this file
  * requires the L3 portrait plus `ROLLUP_MAX_SCENARIOS` blocks, priced through
@@ -780,18 +806,25 @@ export const EXTRACT_BODY_TARGET_CHARS = 800
  *
  * With bodies priced at their worst SHAPE as well as their worst length (see
  * `DERIVED_WORST_LINE_CHARS`), the portrait costs 171 tokens, leaving 1129 for
- * six blocks — which solves to a body ceiling of 639 characters. At 900 the
- * guard reports far over 1300, which is how the defect was found, and it
- * matches the live store where half the blocks were dropped.
+ * six blocks — which solves to a body ceiling of 639 characters. That figure
+ * still holds under the token rule and is re-checked on every load: 639 prices
+ * to 188 and passes, 640 prices to 189 and throws. At 900 the guard reports far
+ * over budget, which is how the original defect was found, and it matches the
+ * live store where half the blocks were dropped.
  *
- * The value sits at 620 rather than on the 639 ceiling so that the guard's own
- * remaining assumption is not load-bearing. At 639 the design survives only
- * bodies carrying >= 30 characters PER NEWLINE — exactly the figure the guard
- * assumes, leaving 1 token of slack, so the assumption would have to be
- * perfect. At 620 it survives down to 22 characters per newline (45 breaks per
- * 1000, against 33.75 for the densest row on this machine and 83.75 for the
- * densest DERIVED row) and keeps 31 tokens of slack. That margin costs 19
- * characters of briefing, about 3%.
+ * The value sits at 620 rather than on the 639 boundary, and the reason has
+ * outlived the mechanism that first produced it. It used to be "so the guard's
+ * own assumption is not load-bearing": at 639 the design survived only bodies
+ * carrying >= 30 characters PER NEWLINE, exactly the figure the guard assumes,
+ * so the assumption had to be perfect. Under the token rule a denser body is
+ * TRUNCATED rather than dropped, so the assumption is no longer load-bearing at
+ * all — but the distance still buys the thing that replaced it: at 620 the
+ * request prices to 183 of 188 and stays under the ceiling down to 22
+ * characters per newline (45 breaks per 1000, against 33.75 for the densest row
+ * on this machine and 83.75 for the densest DERIVED row), which is what keeps
+ * truncation an exception rather than the daily path. Sitting on 639 would put
+ * ordinary output on the boundary and spend 10 of every block's tokens on a
+ * truncation mark. That margin costs 19 characters of briefing, about 3%.
  *
  * The unit is characters PER NEWLINE, not average line length: they differ by
  * one (a 270-char body with 8 breaks averages 30.0-char lines but 33.75 chars
@@ -1119,19 +1152,41 @@ if (LLM_MAX_TOKENS < worstReplyChars) {
  * constant actually serves — DERIVED rows only — the densest is 83.75
  * characters per newline, so 30 is 2.8x stricter there.
  *
- * The remaining exposure is stated rather than hidden: a derived body under 22
- * characters per newline — ASCII art, or a one-word-per-line list — still
- * costs more than this prices. What gives first is the PORTRAIT, not the
- * scenario blocks: the personal cap is spent before the repo rows, and
- * `withinBudget` skips a row whole. So the layer this fix exists to protect
- * still reaches the packet; the personal side degrades instead. That shape is
- * not what the rollup prompt asks for, and pricing for it would cost real
- * briefing length for a case no store exhibits.
- *
  * The alternative (b) — leave the guard single-line and merely DOCUMENT the
  * boundary in a comment — was rejected: it leaves a known false-green in the
  * one mechanism whose whole job is to fail loudly, and the comment is read
  * only by someone who already suspects the problem.
+ *
+ * ## Its role changed, and the exposure it used to describe is gone
+ *
+ * This constant no longer COMPUTES a ceiling. `PERSONA_MAX_TOKENS` and
+ * `SCENARIO_MAX_TOKENS` are the ceilings, the write path enforces them in
+ * rendered tokens, and a body denser than priced here is now TRUNCATED to fit
+ * rather than being over budget. What this shape does instead is certify, in
+ * the satisfiability guard below, that the length we ASK the model for lands
+ * under those ceilings at a density we are willing to bill for — i.e. that
+ * truncation stays the exception rather than the daily path.
+ *
+ * The paragraph that used to sit here described the residual exposure and got
+ * its causality BACKWARDS. It claimed that under a denser body "what gives
+ * first is the PORTRAIT, not the scenario blocks", so the L2 layer the fix
+ * protects still reached the packet. Both halves were false, and measurement
+ * says so in both directions (this is corrected in full in ADR 0007's
+ * 「残余敞口」 section, where the original wording is kept):
+ *
+ *     portrait at 600 chars / 21 newlines  -> 172 tok vs a 171 cap: the
+ *         portrait was not "given up" gracefully, it was DROPPED WHOLE, since
+ *         `withinBudget` skips rather than trims. Zero rows, every repository.
+ *     with a compliant 163-tok portrait and 620-char blocks, varying block
+ *         density: 1 newline per 30 -> L2 6/6; per 10 -> 5/6; per 3 -> 4/6;
+ *         per 2 -> 3/6 — the portrait survived every time and the "protected"
+ *         L2 layer was what degraded.
+ *
+ * So neither layer was shielded by the other; each simply failed in its own
+ * direction, and the claim that one absorbed the damage was an assumption that
+ * was never measured. Enforcing the write path in rendered tokens removes the
+ * exposure rather than reassigning it: a dense body is cut to its ceiling and
+ * arrives marked, at whatever density.
  */
 export const DERIVED_WORST_LINE_CHARS = 30
 
@@ -1157,6 +1212,99 @@ const worstDerivedRowTokens = (kind: string, titleChars: number, bodyChars: numb
     ),
   )
 
+/* ── The derived layer's two ceilings, in the unit its container spends ──────
+
+   These two numbers are the whole fix. Every derived row is bounded HERE, in
+   RENDERED TOKENS, because rendered tokens are what `renderFramed` subtracts
+   from `INJECT_BODY_BUDGET_TOKENS` at runtime. The write path used to bound
+   CHARACTERS instead (`slice(0, ROLLUP_TARGET_CHARS)`), and characters are not
+   the container's unit: `renderEntry` indents every `\n` to `\n␣␣`, so a body
+   costs 2 characters per line break that no character limit can see.
+
+   That mismatch was not a rounding error, it silently deleted content. A
+   portrait at exactly `PERSONA_TARGET_CHARS` (600) — fully compliant, passed
+   by the write path without a cut — renders at 172 tokens once it carries 21
+   line breaks, against a 171-token cap. `withinBudget` SKIPS what it cannot
+   afford rather than trimming it, so the portrait was not shortened, it was
+   dropped whole: zero rows injected, in every repository. The live portrait on
+   this machine renders at 163 tokens, i.e. it was running on 8 tokens of
+   accidental headroom.
+
+   Both ends of the pipeline now measure in the same unit, with the same code
+   (`truncatedToBudget`, the renderer's own). ADR 0009's rule stated the other
+   way round: the outermost ruler is the only one that decides, so the write
+   path is not allowed a private one. */
+/**
+ * The ceiling on ONE rendered L3 portrait.
+ *
+ * DERIVED, not chosen: it is the portrait's share in the inequality below,
+ * priced through the real `renderEntry` at `PERSONA_TARGET_CHARS` characters
+ * shaped at `DERIVED_WORST_LINE_CHARS` — 171. Written as a literal rather than
+ * left as that call so the write path has a fixed contract to cut against: a
+ * budget recomputed per call is a budget that moves under stored rows.
+ *
+ * ## What actually holds this literal to 171, in each direction
+ *
+ * The load-time guards below do NOT pin it. They are inequalities, so each
+ * binds on one side only, and it is worth being exact about which:
+ *
+ * - TOO LOW is caught by the satisfiability guard (`requested > ceiling`): the
+ *   requested portrait would no longer fit its own ceiling. Measured: 170
+ *   throws there.
+ * - TOO HIGH is caught by the capacity guard, but only once the packet
+ *   overflows: it admits any `P <= 1300 - 6 * 188 = 172`. Measured: 173 throws,
+ *   174/175/179/180 throw.
+ *
+ * So exactly ONE wrong value — **172** — satisfies both guards, and nothing in
+ * this file would report it. What reports it is the equality asserted in
+ * `test/pipeline-e2e.test.mjs`:
+ *
+ *     assert.equal(worstPersonaTokens(), priced(worstShapedBody(PERSONA_TARGET_CHARS)))
+ *
+ * Measured: setting this to 172 turns 2 of 231 tests red. That assertion is
+ * the only thing tying this constant to the text it claims to price, which is
+ * why it is an equality and not a bound.
+ *
+ * Do NOT "fix" this by tightening the satisfiability guard to `!==`. It was
+ * tried and it breaks the shipped build immediately: the L2 request is priced
+ * at 183 against a ceiling of 188, and that gap is DELIBERATE — it is what
+ * keeps truncation an exception rather than the daily path (see
+ * `SCENARIO_MAX_TOKENS`). An equality guard reads that intended distance as an
+ * error. The guard stays `>`; the equality belongs in the test, where it can
+ * be stated about the portrait alone.
+ */
+export const PERSONA_MAX_TOKENS = 171
+/**
+ * The ceiling on ONE rendered L2 scenario block.
+ *
+ * Solved, not picked: it is the largest integer satisfying the inequality this
+ * file throws on below,
+ *
+ *     PERSONA_MAX_TOKENS + ROLLUP_MAX_SCENARIOS x SCENARIO_MAX_TOKENS
+ *         <= INJECT_BODY_BUDGET_TOKENS
+ *     171 + 6 x 188 = 1299 <= 1300
+ *
+ * so 188 = floor((1300 - 171) / 6).
+ *
+ * ## The 1 token of slack is the answer, not a near miss
+ *
+ * 189 gives 171 + 6 x 189 = 1305, which is 5 over: the step size is
+ * `ROLLUP_MAX_SCENARIOS`, so the last admissible value necessarily sits within
+ * 6 tokens of the budget and 188 is the largest one. That 1 token is therefore
+ * the arithmetic being tight, NOT a margin someone forgot to leave, and it must
+ * not be "made safer" by dropping to 187: that donates 6 tokens of briefing to
+ * nothing, because nothing else spends from this budget.
+ *
+ * The safety that a margin would buy is bought instead by the satisfiability
+ * guard below, which is the right place for it — it asserts that ordinary
+ * output lands BELOW this ceiling (620 chars at 1 newline per 30 costs 183,
+ * and still only 187 at 1 per 22), so truncation is the exception path rather
+ * than the daily one. Slack in the ceiling protects against nothing; distance
+ * between the request and the ceiling protects against everything this has
+ * historically got wrong.
+ */
+export const SCENARIO_MAX_TOKENS = 188
+
 /**
  * The worst RENDERED cost of the L3 portrait — and the number two different
  * mechanisms are required to agree on.
@@ -1165,7 +1313,7 @@ const worstDerivedRowTokens = (kind: string, titleChars: number, bodyChars: numb
  * down anywhere, because it is one rule with two execution points:
  *
  * - the load-time guard below spends it as the portrait's share of the packet,
- *   which is what makes `ROLLUP_TARGET_CHARS` solvable at all;
+ *   which is what makes `SCENARIO_MAX_TOKENS` solvable at all;
  * - `recall/inject.ts` spends it at runtime as the CAP on what the personal
  *   store may contribute, so the L1 fallback that stands in for a missing
  *   portrait costs no more than the portrait it replaces.
@@ -1175,18 +1323,24 @@ const worstDerivedRowTokens = (kind: string, titleChars: number, bodyChars: numb
  * containers is not a duplicated rule, whereas the same number typed twice is.
  * If these ever disagree, the guard certifies a packet the runtime does not
  * build — which is exactly the failure ADR 0007 records.
+ *
+ * It now RETURNS the ceiling rather than re-pricing a synthetic shape, because
+ * the write path enforces that ceiling directly: what the runtime caps and what
+ * the writer produces are the same quantity, so they must be the same value and
+ * not two computations that agree today. The shape-derived figure did not
+ * disappear — the satisfiability guard below still computes it and requires it
+ * to fit, which is what stops this constant from drifting away from the text it
+ * is supposed to describe.
  */
-export const worstPersonaTokens = (): number =>
-  worstDerivedRowTokens('preference', PERSONA_TITLE.length, PERSONA_TARGET_CHARS)
+export const worstPersonaTokens = (): number => PERSONA_MAX_TOKENS
 
-/** The worst rendered cost of ONE L2 scenario block, priced the same way. */
-export const worstScenarioTokens = (): number =>
-  worstDerivedRowTokens('fact', ROLLUP_TITLE_TARGET_CHARS, ROLLUP_TARGET_CHARS)
+/** The worst rendered cost of ONE L2 scenario block — the ceiling its writer cuts to. */
+export const worstScenarioTokens = (): number => SCENARIO_MAX_TOKENS
 
 /**
- * THE invariant. One inequality, and it yields both numbers this design needs:
- * the per-block ceiling the write path enforces, and the personal-side cap the
- * read path applies.
+ * GUARD 1 (capacity). THE invariant. One inequality, and it yields both numbers
+ * this design needs: the per-block ceiling the write path enforces, and the
+ * personal-side cap the read path applies.
  *
  *     worstPersona + ROLLUP_MAX_SCENARIOS x worstScenario <= INJECT_BODY_BUDGET_TOKENS
  *
@@ -1201,21 +1355,117 @@ if (worstDerivedTokens > INJECT_BODY_BUDGET_TOKENS) {
     `strataloom: the derived layer cannot fit its own packet — worst case is ` +
       `${worstDerivedTokens} tokens (L3 portrait + ${ROLLUP_MAX_SCENARIOS} L2 blocks) ` +
       `against INJECT_BODY_BUDGET_TOKENS (${INJECT_BODY_BUDGET_TOKENS}); ` +
-      `lower ROLLUP_TARGET_CHARS or PERSONA_TARGET_CHARS`,
+      `lower PERSONA_MAX_TOKENS or SCENARIO_MAX_TOKENS`,
   )
 }
+
 /**
- * The FLOOR on the per-member budget: one worst-shaped L2 scenario row rendered
- * WITH its id (recall renders `withId=true`, and the id is 36 characters the
- * injection path never pays). A per-member budget below this would admit
- * nothing at all from a member whose store holds only scenario blocks — a
- * feature that is on, approved, and silently empty.
+ * GUARD 2 (satisfiability). The character targets we ASK the model for must fit
+ * the token ceilings we then cut them to, at the worst density we are willing
+ * to price.
+ *
+ * Guard 1 proves the ceilings fit the packet. It says nothing about whether the
+ * REQUEST fits the ceilings, and without that second question the two halves of
+ * this design come apart in a way nothing would report:
+ *
+ * - `prompts.ts` keeps asking the model for a character count (correctly — a
+ *   model cannot count our tokens), so `ROLLUP_TARGET_CHARS` remains a real
+ *   input to a real request while no longer being the thing enforced. Before
+ *   this guard existed in this form, `ROLLUP_TARGET_CHARS` was bounded by the
+ *   capacity guard; move the enforcement to tokens and that constant becomes
+ *   UNGUARDED. This guard is now its ONLY keeper — measured against today's
+ *   code by deleting this block and re-loading the module:
+ *
+ *       640 -> no throw     700 -> no throw     900 -> no throw
+ *
+ *   including 900, the historical value the live store was measured at. An
+ *   earlier draft of this comment said 700 and 900 would still be caught by
+ *   `RECALL_FOREIGN_BUDGET_TOKENS` "for an unrelated reason". That was true of
+ *   the naive prototype and is FALSE here: guard 3 below now prices the row as
+ *   the writer would CUT it, so it no longer varies with this constant at all,
+ *   and the incidental catch is gone with it. Nothing else in this file reads
+ *   `ROLLUP_TARGET_CHARS` for a bound.
+ * - Truncation would silently become the NORMAL path. `TRUNCATION_MARK` costs
+ *   10 tokens of the 188 it is cut into, so a target that routinely overshoots
+ *   spends real briefing on a marker announcing that briefing was lost, on
+ *   every block, forever. The mark is meant to be seen rarely enough to mean
+ *   something.
+ *
+ * So this asserts the request is SATISFIABLE: a worst-shaped body of the
+ * requested length is priced through the real `renderEntry` and must land under
+ * the ceiling. It binds the character target and the rendered shape at once,
+ * and it is the reason `DERIVED_WORST_LINE_CHARS` and `worstShapedBody` remain
+ * — their job changed from computing the ceiling to certifying the request.
+ *
+ * Measured at the shipped values: 620 chars at 1 newline per 30 costs 183 of
+ * 188 and at 1 per 22 costs 187, while 640@1/30 costs 189 and 620@1/10 costs
+ * 204 — both fire. The portrait is exact rather than slack (600@1/30 = 171 of
+ * 171) because `PERSONA_MAX_TOKENS` is defined AS that price; a portrait denser
+ * than `DERIVED_WORST_LINE_CHARS` is now truncated to fit instead of dropped
+ * whole, which is the defect this round repaired.
+ */
+const satisfiability: readonly (readonly [string, string, number, number, string])[] = [
+  ['L2 scenario', 'fact', ROLLUP_TITLE_TARGET_CHARS, ROLLUP_TARGET_CHARS, 'ROLLUP_TARGET_CHARS'],
+  ['L3 portrait', 'preference', PERSONA_TITLE.length, PERSONA_TARGET_CHARS, 'PERSONA_TARGET_CHARS'],
+]
+for (const [label, kind, titleChars, bodyChars, targetName] of satisfiability) {
+  const ceiling = kind === 'fact' ? SCENARIO_MAX_TOKENS : PERSONA_MAX_TOKENS
+  const requested = worstDerivedRowTokens(kind, titleChars, bodyChars)
+  if (requested > ceiling) {
+    throw new Error(
+      `strataloom: the derived layer cannot fit its own packet — the ${label} target ` +
+        `${targetName} (${bodyChars} chars) prices at ${requested} tokens at the worst shape ` +
+        `we bill for (one newline per ${DERIVED_WORST_LINE_CHARS} chars), above its ceiling ` +
+        `of ${ceiling}; every block would be truncated as a matter of course, so lower ` +
+        `${targetName} or re-solve the ceiling against INJECT_BODY_BUDGET_TOKENS ` +
+        `(${INJECT_BODY_BUDGET_TOKENS})`,
+    )
+  }
+}
+/**
+ * GUARD 3 (lower bound). The FLOOR on the per-member budget: the dearest L2
+ * scenario row the write path can legally store, rendered WITH its id (recall
+ * renders `withId=true`, and the id is 36 characters the injection path never
+ * pays). A per-member budget below this would admit nothing at all from a
+ * member whose store holds only scenario blocks — a feature that is on,
+ * approved, and silently empty.
+ *
+ * ## Why the worst row had to be re-solved
+ *
+ * It used to be "`worstShapedBody(ROLLUP_TARGET_CHARS)`" — the worst row a
+ * CHARACTER limit admits. The write path no longer enforces characters, so that
+ * shape stopped being the boundary of what can be stored, and the question
+ * changed to: among all bodies the injection cap admits (<= 188 rendered
+ * tokens), which is dearest on the RECALL path?
+ *
+ * The two paths price the same body differently, which is what makes this a
+ * real question rather than a rescaling. Injection renders
+ * `- [fact] {title}: {body}` (11 chars of shell), recall adds the id and the
+ * `(from …)` label at `SOURCE_LABEL_MAX_CHARS` (125 chars of shell). Both pay
+ * +2 per newline. So the adversary maximises the RECALL length subject to the
+ * INJECT length fitting — and because the two differ only by a constant shell,
+ * the answer is the body that SATURATES the inject cap with the most
+ * newline-inflated content. Solved by exhaustive search over title length,
+ * body length and newline count: a title of 0 and a body of 247 newlines,
+ * inject 752 chars = 188 tokens, recall 866 chars = **217 tokens**.
+ *
+ * 217 against `RECALL_FOREIGN_BUDGET_TOKENS` = 220 leaves **3 tokens**, down
+ * from 8 under the old character-bounded shape (which priced 212). That figure
+ * is written down because this budget has twice been pushed back by a change to
+ * the RENDERED SHAPE rather than to any number here — adding the id, then
+ * adding the `(from …)` label — and 3 tokens is roughly one such change of
+ * headroom. Anything that lengthens `renderEntry`'s shell, or raises
+ * `SCENARIO_MAX_TOKENS`, spends it. This guard throws rather than warns, so the
+ * next such change surfaces at load; the note exists so the person reading the
+ * throw knows the margin was 3 and not a comfortable unknown.
  *
  * It does not price a single-line synthetic body. `renderEntry` indents a
  * body's own newlines (`\n` → `\n␣␣`, +2 chars each), so `'x'.repeat(n)` is
  * blind to a whole dimension of the cost — the precise false-green ADR 0007
  * records, where a guard reported OK at a newline density that overflowed.
- * `worstShapedBody` is reused so this guard prices the same shape.
+ * The body is built by CUTTING an over-long body with the production
+ * `truncatedToBudget` at the production ceiling, so the guard prices a row the
+ * writer can actually emit rather than a shape assumed to bound it.
  *
  * The CEILING — the one that bounds `GROUP_MAX_MEMBERS` — is deliberately NOT
  * here. It has to price a rendered packet, which means calling `renderFramed`,
@@ -1226,10 +1476,35 @@ if (worstDerivedTokens > INJECT_BODY_BUDGET_TOKENS) {
  *
  * Neither guard asserts against `INJECT_BODY_BUDGET_TOKENS`. Group content
  * NEVER reaches the injection packet (that path is untouched by design — three
- * merged libraries measure 4104 tokens against a 1300 budget, 3.16x, and
- * ADR 0007's invariant already runs on 31 tokens of slack). Recall is a tool
- * result: a different container, so a different ruler.
+ * merged libraries measure 4104 tokens against a 1300 budget, 3.16x, and the
+ * derived-layer invariant runs on 1 token of slack, not the 31 ADR 0007
+ * recorded: the ceilings are now solved in tokens, so the slack is the
+ * remainder of `floor((1300 - 171) / 6)` rather than a margin left over from a
+ * character target). Recall is a tool result: a different container, so a
+ * different ruler.
  */
+const worstStorableScenarioBody = ((): string => {
+  // Over-long on purpose, then CUT by the production truncator at the
+  // production ceiling: whatever the writer would do to an oversized block is
+  // what this guard prices. Shaped rather than flat so the cut is exercised on
+  // a body carrying the newlines `renderEntry` bills for.
+  const oversized = worstShapedBody(ROLLUP_TARGET_CHARS * 4)
+  const cut = truncatedToBudget(
+    { id: '', kind: 'fact', title: 'x'.repeat(ROLLUP_TITLE_TARGET_CHARS), body: oversized },
+    SCENARIO_MAX_TOKENS,
+    false,
+  )
+  // The writer handles this case too (see `parseScenarios`); here it would mean
+  // the ceiling cannot hold even a marked empty body, so no scenario row could
+  // ever be stored and every number below would be vacuous.
+  if (cut === undefined) {
+    throw new Error(
+      `strataloom: SCENARIO_MAX_TOKENS (${SCENARIO_MAX_TOKENS}) is too small to store any ` +
+        'scenario body at all — even a fully truncated one does not fit its own mark',
+    )
+  }
+  return cut.body
+})()
 const worstForeignRowTokens = estimateTokens(
   renderEntry(
     {
@@ -1237,7 +1512,7 @@ const worstForeignRowTokens = estimateTokens(
       id: '123e4567-e89b-12d3-a456-426614174000',
       kind: 'fact',
       title: 'x'.repeat(ROLLUP_TITLE_TARGET_CHARS),
-      body: worstShapedBody(ROLLUP_TARGET_CHARS),
+      body: worstStorableScenarioBody,
       // A foreign row is the ONLY row that renders a `(from …)` label, and the
       // label is what makes the packet honest about whose memory it shows. It
       // is priced at the renderer's own ceiling (`SOURCE_LABEL_MAX_CHARS` —

@@ -429,7 +429,25 @@ test('the derived layer must fit the packet it exists to produce', async () => {
   // only because `620` happens not to — one rule, one expression, rather than
   // two that agree by luck. (Both probes assert `notEqual` afterwards, so a
   // silent non-match would be caught either way; this keeps them from drifting.)
-  const OVERSIZED = 900 // the historical value the live store was measured at
+  //
+  // 640, not the historical 900, because 640 is the BOUNDARY: it is the
+  // smallest value that trips the satisfiability guard — at the priced density
+  // 640 chars render to 189 against a ceiling of 188, where 639 renders to 188
+  // and still fits. A boundary probe pins where the rule actually begins to
+  // fail; a far-away value only shows that something, somewhere, threw.
+  //
+  // Stated as measurement rather than reasoning, because the reasoning here was
+  // wrong once: an earlier draft of this comment claimed 900 would be caught by
+  // `RECALL_FOREIGN_BUDGET_TOKENS` instead, "an unrelated guard for an
+  // unrelated reason". Measured against today's code, 640, 700 and 900 ALL
+  // throw from THIS guard and all name `ROLLUP_TARGET_CHARS` — guard 3 now
+  // prices the row as the writer would cut it, so it no longer varies with this
+  // constant and cannot catch it incidentally. 900 is therefore not a wrong-net
+  // probe, just a blunter one: it would keep passing if the threshold silently
+  // drifted anywhere below 900, which is exactly what a boundary probe refuses
+  // to do. The message assertions below are what keep either value honest about
+  // WHICH guard fired.
+  const OVERSIZED = 640
   const patched = source.replace(
     /export const ROLLUP_TARGET_CHARS = [\d_]+;/,
     `export const ROLLUP_TARGET_CHARS = ${OVERSIZED};`,
@@ -449,6 +467,16 @@ test('the derived layer must fit the packet it exists to produce', async () => {
         assert.match(error.message, /derived layer cannot fit/, 'names the rule it broke')
         assert.match(error.message, /\d+ tokens/, 'reports the worst case it measured')
         assert.match(error.message, /INJECT_BODY_BUDGET_TOKENS \(\d+\)/, 'reports the budget')
+        // The DERIVED guard, not whichever guard happens to fire first. Three
+        // load-time assertions now price rows built from this constant, and two
+        // of them are about other containers; a throw from those would mean the
+        // rule under test is unenforced while the test stays green.
+        assert.match(error.message, /ROLLUP_TARGET_CHARS/, 'names the constant the probe moved')
+        assert.doesNotMatch(
+          error.message,
+          /RECALL_FOREIGN_BUDGET_TOKENS/,
+          'the derived-layer guard must catch this, not the unrelated group-recall floor',
+        )
         return true
       },
     )
@@ -468,6 +496,7 @@ test('the derived layer must fit the packet it exists to produce', async () => {
     DERIVED_WORST_LINE_CHARS,
     worstPersonaTokens,
     worstScenarioTokens,
+    worstShapedBody,
   } = await import('../lib/constants.js')
 
   // THE invariant, restated as the one thing the whole fix rests on. Both
@@ -480,22 +509,33 @@ test('the derived layer must fit the packet it exists to produce', async () => {
     'worstPersona + ROLLUP_MAX_SCENARIOS x worstScenario must fit the body budget',
   )
 
-  // The guard prices NEWLINES, not just length. `renderEntry` indents a body's
-  // own newlines, so a guard fed `'x'.repeat(n)` would be blind to that whole
-  // dimension and would certify a packet that a bullet-list briefing
-  // overflows — measured: 1247 tokens at zero density, 1307 at 33 breaks per
-  // 1000 characters, with the old guard reporting green throughout. So the
-  // priced worst case must exceed the naive single-line one.
+  // The ceiling prices NEWLINES, not just length. `renderEntry` indents a
+  // body's own newlines, so a ceiling solved from `'x'.repeat(n)` would be
+  // blind to that whole dimension and would certify a packet that a bullet-list
+  // briefing overflows — measured: 1247 tokens at zero density, 1307 at 33
+  // breaks per 1000 characters, with the old guard reporting green throughout.
+  //
+  // Stated as an equality against the SHAPED price rather than the old
+  // inequality against the flat one. `worstPersonaTokens()` now returns a
+  // ceiling the write path cuts to, so "it exceeds a single line" no longer
+  // says where the number came from — it would stay true of a ceiling picked by
+  // hand. What must hold is that the ceiling IS the shaped price: that is the
+  // link between the constant and the text it claims to describe, and it is the
+  // same equality the load-time satisfiability guard enforces.
   const { estimateTokens, renderEntry } = await import('../lib/recall/render.js')
-  const singleLine = estimateTokens(
-    renderEntry(
-      { id: '', kind: 'preference', title: 'x'.repeat(26), body: 'x'.repeat(PERSONA_TARGET_CHARS) },
-      false,
-    ),
+  const priced = (body) =>
+    estimateTokens(
+      renderEntry({ id: '', kind: 'preference', title: 'x'.repeat(26), body }, false),
+    )
+  const singleLine = priced('x'.repeat(PERSONA_TARGET_CHARS))
+  assert.equal(
+    worstPersonaTokens(),
+    priced(worstShapedBody(PERSONA_TARGET_CHARS)),
+    'the portrait ceiling is the price of a worst-SHAPED portrait at full target length',
   )
   assert.ok(
     worstPersonaTokens() > singleLine,
-    'the guard must price a body shaped with newlines, not one synthetic line',
+    'and that is dearer than the naive single-line pricing it replaced',
   )
   assert.ok(
     DERIVED_WORST_LINE_CHARS > 0 && DERIVED_WORST_LINE_CHARS < PERSONA_TARGET_CHARS,
@@ -513,8 +553,9 @@ test('derived rows are truncated to their targets, not to the hard body cap', as
   // model produced rows that were legal, oversized, and unbudgeted. Asserting
   // the relationship (target, not cap) rather than a length keeps this true
   // when the target is re-tuned.
-  const { ROLLUP_TARGET_CHARS, ROLLUP_TITLE_TARGET_CHARS, PERSONA_TARGET_CHARS } =
+  const { ROLLUP_TITLE_TARGET_CHARS, PERSONA_TARGET_CHARS, SCENARIO_MAX_TOKENS } =
     await import('../lib/constants.js')
+  const { estimateTokens, renderEntry, TRUNCATION_MARK } = await import('../lib/recall/render.js')
   const { runRebuildJob, readRevision } = await import('../lib/pipeline/rebuild.js')
   const { openRegistry: openReg, cleanup: clean } = await import('./helpers.mjs')
 
@@ -566,7 +607,24 @@ test('derived rows are truncated to their targets, not to the hard body cap', as
 
   const row = store.db.prepare(`SELECT title, body FROM memories WHERE derived = 2`).get()
   assert.ok(row, 'the rebuild committed a scenario block')
-  assert.equal(row.body.length, ROLLUP_TARGET_CHARS, 'the body is cut to the ROLLUP target')
+  // The body is bounded by its RENDERED cost, not its length. `row.body.length
+  // === ROLLUP_TARGET_CHARS` was the old assertion and it is no longer even
+  // true of a correct row: the cut is by token, so the surviving length varies
+  // with the body's newline density (a flat body keeps ~681 chars, a dense one
+  // far fewer). Asserting the length back would re-assert the very unit the
+  // defect was made of. What must hold is the property the container spends:
+  // the entry the packet will render costs no more than one block's ceiling.
+  assert.ok(
+    estimateTokens(renderEntry({ id: '', kind: 'fact', ...row }, false)) <= SCENARIO_MAX_TOKENS,
+    `the stored block renders within its ceiling (${estimateTokens(
+      renderEntry({ id: '', kind: 'fact', ...row }, false),
+    )} <= ${SCENARIO_MAX_TOKENS})`,
+  )
+  // And it was genuinely CUT rather than admitted whole — otherwise the
+  // assertion above would pass for a model that simply answered briefly, and
+  // this test would stop being about enforcement at all.
+  assert.ok(row.body.length < BODY_OVERSHOOT, 'the oversized body really was cut')
+  assert.ok(row.body.endsWith(TRUNCATION_MARK), 'and the cut is visible in what was stored')
   assert.equal(row.title.length, ROLLUP_TITLE_TARGET_CHARS, 'the title is cut to its target')
   assert.ok(PERSONA_TARGET_CHARS > 0, 'the portrait target is the L3 counterpart of the same rule')
   registry.dispose()

@@ -185,6 +185,15 @@ export const withinBudget = <T extends RenderableHit>(
  * platform pruner deletes the middle of a long packet). A mark carried inside
  * the bullet arrives exactly when the truncated bytes arrive.
  *
+ * The wording names no particular budget, and that is load-bearing rather than
+ * vague. This mark reaches text through two containers now: the recall packet,
+ * where it is transient, and the STORED body of a derived row, where the write
+ * path cuts against the INJECTION budget and the mark is persisted. Saying
+ * "the recall budget" inside a row cut for injection is not imprecision, it is
+ * a false statement shipped to the model and kept in SQLite. One neutral
+ * phrasing is correct in both, and a second mark constant — one per budget —
+ * would be the same string written twice, which is what D8 forbids.
+ *
  * Annotated `: string` rather than left to infer its literal type. The guard in
  * `tools.ts` must be able to ask whether this is EMPTY — `''.includes('')` is
  * true, so a mark-presence test alone silently certifies every packet the
@@ -192,7 +201,7 @@ export const withinBudget = <T extends RenderableHit>(
  * that comparison is a compile error rather than a check. Widening the type is
  * what keeps the guard able to fail.
  */
-export const TRUNCATION_MARK: string = ' […truncated to fit the recall budget]'
+export const TRUNCATION_MARK: string = ' […truncated to fit the memory budget]'
 
 /**
  * Cut ONE hit's body until the rendered entry fits `budgetTokens`, marking the
@@ -226,6 +235,24 @@ export const TRUNCATION_MARK: string = ' […truncated to fit the recall budget]
  * inversion of D3 — and it would not repair a single excerpt already written.
  * The bytes are correct where they are; only this one view of them is too
  * small, so the loss is taken here, and taken visibly.
+ *
+ * ## Why the DERIVED write path calls this too
+ *
+ * The paragraph above rejects a write-side cap for QUOTATIONS, and that verdict
+ * stands: an excerpt is evidence the writer chose, and cutting it in the store
+ * destroys the record permanently to please a display. A derived row is the
+ * opposite kind of object. It is text this codebase asked a model to produce,
+ * to a size this codebase chose, for one consumer — the injection packet — and
+ * it carries no evidentiary value the next rebuild does not regenerate.
+ *
+ * So `pipeline/rebuild.ts` cuts here, and cuts with THIS function rather than a
+ * second one. Its two write points used to bound a body's CHARACTERS while the
+ * container that spends it prices RENDERED TOKENS, and `renderEntry` indents
+ * every `\n` (+2 chars) — a unit mismatch that let a fully compliant 600-char
+ * portrait render at 172 tokens against a 171-token cap and be dropped WHOLE,
+ * because `withinBudget` skips rather than truncates. Measuring the write in
+ * the consumer's own unit is what closes that gap, and measuring it with the
+ * consumer's own code is what keeps it closed.
  *
  * ## Bounded by construction
  *
