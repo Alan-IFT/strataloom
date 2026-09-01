@@ -5,10 +5,17 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { MemoryService } from '../lib/service.js'
-import { buildContextProvider, countEntries, renderFramed, FRAMING_HEADER } from '../lib/recall/inject.js'
+import {
+  buildContextProvider,
+  countEntries,
+  renderFramed,
+  worstInjectionPacketTokens,
+  FRAMING_HEADER,
+} from '../lib/recall/inject.js'
 import { registerTools } from '../lib/tools.js'
 import { queryInjectionRows } from '../lib/store/fts.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
+import { INJECT_PACKET_BUDGET_TOKENS } from '../lib/constants.js'
 import { openRegistry, cleanup, fakeAgent, fakeCtx, tempRoot } from './helpers.mjs'
 
 const makeRepo = () => {
@@ -129,7 +136,10 @@ test('a memory skipped by the budget is reported, not silent', () => {
 
 test('a full packet stays within the §4.2 total budget (header included)', () => {
   // 40 entries is twice INJECT_TOP_N, so the budget — not the row cap — is
-  // what bounds this. The spec's ceiling is header + body ≤ 1400 tokens.
+  // what bounds this. The spec's ceiling is INJECT_PACKET_BUDGET_TOKENS
+  // (header + body); this fixture is a REALISTIC packet, not the worst one —
+  // the worst case is priced by the load-time guard and asserted against
+  // `worstInjectionPacketTokens()` below.
   const hits = Array.from({ length: 40 }, (_, i) => ({
     id: `m${i}`,
     kind: 'fact',
@@ -139,9 +149,129 @@ test('a full packet stays within the §4.2 total budget (header included)', () =
   const packet = renderFramed(hits, 1_300)
   assert.ok(packet.length > 0)
   assert.ok(
-    Math.ceil(packet.length / 4) <= 1_400,
+    Math.ceil(packet.length / 4) <= INJECT_PACKET_BUDGET_TOKENS,
     `packet must fit the total budget, got ~${Math.ceil(packet.length / 4)} tokens`,
   )
+})
+
+test('the WORST injection packet fits the §4.2 container, not just a typical one', () => {
+  // The fixture above is a realistic packet, and a realistic packet passing
+  // says nothing about the container: a control mutation raised the body
+  // budget and every 1400-mentioning assertion in this suite stayed green
+  // while the packet overflowed. This asserts the PROPERTY instead.
+  //
+  // Deliberately NOT rebuilding a worst-case shape here. The worst shape is
+  // the max over the derived path and the double-fallback path, and writing it
+  // out again would be a second implementation of a rule the guard already
+  // executes (D8) — the two would agree until the day they did not. The guard
+  // in `recall/inject.ts` prices it through the real `renderFramed`, and this
+  // reads that measurement. Same convention as `worstRecallPacketChars()`.
+  const worst = worstInjectionPacketTokens()
+  assert.ok(worst > 0, 'the guard must price a real packet, not an empty one')
+  assert.ok(
+    worst <= INJECT_PACKET_BUDGET_TOKENS,
+    `the worst injection packet prices at ${worst} tokens against a container of ` +
+      `${INJECT_PACKET_BUDGET_TOKENS}`,
+  )
+})
+
+test('the priced worst packet is an upper bound on a REALLY assembled double-fallback packet', async () => {
+  // The test above reads the guard's own number, so it cannot tell a guard
+  // that models both injection shapes from one that models only the cheap
+  // derived shape. Mutating `Math.max` to `Math.min` in `recall/inject.ts`
+  // deletes the entire fallback half — the half a plan review rejected the
+  // first design for omitting — and drops the priced worst from 1361 to 1352
+  // with the whole suite still green. A bound nothing independent is measured
+  // against is a constant, not a bound.
+  //
+  // So this assembles the worst shape FOR REAL — two stores, both in L1
+  // fallback, driven through `buildContextProvider` — and asserts the property
+  // the guard exists to promise: the priced worst is an UPPER BOUND on what
+  // the runtime can actually emit. Deliberately not a second computation of
+  // the bound (D8): nothing here re-derives `max(derived, fallback)` or names
+  // a token count. The fixture only has to REACH the fallback shape; the real
+  // provider prices it, and the guard has to cover whatever that costs.
+  //
+  // Why the fallback shape is the expensive one, and why a `min` guard misses
+  // it: the packet is `[header, '', ...lines].join('\n')`, so its length is
+  // `headerLen + 2 + Σ(entry lengths) + (E − 1)`. Per-entry `ceil` discards
+  // each entry's fractional remainder, so at a FIXED body spend the packet
+  // grows with the entry COUNT — and this shape carries `INJECT_TOP_N * 2`
+  // entries against the derived shape's `ROLLUP_MAX_SCENARIOS + 1`.
+  clearRepoIdentityMemo()
+  const repo = makeRepo()
+  const { root, registry } = openRegistry()
+  const principal = fakeAgent({ id: 'p', cwd: repo })
+  const ctx = fakeCtx({ agents: [principal] })
+  const svc = service(registry, ctx)
+  const { estimateTokens, packetTokens, renderEntry } = await import('../lib/recall/render.js')
+  const { INJECT_BODY_BUDGET_TOKENS, INJECT_TOP_N } = await import('../lib/constants.js')
+  const { MEMORY_KINDS } = await import('../lib/types.js')
+
+  // An entry billed `t` tokens spans at most `4t` characters (`ceil(len / 4)`),
+  // so filling to exactly `4t` is what makes a token spend buy the most packet.
+  // The kind comes from the enum and the shell from the real `renderEntry`, so
+  // the fixture follows the renderer instead of pinning today's widths.
+  const kind = [...MEMORY_KINDS].sort((a, b) => a.length - b.length)[0]
+  const shell = renderEntry({ id: '', kind, title: 'x', body: '' }, false).length
+  const bodyOf = (tokens) => 'y'.repeat(tokens * 4 - shell)
+  const cheapest = Math.ceil((shell + 1) / 4)
+  // Personal rows are held to the cheapest legal entry so the personal cap
+  // (`worstPersonaTokens()`) cannot trim any of them; the repo side then buys
+  // every remaining token of the body budget, with the last row absorbing the
+  // remainder so nothing is left unspent.
+  const repoBudget = INJECT_BODY_BUDGET_TOKENS - cheapest * INJECT_TOP_N
+  const repoEach = Math.floor(repoBudget / INJECT_TOP_N)
+
+  const seed = (store, visibility, provenance, prefix, costOf) =>
+    store.tx(() => {
+      for (let i = 0; i < INJECT_TOP_N; i++) {
+        store.db
+          .prepare(
+            `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+             VALUES (?, ?, ?, 'active', 'x', ?, ?, 0, ?)`,
+          )
+          .run(`${prefix}-${i}`, kind, visibility, bodyOf(costOf(i)), provenance, INJECT_TOP_N - i)
+      }
+    })
+  const personal = registry.openGlobal()
+  seed(personal, 'private', 'principal-explicit', 'personal', () => cheapest)
+  const store = svc.storeFor(principal, true)
+  seed(store, 'repo-local', 'human', 'repo', (i) =>
+    i === INJECT_TOP_N - 1 ? repoBudget - repoEach * (INJECT_TOP_N - 1) : repoEach,
+  )
+
+  // The fixture must really be the shape it claims, or the bound below is
+  // asserted against something cheap and passes for the wrong reason — the
+  // fixture-homogeneity failure this suite has already paid for once.
+  const derivedRows = (s) =>
+    s.db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c
+  assert.equal(derivedRows(personal), 0, 'the personal side must take the L1 fallback branch')
+  assert.equal(derivedRows(store), 0, 'and so must the repo side — this is the DOUBLE fallback')
+  const hits = [...queryInjectionRows(personal), ...queryInjectionRows(store)]
+  assert.equal(hits.length, INJECT_TOP_N * 2, 'both sides must return a full INJECT_TOP_N page')
+  assert.equal(
+    packetTokens(hits),
+    INJECT_BODY_BUDGET_TOKENS,
+    'and together they must spend the whole body budget, leaving no token unbought',
+  )
+
+  const packet = buildContextProvider(ctx, svc)({ agent: principal })
+  assert.equal(
+    countEntries(packet),
+    INJECT_TOP_N * 2,
+    'every seeded row must survive the personal cap and the packet budget',
+  )
+  const actual = estimateTokens(packet)
+  assert.ok(
+    worstInjectionPacketTokens() >= actual,
+    `the guard prices the worst injection packet at ${worstInjectionPacketTokens()} tokens, but a ` +
+      `real double-fallback packet assembled through buildContextProvider costs ${actual} ` +
+      `(${countEntries(packet)} entries, ${packet.length} chars). The guard is not an upper ` +
+      'bound: it is not pricing the fallback shape.',
+  )
+  registry.dispose()
+  cleanup(root)
 })
 
 test('a memory cannot break out of its bullet to address the model directly', () => {
@@ -314,7 +444,7 @@ test('the personal store cannot starve the repo store: its contribution is cappe
   // ...and personal is still represented: this is a CAP, not an eviction.
   assert.match(packet, /a personal preference/, 'the personal side still contributes')
   assert.ok(
-    estimateTokens(packet) <= 1_400,
+    estimateTokens(packet) <= INJECT_PACKET_BUDGET_TOKENS,
     'and the whole packet still respects the spec §4.2 total',
   )
 

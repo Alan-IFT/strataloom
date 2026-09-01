@@ -56,12 +56,41 @@ export const BUSY_BACKOFF_MS = 50
 export const SLOW_STATEMENT_MS = 50
 
 /**
- * Injection body budget (spec §4.2: header + body ≤1400). The header is a
- * fixed string, so its size is a measurable fact rather than a budget to
- * enforce — `test/inject.test.mjs` asserts header + body stays under the
- * total instead of reserving an unused allowance for it.
+ * Injection body budget — the INTERNAL quota, not the container.
+ *
+ * The container is `INJECT_PACKET_BUDGET_TOKENS` (header + body), and this is
+ * what the body alone may spend inside it. The two numbers are separate
+ * because they answer separate questions: `renderFramed` subtracts entry costs
+ * from THIS one at runtime, while the spec's ceiling applies to the string the
+ * model actually receives — header included.
+ *
+ * The header is a fixed string, so its size is a measurable fact rather than a
+ * budget to enforce; the guard in `recall/inject.ts` prices it as part of the
+ * packet instead of reserving an unused allowance for it here.
  */
 export const INJECT_BODY_BUDGET_TOKENS = 1_300
+/**
+ * The injection packet's REAL container: framing header + body, in tokens.
+ *
+ * This is the OUTERMOST ruler on the injection path (ADR 0009), and it is the
+ * number spec §4.2 states — "头部框定 100 tok + 正文 ≤1300 tok，总 ≤1400". Until
+ * this constant existed the total was enforced NOWHERE: `INJECT_BODY_BUDGET_TOKENS`
+ * bounds only the body, and the four test assertions that mentioned 1400 typed
+ * it as a bare literal against fixtures that are not worst-case, so they stayed
+ * green while nothing measured the container at all.
+ *
+ * It follows the `GUIDANCE_BUDGET_TOKENS` precedent: the constant REPLACES the
+ * prose, so the limit lives in one executable place rather than being restated
+ * beside every assertion that happens to care. The guard that spends it is in
+ * `recall/inject.ts`, beside the `renderFramed` call it constrains — it must
+ * price a packet through the real renderer, and putting that here would close
+ * the `constants → inject → constants` cycle `render.ts` exists to keep open.
+ *
+ * `worstInjectionPacketTokens()` reports the measured worst; do not restate the
+ * margin here, for the reason `worstRecallPacketChars` records — a quoted
+ * figure goes stale silently while the test that calls the function stays green.
+ */
+export const INJECT_PACKET_BUDGET_TOKENS = 1_400
 /** Top-N rows fetched for injection before budget truncation. */
 export const INJECT_TOP_N = 20
 

@@ -27,6 +27,7 @@ import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import {
   EXTRACT_EVENT_EXCERPT_CHARS,
   INJECT_BODY_BUDGET_TOKENS,
+  INJECT_PACKET_BUDGET_TOKENS,
   INJECT_TOP_N,
   L0_RETENTION_MS,
   RECALL_PACKET_BUDGET_TOKENS,
@@ -1326,7 +1327,7 @@ test('derived layer engages only on overflow and replaces the raw set', async ()
   const packet = buildContextProvider(ctx, service)({ agent: principal })
   assert.match(packet, /use pnpm; deploy with make/)
   assert.doesNotMatch(packet, /fact number 3 about/, 'raw entries are replaced, not appended')
-  assert.ok(estimateTokens(packet) <= 1400, 'and it fits the budget')
+  assert.ok(estimateTokens(packet) <= INJECT_PACKET_BUDGET_TOKENS, 'and it fits the budget')
   registry.dispose()
   cleanup(root)
 })
@@ -1449,7 +1450,7 @@ test('L2: a rebuild emits scenario blocks, and they vanish with their L1 (D9)', 
   assert.match(packet, /Auth refactor/)
   assert.match(packet, /CI and release/)
   assert.doesNotMatch(packet, /fact number 3 about/, 'raw entries are replaced')
-  assert.ok(estimateTokens(packet) <= 1400)
+  assert.ok(estimateTokens(packet) <= INJECT_PACKET_BUDGET_TOKENS)
 
   // 2) One authoritative write to the RAW layer retires every block — no new
   // invalidation path was written for L2; it rides the v5 triggers.

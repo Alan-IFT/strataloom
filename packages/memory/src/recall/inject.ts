@@ -12,7 +12,19 @@ import type { AssembleContext } from '@deepseek-ai/dsh-system-prompt'
 import type { MemoryService } from '../service.ts'
 import { isLineagePrincipal } from '../identity.ts'
 import { queryInjectionRows } from '../store/fts.ts'
-import { INJECT_BODY_BUDGET_TOKENS, worstPersonaTokens } from '../constants.ts'
+import {
+  INJECT_BODY_BUDGET_TOKENS,
+  INJECT_PACKET_BUDGET_TOKENS,
+  INJECT_TOP_N,
+  PERSONA_MAX_TOKENS,
+  ROLLUP_MAX_SCENARIOS,
+  SCENARIO_MAX_TOKENS,
+  worstPersonaTokens,
+  worstScenarioTokens,
+} from '../constants.ts'
+// The kind enum is READ rather than quoted, so the cheapest legal entry is
+// derived from the domain instead of from a literal typed here.
+import { MEMORY_KINDS } from '../types.ts'
 import {
   estimateTokens,
   packetTokens,
@@ -128,6 +140,158 @@ export const renderFramed = (
     : FRAMING_HEADER
   return [header, '', ...lines].join('\n')
 }
+
+/* ── THE injection packet guard: the container spec §4.2 actually states ─────
+
+   `INJECT_BODY_BUDGET_TOKENS` bounds the BODY. Nothing bounded the packet —
+   header plus body — which is the string the model receives and the only thing
+   §4.2's 1400 was ever about. Four test assertions mentioned 1400 and all four
+   were bare literals over hand-built fixtures that are not worst-case; a
+   control mutation raised the body budget and every one of them stayed green
+   while the container overflowed. A number nothing measures is not a limit.
+
+   It lives HERE rather than in `constants.ts` because it must price a packet
+   through the REAL `renderFramed`, and `constants.ts` calling that closes the
+   `constants → inject → constants` cycle `render.ts` exists to keep open (see
+   that module's header for the measured TDZ crash). This file ALREADY imports
+   `constants.ts`, so the guard adds no import edge at all.
+
+   And it lives here rather than in `tools.ts`, where the RECALL packet guard
+   sits, because that precedent is about placement next to the render call:
+   `tools.ts` renders the recall packet, `buildContextProvider` below renders
+   the injection packet. Each guard belongs beside the call it constrains. */
+/**
+ * The cheapest entry the write path can legally store, in tokens.
+ *
+ * DERIVED, never written down: `service.ts` rejects an empty title and an empty
+ * body and `kind` comes from a closed enum, so the floor is the shortest kind
+ * with one character of each — priced through the real `renderEntry`. Writing
+ * "4" here would be the same number typed twice, and it moves the moment the
+ * renderer's shell or the enum does.
+ */
+const cheapestEntryTokens = estimateTokens(
+  renderEntry(
+    {
+      id: '',
+      kind: [...MEMORY_KINDS].sort((a, b) => a.length - b.length)[0] ?? '',
+      title: 'x',
+      body: 'y',
+    },
+    false,
+  ),
+)
+
+/**
+ * An entry costing exactly `tokens` tokens and spanning the MOST characters
+ * that can buy — the adversary the container actually has.
+ *
+ * `estimateTokens` is `ceil(len / 4)`, so an entry billed `c` tokens spans at
+ * most `4c` characters, and filling to exactly `4c` makes the bound tight. This
+ * is the same reasoning `worstPacketFillEntry` records for the recall packet,
+ * and it is why the worst injection packet is NOT the worst-token shape.
+ */
+const fillEntry = (tokens: number): RenderableHit => {
+  const kind = [...MEMORY_KINDS].sort((a, b) => a.length - b.length)[0] ?? ''
+  const shell = renderEntry({ id: '', kind, title: 'x', body: '' }, false).length
+  return { id: '', kind, title: 'x', body: 'y'.repeat(tokens * 4 - shell) }
+}
+
+/**
+ * The worst packet `buildContextProvider` can render, priced through the real
+ * `renderFramed` at the real budget — the MAX over both shapes injection has.
+ *
+ * ## Why both shapes, and why the fallback is the worse one
+ *
+ * `queryInjectionRows` returns derived rows when any exist and otherwise falls
+ * back to up to `INJECT_TOP_N` raw L1 rows. `buildContextProvider` calls it
+ * ONCE PER SIDE — personal and repo — so both sides can be in fallback at the
+ * same time, and the global store takes that branch often (D9's triggers delete
+ * the L3 portrait on any personal raw write; measured absent 41.5% of the time).
+ * The entry count is therefore `INJECT_TOP_N * 2`, not `ROLLUP_MAX_SCENARIOS + 1`.
+ *
+ * That matters because the packet is `[header, '', ...lines].join('\n')`, i.e.
+ * `headerLen + 2 + Σ(entry lengths) + (E − 1)` characters. Per-entry `ceil`
+ * throws away each entry's fractional remainder, so the tight bound RISES WITH
+ * E: the derived shape (E=7) is the CHEAPEST shape, not the worst. Pricing only
+ * the derived path would have reported a false green — the mutation
+ * `INJECT_TOP_N` 20 → 155 overflows the container and the derived shape does
+ * not move a token.
+ *
+ * The derived side is still priced, because the two are not ordered by
+ * construction: raising `PERSONA_MAX_TOKENS` or `SCENARIO_MAX_TOKENS` moves the
+ * derived shape alone. `max` over both means neither can be raised silently.
+ *
+ * ## Why `FRAMING_HEADER` and not `FRAMING_HEADER_MIXED`
+ *
+ * `renderFramed` picks MIXED only when some kept hit has `source !== undefined`,
+ * and nothing on this path can set it: `queryInjectionRows` selects only
+ * `id, kind, title, body` (`store/fts.ts`), `MemoryHit` (`types.ts`) has no
+ * `source`, and `buildContextProvider` never reads group declarations. So the
+ * guard prices the header the runtime renders — the ADR 0009 rule, that the
+ * measured container must be the one the runtime actually spends.
+ *
+ * A coincidence worth writing down, because it is a trap rather than a comfort:
+ * MIXED costs exactly +39 tokens, and the margin this guard measures at the
+ * shipped constants is exactly 39. The equality is arithmetic accident, not
+ * design — but it means that the day a foreign entry becomes reachable from the
+ * injection path, the container is spent to the last token. Whoever makes that
+ * change must re-price this guard against MIXED, and this guard will not tell
+ * them, because a `source` field is exactly what it does not model.
+ */
+const worstPacketTokens = ((): number => {
+  // Derived shape: one worst portrait plus the most blocks a rebuild can emit,
+  // each at the ceiling its writer cuts to. Both come from the functions
+  // `constants.ts` guards the derived layer with — one rule, two containers.
+  const derivedHits = [
+    fillEntry(worstPersonaTokens()),
+    ...Array.from({ length: ROLLUP_MAX_SCENARIOS }, () => fillEntry(worstScenarioTokens())),
+  ]
+  // Fallback shape: both sides in L1 fallback at once. The personal side is
+  // capped at `worstPersonaTokens()` by `buildContextProvider` below, so it
+  // spends that; the repo side spends what remains of the body budget. Each
+  // side is separately bounded by `INJECT_TOP_N` rows.
+  const side = (budgetTokens: number): RenderableHit[] => {
+    const count = Math.min(INJECT_TOP_N, Math.floor(budgetTokens / cheapestEntryTokens))
+    if (count <= 0) return []
+    // The last entry absorbs the remainder, so the side spends its whole budget
+    // rather than leaving `budget % cheapest` tokens unbought.
+    return [
+      ...Array.from({ length: count - 1 }, () => fillEntry(cheapestEntryTokens)),
+      fillEntry(budgetTokens - (count - 1) * cheapestEntryTokens),
+    ]
+  }
+  const fallbackHits = [
+    ...side(worstPersonaTokens()),
+    ...side(INJECT_BODY_BUDGET_TOKENS - worstPersonaTokens()),
+  ]
+  // Rendered by the very function `buildContextProvider` renders by, at the
+  // very budget it passes, with the same `withId` default: what this measures
+  // IS what a model receives.
+  return Math.max(
+    estimateTokens(renderFramed(derivedHits, INJECT_BODY_BUDGET_TOKENS)),
+    estimateTokens(renderFramed(fallbackHits, INJECT_BODY_BUDGET_TOKENS)),
+  )
+})()
+
+if (worstPacketTokens > INJECT_PACKET_BUDGET_TOKENS) {
+  throw new Error(
+    `strataloom: the worst injection packet prices at ${worstPacketTokens} tokens, past the ` +
+      `INJECT_PACKET_BUDGET_TOKENS (${INJECT_PACKET_BUDGET_TOKENS}) container spec §4.2 states ` +
+      'for framing header + body. The packet is assembled on every turn, so the overflow is ' +
+      'paid by every request. Lower INJECT_BODY_BUDGET_TOKENS ' +
+      `(${INJECT_BODY_BUDGET_TOKENS}), INJECT_TOP_N (${INJECT_TOP_N}), PERSONA_MAX_TOKENS ` +
+      `(${PERSONA_MAX_TOKENS}), SCENARIO_MAX_TOKENS (${SCENARIO_MAX_TOKENS}) or ` +
+      `ROLLUP_MAX_SCENARIOS (${ROLLUP_MAX_SCENARIOS})`,
+  )
+}
+
+/**
+ * The priced worst injection packet, exported so tests assert this rather than
+ * restating a number — the `worstRecallPacketChars` / `worstQuotePacketChars`
+ * convention, for the reason recorded there: a quoted figure rots silently
+ * while the test that calls the function stays green.
+ */
+export const worstInjectionPacketTokens = (): number => worstPacketTokens
 
 /**
  * The prompt variable the packet is delivered through, and the entire text of
