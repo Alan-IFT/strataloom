@@ -13,16 +13,28 @@ import { GLOBAL_STORE_KEY } from '../lib/store/store.js'
 import { captureTurn, readTurn, pruneConversations } from '../lib/store/conversations.js'
 import { collectTurnEvents, QUOTE_LABEL, QUOTE_SEQ } from '../lib/transcript.js'
 import { runExtractJob } from '../lib/pipeline/extract.js'
-import { buildContextProvider, renderFramed, FRAMING_HEADER } from '../lib/recall/inject.js'
+import {
+  buildContextProvider,
+  packetTokens,
+  renderFramed,
+  withinBudget,
+  FRAMING_HEADER,
+} from '../lib/recall/inject.js'
 import { renderEntry, TRUNCATION_MARK } from '../lib/recall/render.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import {
   EXTRACT_EVENT_EXCERPT_CHARS,
+  INJECT_BODY_BUDGET_TOKENS,
+  INJECT_TOP_N,
   L0_RETENTION_MS,
   RECALL_PACKET_BUDGET_TOKENS,
+  ROLLUP_MAX_SCENARIOS,
+  ROLLUP_TARGET_CHARS,
+  ROLLUP_TITLE_TARGET_CHARS,
   ROLLUP_TRANSCRIPT_CHARS,
   SOURCE_TURN_LIMIT,
   WORST_SOURCE_SEQS,
+  worstPersonaTokens,
 } from '../lib/constants.js'
 import { collectMetrics } from '../lib/metrics.js'
 import { RECALL_NO_MATCH, SOURCE_NOT_SHOWN, registerTools } from '../lib/tools.js'
@@ -36,7 +48,7 @@ import {
 import { estimateTokens } from '../lib/constants.js'
 import { looksSecret, projectStore, PROJECTION_DIR, PROJECTION_FILE } from '../lib/projection.js'
 import { enqueueJob, claimNextJob, commitClaimedJob } from '../lib/pipeline/jobs.js'
-import { queryInjectionRows } from '../lib/store/fts.js'
+import { queryInjectableSet, queryInjectionRows } from '../lib/store/fts.js'
 import {
   openRegistry,
   cleanup,
@@ -988,7 +1000,7 @@ test('metrics snapshot reports the §12 trigger indicators from the store', asyn
   const m = collectMetrics(store, Date.now())
   assert.equal(m.kind, 'repo')
   assert.equal(m.activeCount, 1, 'one survivor')
-  assert.ok(m.packetTokens > 0, 'packet size is measured, not guessed')
+  assert.ok(m.injectableTokens > 0, 'packet size is measured, not guessed')
   assert.equal(m.retrievedRate, 1, 'the survivor was recalled once')
   assert.ok(m.overturnRate > 0 && m.overturnRate < 1, `overturn tracked: ${m.overturnRate}`)
   assert.equal(m.pendingJobs, 0)
@@ -1445,6 +1457,166 @@ test('L2: a rebuild emits scenario blocks, and they vanish with their L1 (D9)', 
     'every scenario block goes when the set it described changes',
   )
   assert.ok(readRevision(store) > rev0, 'and the revision advanced, fencing a queued rebuild')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('metrics price the container injection READS, and the repo side takes no cap', async () => {
+  // Two halves of one rule, and the second half is why this fixture is not a
+  // single small block. A summary REPLACES the raw set it summarizes, so the
+  // metric must price the derived rows (half one) — and it must price them
+  // WHOLE, because the personal-side cap belongs to the personal store alone
+  // (half two). A fixture with one cheap block cannot see half two: any cap
+  // large enough to be plausible leaves one cheap block untouched, so the test
+  // passes whether or not the cap is wrongly applied here.
+  //
+  // So the blocks are written at the maximum the write path admits
+  // (`ROLLUP_MAX_SCENARIOS` of them, each at `ROLLUP_TITLE_TARGET_CHARS` /
+  // `ROLLUP_TARGET_CHARS`), which puts EVERY block above `worstPersonaTokens()`
+  // individually. A cap misapplied to this store therefore skips all of them
+  // and the value collapses to zero — the shape that let a mutation destroy
+  // 8 of 9 live stores' numbers, one of them to zero, with nothing red.
+  //
+  // Both expectations are computed by the production functions rather than
+  // written down: hard-coding either would lock in today's fixture instead of
+  // the rule.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await overflow(service, principal)
+
+  const rawPrice = packetTokens(queryInjectableSet(store, INJECT_TOP_N))
+  const fat = (n) => ({
+    title: `scenario ${n} `.padEnd(ROLLUP_TITLE_TARGET_CHARS, 'x'),
+    body: `the ${n}th scenario block, written at the enforced maximum. `.padEnd(
+      ROLLUP_TARGET_CHARS,
+      'x',
+    ),
+  })
+  ctx.get = (name) =>
+    name === 'llm'
+      ? rollupReply(Array.from({ length: ROLLUP_MAX_SCENARIOS }, (_, i) => fat(i)))
+      : undefined
+  const rev0 = readRevision(store)
+  enqueueJob(store, 'rebuild', 'rb-metrics', { expectedRevision: rev0, provider: 'p', model: 'm' }, 0)
+  await runRebuildJob(
+    ctx, store, claimNextJob(store, Date.now(), Date.now() + 60_000),
+    { expectedRevision: rev0, provider: 'p', model: 'm' }, new AbortController().signal,
+  )
+
+  const derived = queryInjectionRows(store)
+  assert.equal(derived.length, ROLLUP_MAX_SCENARIOS, 'precondition: a full derived layer')
+  assert.ok(
+    derived.every((hit) => packetTokens([hit]) > worstPersonaTokens()),
+    'precondition: every block outprices the personal cap, so a wrong cap would zero this',
+  )
+
+  const m = collectMetrics(store, Date.now())
+  // Half one: the container is the derived rows, not the set they replaced.
+  assert.equal(m.injectableTokens, packetTokens(derived), 'the metric prices what is offered')
+  assert.notEqual(m.injectableTokens, rawPrice, 'and not the set the summary replaced')
+  // Half two: uncapped on this side. Stated against the capped alternative so
+  // the assertion fails if the personal ceiling is ever applied here.
+  assert.notEqual(
+    packetTokens(withinBudget(derived, worstPersonaTokens())),
+    packetTokens(derived),
+    'precondition: the two alternatives are distinguishable on this fixture',
+  )
+  assert.notEqual(
+    m.injectableTokens,
+    packetTokens(withinBudget(derived, worstPersonaTokens())),
+    'the repo side is NOT held to the personal store ceiling',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('the global metric is capped by the same bound injection caps personal with', async () => {
+  // D9's triggers delete the L3 portrait on ANY personal raw write, and
+  // `queryInjectionRows` then falls back to raw atoms bounded in COUNT only.
+  // `buildContextProvider` caps that fallback at `worstPersonaTokens()` — the
+  // cost of the portrait it stands in for — so an uncapped metric would report
+  // tokens the packet never carries (34.1x on the live global store).
+  //
+  // The rows are deliberately UNEQUAL in size, alternating one that cannot fit
+  // beside a cheap one that can. `withinBudget` skips an entry that does not
+  // fit and keeps going (`render.ts`: priority order means one fat row must not
+  // hide the cheap rows behind it), and equal-sized rows never exercise that:
+  // with uniform costs the loop degenerates into `slice(0, k)`, and a mutation
+  // replacing the budget rule with exactly that slice passes unnoticed. Here
+  // the kept set is provably not a prefix.
+  const { root, registry, principal, service } = setup()
+  const propose = (i, body) =>
+    service.propose(
+      { title: `preference number ${i} about how to work`, body, kind: 'preference', scope: 'personal' },
+      principal,
+    )
+  for (let i = 0; i < 20; i++) {
+    // Odd rows are individually larger than the whole cap; even rows are cheap.
+    await propose(i, i % 2 === 1
+      ? `a long statement of taste, number ${i}, that alone outprices the cap. `.repeat(12)
+      : `terse taste ${i}.`)
+  }
+  const global = registry.get(GLOBAL_STORE_KEY)
+  const rows = queryInjectionRows(global)
+  const kept = withinBudget(rows, worstPersonaTokens())
+  assert.ok(
+    packetTokens(rows) > worstPersonaTokens(),
+    'precondition: the uncapped personal fallback overruns the cap it is held to',
+  )
+  assert.ok(
+    rows.some((hit) => packetTokens([hit]) > worstPersonaTokens()),
+    'precondition: at least one row cannot fit the cap at all',
+  )
+  // The skip-not-stop property itself: what survives is NOT a prefix of what
+  // was offered, so a `slice` cannot stand in for the budget rule.
+  assert.notDeepEqual(
+    kept.map((hit) => hit.id),
+    rows.slice(0, kept.length).map((hit) => hit.id),
+    'precondition: the budget skips over a fat row and keeps a later cheap one',
+  )
+
+  const m = collectMetrics(global, Date.now())
+  assert.ok(
+    m.injectableTokens <= worstPersonaTokens(),
+    `personal is reported within its cap: ${m.injectableTokens} <= ${worstPersonaTokens()}`,
+  )
+  assert.equal(
+    m.injectableTokens,
+    packetTokens(kept),
+    'and it is the runtime selection that is priced, by the same function',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('injectableTokens is a candidate price: the packet budget is NOT applied here', async () => {
+  // The promise this field makes, pinned so the "obvious fix" cannot land
+  // silently. A store CAN offer more than `INJECT_BODY_BUDGET_TOKENS`, and
+  // this field reports that overrun rather than clamping it: the real packet
+  // budget is spent on personal and repo rows CONCATENATED, inside
+  // `renderFramed`, so a per-store clamp here would be a third implementation
+  // of the selection rule and a different approximation — not a closer one.
+  //
+  // A mutation adding `withinBudget(injectable, INJECT_BODY_BUDGET_TOKENS)`
+  // must therefore turn this RED. That is not a regression being caught; it is
+  // a decision being enforced (ADR 0009: where the implementation is left
+  // alone, the promise is what gets corrected — hence "injectable", not
+  // "injected").
+  const { root, registry, principal, service } = setup()
+  const store = service.storeFor(principal, true)
+  await overflow(service, principal)
+
+  const offered = queryInjectionRows(store)
+  assert.ok(
+    packetTokens(offered) > INJECT_BODY_BUDGET_TOKENS,
+    'precondition: this store offers more than one packet can carry',
+  )
+  const m = collectMetrics(store, Date.now())
+  assert.equal(m.injectableTokens, packetTokens(offered), 'the whole candidate set is priced')
+  assert.ok(
+    m.injectableTokens > INJECT_BODY_BUDGET_TOKENS,
+    'exceeding the packet budget is reportable, not an anomaly to be clamped',
+  )
   registry.dispose()
   cleanup(root)
 })

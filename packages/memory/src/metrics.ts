@@ -9,18 +9,26 @@
  * The set is not arbitrary — these are exactly the trigger indicators §12
  * names for the deferred capabilities, so "should we enable X" is answered
  * with data rather than taste:
- *   packetTokens / injectableCount → derived summary layer (Packet overflow)
+ *   injectableTokens               → what this store OFFERS the next packet
  *   activeCount / retrievedRate    → dormant/decay (recall signal-to-noise)
  *   overturnRate                   → continuous trust (real misjudgements)
  *   recallMissRate                 → retrieval fusion (see the caveat below)
  *   oldestPendingJobAgeMs / deadLettered → pipeline health
+ *
+ * `injectableTokens` is an OBSERVATION, not the §12 derived-layer trigger. The
+ * trigger is `packetOverflows` in `pipeline/rebuild.ts`, and it deliberately
+ * prices a different container: this field prices the rows injection would
+ * draw from (derived rows when they exist), while the trigger prices the raw
+ * set the derived layer would be built FROM. Reading either as the other
+ * inverts the answer — see `packetOverflows` for why the two must not
+ * converge. What the field does NOT price is stated on the field itself.
  * @module @strataloom/dsh-memory/metrics
  */
 import type { OpenStore } from './store/store.ts'
-import { INJECT_TOP_N } from './constants.ts'
-import { queryInjectableSet } from './store/fts.ts'
+import { worstPersonaTokens } from './constants.ts'
+import { queryInjectionRows } from './store/fts.ts'
 import { RECALL_NO_MATCH } from './tools.ts'
-import { packetTokens } from './recall/inject.ts'
+import { packetTokens, withinBudget } from './recall/inject.ts'
 
 const one = (store: OpenStore, sql: string, ...params: unknown[]): number => {
   const row = store.db.prepare(sql).get(...(params as never[])) as { n: number } | undefined
@@ -55,9 +63,34 @@ export const collectMetrics = (store: OpenStore, now: number) => {
   const byStatus = (status: string): number =>
     one(store, `SELECT count(*) AS n FROM memories WHERE status = ?`, status)
 
-  // The injectable set and its price come from the same helpers the packet
-  // itself uses, so these numbers mean what §4.2's budget means.
-  const injectable = queryInjectableSet(store, INJECT_TOP_N)
+  // Selected by the same per-store calls `buildContextProvider` makes, in the
+  // same order, so what is priced is the set this store would hand injection —
+  // not a plausible stand-in for it. Everything the packet does AFTERWARDS is
+  // out of this snapshot's reach, and the field's own comment says so.
+  //
+  // `queryInjectionRows` — not the raw injectable set — because derived rows
+  // REPLACE the raw set they summarize, so on a store with a derived layer the
+  // raw set is not offered at all and its price answers no question anyone
+  // asks. Measured across the nine live stores, the two containers give
+  // opposite verdicts against `INJECT_BODY_BUDGET_TOKENS` on three of them.
+  //
+  // The global branch's `withinBudget` is NOT a budget invented here: it is
+  // literally the step `recall/inject.ts` performs on the personal store's
+  // rows before concatenation. Personal's fallback (raw atoms, when D9's
+  // triggers have deleted the portrait) is capped at the cost of the portrait
+  // it stands in for, so a metric that skipped the cap would report tokens the
+  // packet never carries — on the live global store, off by a factor of 34.
+  // One rule, two execution points: both sides call the same function with the
+  // same bound, `worstPersonaTokens()`, so they cannot drift apart (that
+  // function's own comment in `constants.ts` names this shape).
+  //
+  // The repo branch takes NO cap, and that asymmetry is half the rule rather
+  // than an omission: the runtime caps personal alone, because personal is
+  // what stands in for a deleted portrait. Capping repo rows here too would
+  // hold them to a personal-side ceiling they never face, which on the live
+  // stores collapses the number and on one of them zeroes it.
+  const rows = queryInjectionRows(store)
+  const injectable = store.kind === 'global' ? withinBudget(rows, worstPersonaTokens()) : rows
 
   const active = byStatus('active')
   const superseded = byStatus('superseded')
@@ -89,7 +122,40 @@ export const collectMetrics = (store: OpenStore, now: number) => {
     store: store.repoKey,
     kind: store.kind,
     activeCount: active,
-    packetTokens: packetTokens(injectable),
+    // What this store OFFERS the next assembly, already past this store's own
+    // ceiling. "Injectable", not "injected", and the difference is two things
+    // this number deliberately does not know:
+    //
+    //   1. cross-store competition — personal and repo rows spend ONE packet
+    //      budget together, and a single-store snapshot cannot see the other
+    //      side;
+    //   2. the packet budget's own trimming — `renderFramed(hits,
+    //      INJECT_BODY_BUDGET_TOKENS)` runs on the CONCATENATED hits, after
+    //      this snapshot's vantage point.
+    //
+    // So this value MAY EXCEED `INJECT_BODY_BUDGET_TOKENS`, and that is not an
+    // anomaly to be clamped: it is a store offering more than the packet can
+    // take, which is exactly the condition worth logging.
+    //
+    // Applying that budget here was considered and rejected three times over.
+    // It would be a THIRD implementation of the selection rule `renderFramed`
+    // already delegates to `withinBudget` — the D7-D9 shape this whole module
+    // is being corrected for. It would not even be right: injection budgets
+    // the two stores' rows jointly, so a per-store clamp is a different
+    // approximation, not a closer one. And it would assert that this store
+    // owns the whole budget, which is the shared-container error ADR 0007
+    // records. The remaining gap is therefore real, known, and named here
+    // rather than papered over — ADR 0009's rule that a promise not backed by
+    // an implementation gets the PROMISE corrected.
+    //
+    // The global cap above is a different thing and stays: `worstPersonaTokens()`
+    // is a per-store ceiling the runtime genuinely applies to this store alone.
+    //
+    // Named apart from `packetOverflows`'s input on purpose — one ruler
+    // (`packetTokens`) is shared, one field name must not be, because a key
+    // whose meaning depends on which reader holds it is the failure ADR 0009
+    // §六(c) records.
+    injectableTokens: packetTokens(injectable),
     retrievedRate: active === 0 ? 0 : Number((retrieved / active).toFixed(3)),
     overturnRate:
       active + superseded + archived === 0

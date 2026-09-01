@@ -491,6 +491,14 @@ dsh-llm createToolResultMessage → 只把 content 放进消息            lib/i
 | V7 | 未审批时外仓零参与（recall/list/source） | 用例 2 / 2b 通过 |
 | V8 | `npm run verify` | **199/199**（基线 176 + 组 **23**）|
 
+> **V5 的口径更正（2026-09-01，v0.4.4）**：该门当时读的是 `metrics` 的
+> `packetTokens` 字段，而那个字段量的是 **raw 集**，不是运行时真正注入的
+> 集合（有派生行时 `queryInjectionRows` 用派生行**整体替换** raw 集）。
+> 故 V5 实际证明的是「**两库的 raw 集渲染一致**」，而非「注入包一致」。
+> **本门的结论不受影响**：V1/V2/V4 已从 `renderFramed` 出口独立覆盖注入包
+> 本身，那才是外侧那把尺子；V5 是冗余佐证而非唯一依据。该字段现已改名
+> `injectableTokens` 并改测运行时容器，见 `STATUS.md` v0.4.4 一节。
+
 **第二轮补测（订正后，真实 4 库 × 1936 机械种子，`renderFramed` 出口）**：
 
 | 闸 | 口径 | 结果 |

@@ -71,19 +71,72 @@ export const readRevision = (store: OpenStore): number => {
 }
 
 /**
- * Whether direct injection currently overflows its budget — the measured
- * condition that both enables and disables the derived layer. Priced with
- * the packet's own estimator so the trigger means what the budget means.
+ * Whether the RAW set overflows the packet budget — the measured condition
+ * that both enables and disables the derived layer. Priced with the packet's
+ * own estimator so the trigger means what the budget means.
+ *
+ * The container is `queryInjectableSet`, and it has to stay that way. Pricing
+ * `queryInjectionRows` instead — what injection actually carries — reads like
+ * the more honest measurement and is a self-reference that freezes the layer.
+ * The argument is arithmetic rather than today's numbers, because a rebuild
+ * heals the data and would retire any argument made from it:
+ *
+ *   worstPersonaTokens() + ROLLUP_MAX_SCENARIOS x worstScenarioTokens()
+ *       <= INJECT_BODY_BUDGET_TOKENS
+ *
+ * — the invariant `constants.ts` throws on at load. So for a derived layer
+ * whose rows are priced no worse than that invariant assumes,
+ * `packetTokens(queryInjectionRows(store)) > INJECT_BODY_BUDGET_TOKENS` is
+ * false: the first rollup would be the last this store ever gets, and its
+ * blocks would go on summarizing a snapshot that has since moved.
+ *
+ * The qualifier is load-bearing rather than a hedge, because TWO kinds of
+ * derived layer price worse than the invariant assumes and can exceed the
+ * budget:
+ *
+ * - legacy rows, written before `ROLLUP_TARGET_CHARS` was enforced, whose
+ *   bodies simply exceed it;
+ * - conforming rows whose newline density is higher than
+ *   `DERIVED_WORST_LINE_CHARS` prices. The write path bounds a body's
+ *   CHARACTERS, while `renderEntry` indents a body's own newlines and so bills
+ *   for them — a gap `constants.ts` records on that constant, and one a
+ *   measurement confirms is reachable, not theoretical, for shapes like ASCII
+ *   art or a one-word-per-line list.
+ *
+ * The freeze is therefore not universal; it is permanent for the layers this
+ * store will normally hold, which is what makes it a real hazard rather than a
+ * curiosity. Nothing above argues for changing the container: a trigger that
+ * stops firing for most stores is broken whether or not an exotic body shape
+ * could still trip it, and the exception is a pricing gap logged elsewhere,
+ * not a property anyone should rely on to keep rebuilds alive.
+ *
+ * Either way the trigger's question is about the material ("does the raw set
+ * still need summarizing?"), not about the summary's own size, which the write
+ * path bounds in characters.
+ *
+ * `ROLLUP_SOURCE_LIMIT` rather than `INJECT_TOP_N` for the same reason: the
+ * job summarizes the sources, so the test must see all of them.
+ *
+ * It must also stay the same container as `runRebuildJob`'s re-check below.
+ * If enqueue and execution answered from different sets, one job could be
+ * queued and then dismissed as unnecessary on arrival, forever.
  */
 export const packetOverflows = (store: OpenStore): boolean =>
   packetTokens(queryInjectableSet(store, ROLLUP_SOURCE_LIMIT)) > INJECT_BODY_BUDGET_TOKENS
 
 /**
- * Queue a rebuild if — and only if — direct injection currently overflows.
- * The derived layer therefore switches itself on and off from measurement:
- * §9's indicator IS §12's trigger, so there is no flag to set and no state
- * to keep in sync. The revision rides the idempotence key, so a job for a
- * superseded snapshot is a different job (and is fenced when claimed).
+ * Queue a rebuild if — and only if — the raw set currently overflows. The
+ * derived layer therefore switches itself on and off from measurement: there
+ * is no flag to set and no state to keep in sync.
+ *
+ * §9's indicator and §12's trigger share one ruler — `packetTokens` — and
+ * measure two different containers deliberately: `metrics.ts` prices what the
+ * next assembly injects, this prices the raw set a rollup would consume. Same
+ * rule, two execution points, which `constants.ts` distinguishes from a
+ * duplicated rule; collapsing them into one container is the self-reference
+ * described on `packetOverflows`. The revision rides the idempotence key, so a
+ * job for a superseded snapshot is a different job (and is fenced when
+ * claimed).
  * @returns whether a rebuild was queued.
  */
 export const enqueueRebuildIfOverflowing = (
