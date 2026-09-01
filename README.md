@@ -61,6 +61,14 @@ What this is and is not:
   nothing can verify. Approval lives in memory only: restart the harness and
   you are asked again. Editing the file mid-session has no effect until
   restart — that is deliberate, not a limitation.
+
+  > Approval is the load-bearing gate, so an approval policy of `never` turns
+  > the group OFF rather than waving it through: the platform answers such a
+  > request `rejected` without asking anyone, and the session reads only its
+  > own repository. `never` means never *asked*, and therefore never *granted*.
+  > If a declared group seems inert, check the policy before the file — the log
+  > line `was not approved (rejected)` is that policy's fingerprint, while
+  > `(unavailable)` means the approval service is missing entirely.
 - **Attributed.** A recall result marks each foreign entry `(from <source>)`,
   and `/memory` lists every member under its own heading, because a fact from
   another repository may simply not be true in this one.
