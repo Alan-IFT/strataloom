@@ -525,8 +525,25 @@ export const ROLLUP_TRANSCRIPT_CHARS = 6_000
    states a rule the code implements elsewhere is a second source of truth
    waiting to drift; removed rather than wired up. */
 
-/** L0 conversation retention: raw turns outlive the jobs that read them,
- * but not forever — rows a live memory still cites are exempt. */
+/**
+ * L0 conversation retention — the age half of `pruneConversations`'s
+ * predicate, and TODAY IT DECIDES NO DELETIONS AT ALL.
+ *
+ * This comment used to end "but not forever". Measured over the 9 real stores
+ * on 2026-09-01, forever is exactly what it is: the exemption clause held
+ * every L0 row in every non-empty store (8 of the 9; the global store has no
+ * rows and so offers no evidence either way), and forcing the cutoff wide
+ * open deleted nothing. The clause above this one, not this constant, is what
+ * bounds L0 — see the `EXCERPT_COMPACT_MS` epitaph earlier in this file, which
+ * already states the same fact correctly ("a cited conversation is never
+ * pruned at all … the gap was therefore not 60 days but unbounded"). Two
+ * opposite claims about one fact lived in this file; this is the wrong one.
+ *
+ * Kept, not deleted, because it is the only protection keyed on a row's AGE.
+ * Removing it would not turn a no-op into a no-op — it would start deleting
+ * every conversation that has not yet produced evidence, which is the window
+ * between capture and extract. `pruneConversations` carries that argument.
+ */
 export const L0_RETENTION_MS = 90 * 86_400_000
 
 export const DONE_RETENTION_MS = 7 * 86_400_000

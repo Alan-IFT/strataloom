@@ -142,6 +142,85 @@ test('L0: pruning drops aged turns but never those a live memory cites', () => {
   cleanup(root)
 })
 
+/**
+ * The exemption is per SESSION, not per cited row. A memory cites a session id
+ * (`evidence.ref`), so every row of that session is held — including the rows
+ * nothing quotes. Any attempt to narrow the exemption to the seqs actually
+ * referenced turns this test red, which is the point: that narrowing would
+ * delete the only complete copy of the surrounding words.
+ */
+test('L0: a cited session keeps EVERY row, including rows no memory references', () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  const old = Date.now() - L0_RETENTION_MS - 86_400_000
+
+  store.tx(() => {
+    const stmt = store.db.prepare(
+      `INSERT INTO conversations (session_id, seq, turn, label, provenance, text, created_at)
+       VALUES ('cited', ?, 1, 'user', 'human', ?, ?)`,
+    )
+    stmt.run(1, 'the quoted line', old)
+    stmt.run(2, 'never quoted by anything', old)
+    stmt.run(3, 'also never quoted', old)
+    store.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+         VALUES ('m1','fact','repo-local','active','t','b','human',0,0)`,
+      )
+      .run()
+    // The memory quotes seq 1 only; the exemption still covers 2 and 3.
+    store.db
+      .prepare(`INSERT INTO evidence (memory_id, kind, ref) VALUES ('m1','session','cited')`)
+      .run()
+  })
+
+  pruneConversations(store, Date.now())
+  const left = store.db
+    .prepare(`SELECT seq FROM conversations WHERE session_id = 'cited' ORDER BY seq`)
+    .all()
+    .map((r) => r.seq)
+  assert.deepEqual(left, [1, 2, 3], 'the exemption holds the whole session, not the cited seqs')
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * The OTHER half of the predicate: `created_at < ?` is the only protection
+ * keyed on how OLD a row is, and it is what keeps a turn alive across the
+ * unavoidable window between `captureTurn` (unconditional, at the turn
+ * boundary) and the evidence an extract job may or may not later write. A row
+ * below `ENQUEUE_MIN_TURN_TOKENS`, or one whose extract found nothing worth
+ * keeping, NEVER gets evidence — the age clause is all it has.
+ *
+ * Without this assertion the age clause carries zero coverage: forcing it true
+ * (`created_at < ? OR 1=1`) or dropping it leaves every other test green while
+ * the statement starts deleting live, unextracted conversation.
+ */
+test('L0: an unexpired, uncited row survives prune', () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+
+  // Captured just now, no evidence anywhere: the shape of a turn whose extract
+  // has not run, was never enqueued, or produced no candidates.
+  store.tx(() => {
+    store.db
+      .prepare(
+        `INSERT INTO conversations (session_id, seq, turn, label, provenance, text, created_at)
+         VALUES ('fresh', 1, 1, 'user', 'human', 'said five seconds ago', ?)`,
+      )
+      .run(Date.now())
+  })
+
+  pruneConversations(store, Date.now())
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM conversations WHERE session_id = 'fresh'`).get().c,
+    1,
+    'age is the only thing protecting a turn that has not been extracted yet',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
 /** One scripted LLM reply, shaped like the stream `llm-call.ts` consumes. */
 const textStream = (text) => ({
   async *[Symbol.asyncIterator]() {

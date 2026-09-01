@@ -60,9 +60,13 @@ a memory, so "where did this come from" has an answer that does not depend on
 the platform session log still existing.
 
 L0 is deliberately **not** a second search index — the distilled layer is
-what gets searched; L0 is reached by id. Raw turns are pruned after 90 days,
-except any a live memory still cites: a memory never outlives the words
-behind it.
+what gets searched; L0 is reached by id. Any turn a live memory cites is kept
+for good — a memory never outlives the words behind it — and because
+`evidence.ref` names a whole session, one memory pins every turn beside the
+ones it quotes. Measured on 2026-09-01 that exemption covered every stored
+turn, so **treat L0 as retained without bound**: the 90-day window
+(`L0_RETENTION_MS`) can only ever reach a turn nothing cites, and it has not
+deleted anything to date.
 
 Memories live in `~/.dsh/strataloom/repos/<repo-key>/memory.sqlite`, keyed by
 canonical git remote (or the work-tree realpath when there is no remote). A
