@@ -749,7 +749,12 @@ disposed 监听 + 自持 fiber 约定）整套删除——隐藏一个 ~50 tok �
 不值一个生命周期子系统；删除双 context 提供方的同一理由在此同样成立。
 工具描述自带"仅顶层主 Agent 可用"，subagent 误调获得明确拒绝。
 
-`systemPrompt.section()`（order ~120）≤150 tok 引导段。
+`systemPrompt.section()`（order ~120）引导段，上限由 `GUIDANCE_BUDGET_TOKENS`
+（`constants.ts`）持有并在 `tools.ts` 加载期强制。**此处刻意不复述那个数字**——
+原文写的 `≤150 tok` 出自首次提交、无测量依据，且从未被强制：引导段一路涨到
+**245 tok** 无人察觉。涨因是 kind 判据在提示词里被渲染了第三遍（另两处在
+`memory_recall` / `memory_propose` 的 schema），而静态文案自 2026-08-23 一字未动
+——**一条规则写在两处**（D7–D9）第一次出现在提示词而非代码里。
 
 ---
 

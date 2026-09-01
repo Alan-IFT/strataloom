@@ -60,6 +60,26 @@ export const INJECT_BODY_BUDGET_TOKENS = 1_300
 /** Top-N rows fetched for injection before budget truncation. */
 export const INJECT_TOP_N = 20
 
+/**
+ * Ceiling for the tool-guidance section (`GUIDANCE_SECTION` in `tools.ts`),
+ * enforced at load time there.
+ *
+ * 160 = the 153 tokens the section measures once the duplicated kind criteria
+ * are gone, plus room for roughly one more sentence. It is deliberately tight:
+ * the section's job is to say when to reach for three tools, and anything that
+ * needs more room than that is documentation, which belongs in a schema
+ * description or a doc — not in every request.
+ *
+ * This constant REPLACES the "≤150 tokens" prose in the spec (§7). That number
+ * came from the initial commit with no measurement attached, and it was never
+ * enforced: the section reached 245 tokens without anything noticing. 150 is
+ * also simply wrong now — the surviving copy prices at 153 — so restating it
+ * would have meant shipping a limit the correct text cannot meet. The spec now
+ * points here, because a limit written in two places is the defect this whole
+ * change is about.
+ */
+export const GUIDANCE_BUDGET_TOKENS = 160
+
 /** FTS candidate cap for memory_recall (spec §4.3). */
 /** Near-duplicate candidates offered back when saving. */
 export const SIMILAR_LIMIT = 5
