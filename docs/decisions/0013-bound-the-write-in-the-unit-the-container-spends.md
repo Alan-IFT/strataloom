@@ -1,6 +1,6 @@
 # 0013 · 用容器结算的那个单位去约束写入——派生层的字符上限换成渲染后 token
 
-- 日期：2026-09-08
+- 日期：2026-09-02
 - 状态：已采纳并实现
 - 相关：D7–D9（一条规则一处实现）、D8（唯一渲染器）、§4.2（注入预算）、
   `src/constants.ts`、`src/pipeline/rebuild.ts`、`src/recall/render.ts`、
@@ -9,7 +9,7 @@
 
 > **数字口径约定**（沿用 ADR 0009/0010/0011/0012）：绝对数标注**测量时刻**与
 > **store 集合**；凡投递量一律在 **`renderFramed` 出口**计数。本文数据测于
-> **2026-09-08**，集合为本机 `~/.dsh/strataloom/` 下 **9 个真实库**
+> **2026-09-02**，集合为本机 `~/.dsh/strataloom/` 下 **9 个真实库**
 > （`DatabaseSync(path,{readOnly:true})` 只读查询，直接调用编译产物中的
 > `renderEntry` / `withinBudget` / `truncatedToBudget`，不复写计价逻辑）。
 
@@ -234,7 +234,7 @@ join 换行         8 个   （header 后空行 1 + 条目间 6 + 空行与首�
 
 收敛判据只需一条：**唯一持有超限行的 `3e857510e628`，其 `packetOverflows`
 为 true**，故下一次 rebuild 会 `DELETE` 后重写它的全部块，**自然收敛**。
-按生产函数复核（2026-09-08，8 个 repo 库，`ROLLUP_SOURCE_LIMIT=200`）：
+按生产函数复核（2026-09-02，8 个 repo 库，`ROLLUP_SOURCE_LIMIT=200`）：
 
 ```
 3e857510e628 3007 true    5ed2b4d261b2 3291 true
