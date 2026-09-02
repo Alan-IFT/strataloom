@@ -25,6 +25,7 @@ import {
 import { renderEntry, TRUNCATION_MARK } from '../lib/recall/render.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import {
+  DONE_RETENTION_MS,
   EXTRACT_EVENT_EXCERPT_CHARS,
   INJECT_BODY_BUDGET_TOKENS,
   INJECT_PACKET_BUDGET_TOKENS,
@@ -32,6 +33,7 @@ import {
   L0_RETENTION_MS,
   RECALL_PACKET_BUDGET_TOKENS,
   ROLLUP_MAX_SCENARIOS,
+  ROLLUP_SOURCE_LIMIT,
   ROLLUP_TARGET_CHARS,
   ROLLUP_TITLE_TARGET_CHARS,
   ROLLUP_TRANSCRIPT_CHARS,
@@ -54,7 +56,7 @@ import {
 } from '../lib/pipeline/rebuild.js'
 import { estimateTokens } from '../lib/constants.js'
 import { looksSecret, projectStore, PROJECTION_DIR, PROJECTION_FILE } from '../lib/projection.js'
-import { enqueueJob, claimNextJob, commitClaimedJob } from '../lib/pipeline/jobs.js'
+import { enqueueJob, claimNextJob, cleanupJobs, commitClaimedJob } from '../lib/pipeline/jobs.js'
 import { queryInjectableSet, queryInjectionRows } from '../lib/store/fts.js'
 import { DERIVED_PROVENANCE, INJECTABLE_PROVENANCE, PROVENANCES } from '../lib/types.js'
 import {
@@ -1329,6 +1331,364 @@ test('derived layer engages only on overflow and replaces the raw set', async ()
   assert.match(packet, /use pnpm; deploy with make/)
   assert.doesNotMatch(packet, /fact number 3 about/, 'raw entries are replaced, not appended')
   assert.ok(estimateTokens(packet) <= INJECT_PACKET_BUDGET_TOKENS, 'and it fits the budget')
+  registry.dispose()
+  cleanup(root)
+})
+
+// ---------------------------------------- the trigger's CONTAINER rule ----
+//
+// The five tests below cover one rule stated in two places: `packetOverflows`
+// prices `queryInjectableSet(store, ROLLUP_SOURCE_LIMIT)` — the RAW set at the
+// ROLLUP limit — and `runRebuildJob`'s arrival re-check must price THE SAME
+// set at THE SAME limit. Three independent things can be got wrong there, and
+// the tests are split along exactly those seams so a red test names the defect:
+//
+//   the CONTAINER  raw set vs `queryInjectionRows`   T1 (enqueue) T5 (re-check)
+//   the LIMIT      200 vs INJECT_TOP_N (20)          T1 (enqueue) T5 (re-check)
+//   the OPERATOR   `>` vs `>=`                       T4
+//   the AGREEMENT  both sides answer from one set    T3
+//   NON-SELF-REFERENCE, by dimension — the two are NOT the same claim:
+//     it never SELECTS its own output                T2, T3
+//     it never lets that output discount the PRICE   T6
+//
+// Two fixtures do the discriminating, and which one a test uses IS its
+// argument:
+//
+//   `overflow` (existing, 60 LARGE rows)  full set 4660 tok, window 1560 tok.
+//       BOTH containers overflow, so this fixture cannot separate them — but
+//       once a rollup exists it separates them completely, because
+//       `queryInjectionRows` then returns the summary alone (6 tok).
+//   `narrowWindowOverflow` (70 SMALL rows) full set 1330 tok, window 380 tok,
+//       budget 1300, and NO derived layer. Here the window fits and the full
+//       set does not, so it separates the container and the limit with no
+//       rollup anywhere in the picture.
+//
+// All figures above are measured by the assertions themselves, never asserted
+// as literals: the tests re-derive them from the production `renderEntry` /
+// `estimateTokens`, so a change to how a row is priced moves the fixture
+// instead of silently invalidating it.
+
+/**
+ * Many SMALL rows: the top-20 injection window fits the budget while the full
+ * `ROLLUP_SOURCE_LIMIT` set does not. Deliberately builds NO derived layer,
+ * which is what makes it a clean probe of the container and the limit — with
+ * no rollup in the store, `queryInjectionRows` degrades to
+ * `queryInjectableSet(store, INJECT_TOP_N)`, so it differs from the production
+ * container by the LIMIT alone and self-reference cannot be the explanation.
+ *
+ * KEEP THE ROWS EQUALLY PRICED. `updated_at` collides heavily at this write
+ * rate (70 rows land on 26 distinct timestamps), so `ORDER BY priority,
+ * updated_at DESC` does not determine WHICH rows fall inside the top-20
+ * window. That is harmless only because every row costs the same: sampled 200
+ * times, the window prices 380 and the full set 1330, every time. Give these
+ * rows differing sizes and the window's total becomes sampling-dependent —
+ * a real flake, and one an earlier draft of these tests actually had (an
+ * assertion on which row landed in the window failed 2 runs in 3). Assert on
+ * PRICES here, never on which row is where.
+ */
+const narrowWindowOverflow = async (service, principal, n = 70) => {
+  for (let i = 0; i < n; i++) {
+    await service.propose(
+      { title: `title ${i}`, body: `${'word '.repeat(10)}end ${i}`, kind: 'fact' },
+      principal,
+    )
+  }
+}
+
+/** ctx serving both the rollup reply and the route the enqueue side pins. */
+const routedLlm = (ctx, body) => {
+  ctx.get = (name) =>
+    name === 'llm'
+      ? rollupReply(body)
+      : name === 'agentDefaultModel'
+        ? { currentSelection: () => ({ provider: 'p', model: 'm' }) }
+        : undefined
+}
+
+const derivedBody = (store) =>
+  store.db.prepare(`SELECT body FROM memories WHERE derived != 0 AND status = 'active' LIMIT 1`)
+    .get()?.body
+
+/** One full trigger→claim→execute cycle through the REAL entry points. */
+const rebuildOnce = async (ctx, store, body) => {
+  routedLlm(ctx, body)
+  const queued = enqueueRebuildIfOverflowing(ctx, store, Date.now())
+  if (!queued) return { queued, built: false }
+  const job = claimNextJob(store, Date.now(), Date.now() + 60_000)
+  if (job === undefined) return { queued, built: false }
+  const built = await runRebuildJob(
+    ctx, store, job, JSON.parse(job.payload), new AbortController().signal,
+  )
+  return { queued, built }
+}
+
+test('T1: the trigger prices the WHOLE source set, not the window injection carries', async () => {
+  // PINS: the enqueue-side container is the RAW set at ROLLUP_SOURCE_LIMIT.
+  // RED UNDER: swapping the container to `queryInjectionRows` (M1), or the
+  // limit to `INJECT_TOP_N` (M3) — both then price 380 tok against a 1300
+  // budget and the store that genuinely needs summarizing is never queued.
+  // GREEN UNDER: the pure self-referential mutant `hasDerivedLayer ?
+  // queryInjectionRows : queryInjectableSet` (M8), which on this fixture takes
+  // the raw branch and behaves exactly like HEAD. That is not a gap in this
+  // test — it is the division of labour: this is the enqueue-side LIMIT probe,
+  // while T2/T3 are the ONLY two that kill M8, and a fixture that confounded
+  // the two concerns would let both defects hide behind one another.
+  //
+  // "Only" is exact for M8, and that is the claim this split rests on. It is
+  // NOT a claim that each mutant dies exactly once: M3 also reddens T4 and T5
+  // (measured). Overlap is harmless — what the matrix has to show is that no
+  // mutant survives, and that M8's two killers are not redundant with T1/T5.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await narrowWindowOverflow(service, principal)
+
+  // The fixture's whole claim, measured rather than asserted as a constant:
+  // the two candidate containers disagree, and they straddle the budget.
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c, 0,
+    'precondition: no derived layer, so what follows measures the LIMIT, not the layer',
+  )
+  const windowTokens = packetTokens(queryInjectableSet(store, INJECT_TOP_N))
+  const sourceTokens = packetTokens(queryInjectableSet(store, ROLLUP_SOURCE_LIMIT))
+  assert.ok(windowTokens <= INJECT_BODY_BUDGET_TOKENS, 'precondition: the window fits the budget')
+  assert.ok(sourceTokens > INJECT_BODY_BUDGET_TOKENS, 'precondition: the whole source set does not')
+  // With no rollup stored, this is literally the M1 mutant's reading.
+  assert.equal(
+    packetTokens(queryInjectionRows(store)), windowTokens,
+    'precondition: with no layer, `queryInjectionRows` IS the 20-row window',
+  )
+
+  assert.equal(packetOverflows(store), true, 'the set a rollup would consume overflows')
+  const { queued, built } = await rebuildOnce(ctx, store, 'THE-ROLLUP')
+  assert.equal(queued, true, 'so a rebuild is queued')
+  assert.equal(built, true, 'and the job that arrives agrees there is work')
+  const packet = buildContextProvider(ctx, service)({ agent: principal })
+  assert.match(packet, /THE-ROLLUP/, 'and the packet now carries the summary')
+  assert.doesNotMatch(packet, /end \d+/, 'in place of the raw rows it was built from')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('T2: a store that already holds a derived layer keeps rebuilding it', async () => {
+  // PINS: the trigger does not SELECT its own output — it reads the material,
+  // not the summary. This is the state no other test in this file reaches: a
+  // derived layer ALIVE while the raw set still overflows.
+  //
+  // Scope, stated exactly, because the wider claim is false: this pins the
+  // SELECTION of rows. A mutant that keeps the right query and instead lets the
+  // layer's size discount the PRICE (`raw - blocks * 200 > budget`) is
+  // self-reference in the other dimension, and this fixture cannot see it —
+  // at raw = 4660 it would take 17 blocks to change the verdict, and the writer
+  // caps at ROLLUP_MAX_SCENARIOS = 6, so the state is unreachable here. T6
+  // covers that dimension on the cheaper fixture, where one block suffices.
+  // RED UNDER: M8 (`hasDerivedLayer ? queryInjectionRows : queryInjectableSet`),
+  // M1 and M5 — with a rollup stored these price the summary (6 tok), answer
+  // "no", and the layer freezes at GEN-1 while the raw set it describes moves
+  // on.
+  //
+  // Honest about the overlap, since the matrix was actually run: T6 reddens
+  // under every mutant this test does, and no measured mutant is caught here
+  // and missed there. So T2/T3 are NOT justified by the mutant set — they are
+  // kept because they assert a different proposition (which rows are read, and
+  // that the two sides read the same ones) whose failure modes have not all
+  // been enumerated. Do not read the matrix as proof that they earn their
+  // place; read it as proof that T6 is the one that cannot be removed.
+  // NOT REDUNDANT WITH T3: T3 proves the two SIDES agree in one pass; this
+  // proves the answer does not decay ACROSS generations, which is the shape a
+  // self-reference actually takes in production.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await overflow(service, principal)
+  assert.equal((await rebuildOnce(ctx, store, 'GEN-1')).built, true, 'bootstrap rollup')
+  assert.equal(derivedBody(store), 'GEN-1')
+
+  // The discriminating state. Note there is NO raw write in this loop: D9
+  // deletes every derived row on any authoritative raw write, so a fixture
+  // that grew the raw set would destroy the very layer under test and the
+  // self-referential mutant would be indistinguishable from HEAD.
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c, 1,
+    'precondition: the layer exists, so a self-referential trigger would read ITS size',
+  )
+  assert.ok(
+    packetTokens(queryInjectionRows(store)) <= INJECT_BODY_BUDGET_TOKENS,
+    'precondition: and that size is comfortably under budget — it would answer "no"',
+  )
+  for (let pass = 2; pass <= 4; pass++) {
+    // With no raw write the revision never moves, so the idempotence key would
+    // absorb the retrigger as a duplicate of the job that already ran. Pruning
+    // the settled row is what `cleanupJobs` does to a `done` job past
+    // DONE_RETENTION_MS in production; doing it here is what lets the trigger
+    // be asked a second time about an unchanged snapshot.
+    cleanupJobs(store, Date.now() + DONE_RETENTION_MS + 1)
+    const result = await rebuildOnce(ctx, store, `GEN-${pass}`)
+    assert.equal(result.queued, true, `pass ${pass}: the raw set still overflows, so work is queued`)
+    assert.equal(result.built, true, `pass ${pass}: and the arriving job finds work to do`)
+    assert.equal(derivedBody(store), `GEN-${pass}`, `pass ${pass}: the layer was actually replaced`)
+  }
+  const packet = buildContextProvider(ctx, service)({ agent: principal })
+  assert.match(packet, /GEN-4/, 'the packet carries the newest summary')
+  assert.doesNotMatch(packet, /GEN-1/, 'and not the generation it would have frozen at')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('T3: enqueue and the arrival re-check answer from ONE set', async () => {
+  // PINS: the agreement itself. A job queued as necessary must not be
+  // dismissed as unnecessary the moment it arrives — that pairing is a
+  // livelock, queued and discarded forever at one LLM-free round trip apiece.
+  // RED UNDER: M8 and M1 (the enqueue side goes quiet, so `queued` is false)
+  // and M5 (the enqueue side still fires but the re-check prices the 6-token
+  // summary and drops the job).
+  // NOT REDUNDANT WITH T2: T2 watches generations advance and would still pass
+  // if BOTH sides were changed together in a way that stayed consistent; this
+  // one holds the two sides against each other within a single pass, which is
+  // the property `packetOverflows`' comment actually states.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await overflow(service, principal)
+  assert.equal((await rebuildOnce(ctx, store, 'GEN-1')).built, true, 'bootstrap rollup')
+
+  cleanupJobs(store, Date.now() + DONE_RETENTION_MS + 1)
+  routedLlm(ctx, 'GEN-2')
+  const queued = enqueueRebuildIfOverflowing(ctx, store, Date.now())
+  assert.equal(queued, true, 'the enqueue side says there is work')
+  const job = claimNextJob(store, Date.now(), Date.now() + 60_000)
+  assert.notEqual(job, undefined, 'the job is claimable')
+  // Without this the next assertion could be satisfied — or defeated — by the
+  // revision fence rather than by the container rule under test.
+  assert.equal(
+    readRevision(store), JSON.parse(job.payload).expectedRevision,
+    'and it is not fenced, so what follows is the re-check and nothing else',
+  )
+  const built = await runRebuildJob(
+    ctx, store, job, JSON.parse(job.payload), new AbortController().signal,
+  )
+  assert.equal(built, true, 'so the arrival must not answer "unnecessary"')
+  assert.equal(derivedBody(store), 'GEN-2', 'and the rollup it was queued to build exists')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('T4: a set priced exactly AT the budget does not overflow', async () => {
+  // PINS: the comparison is `>`, not `>=` — the ONLY test that catches M4.
+  //
+  // It is not the only mutant it reddens, and saying so precisely matters: the
+  // flip step below stores 27 rows at 50 tok each, so a mutant reading the
+  // 20-row window prices them at 1000 <= 1300 and the final assertion fails.
+  // M1 and M3 therefore redden this test too (measured). That is incidental
+  // coverage, not this test's job — read the exclusivity claim as "M4 dies
+  // here and nowhere else", never as "only M4 reddens this test".
+  // The token count is DERIVED from the production estimator against the
+  // production renderer, never written down: a hardcoded 1300 would keep
+  // passing while silently ceasing to sit on the boundary the day either
+  // changes, which is the failure mode a boundary test exists to prevent.
+  const { root, registry, principal, service } = setup()
+  const store = service.storeFor(principal, true)
+
+  // A row shape whose RENDERED cost divides the budget exactly, so the set can
+  // land ON the boundary rather than merely near it.
+  const entry = { kind: 'fact', title: 't', body: `${'word '.repeat(37)}x` }
+  const perRow = estimateTokens(renderEntry({ id: '', ...entry }, false))
+  const rows = INJECT_BODY_BUDGET_TOKENS / perRow
+  assert.ok(
+    Number.isInteger(rows) && rows <= ROLLUP_SOURCE_LIMIT,
+    `precondition: ${perRow} tok/row divides the budget within the source limit`,
+  )
+  for (let i = 0; i < rows; i++) await service.propose({ ...entry }, principal)
+
+  const priced = () => packetTokens(queryInjectableSet(store, ROLLUP_SOURCE_LIMIT))
+  assert.equal(priced(), INJECT_BODY_BUDGET_TOKENS, 'the set sits exactly on the budget')
+  assert.equal(packetOverflows(store), false, 'exactly at the budget is within it, not over it')
+
+  // The other half, and it is not decoration: the assertion above holds just
+  // as well for a trigger that never fires at all, so on its own it certifies
+  // nothing. One row past the boundary must flip it.
+  await service.propose({ ...entry }, principal)
+  assert.ok(priced() > INJECT_BODY_BUDGET_TOKENS, 'one row past the boundary is over budget')
+  assert.equal(packetOverflows(store), true, 'and only then does the trigger fire')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('T5: the arrival re-check summarizes the WHOLE source set too', async () => {
+  // PINS: the re-check's container AND limit, which T3 cannot separate (on its
+  // fixture both containers overflow before a rollup exists). Here the 20-row
+  // window fits and the full source set does not, so a re-check reading either
+  // the wrong container or the wrong limit answers "no work" and settles a job
+  // the enqueue side correctly raised.
+  // RED UNDER: M5 (container) and M6 (limit). With no derived layer in this
+  // store the two mutants read the same 380 tokens — which is exactly why one
+  // fixture kills both, and why T3 is still needed for the case where a layer
+  // exists and only the container is wrong.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await narrowWindowOverflow(service, principal)
+
+  routedLlm(ctx, 'GEN-1')
+  const queued = enqueueRebuildIfOverflowing(ctx, store, Date.now())
+  assert.equal(queued, true, 'precondition: the enqueue side sees an overflowing source set')
+  const job = claimNextJob(store, Date.now(), Date.now() + 60_000)
+  assert.notEqual(job, undefined, 'precondition: the job is claimable')
+  const built = await runRebuildJob(
+    ctx, store, job, JSON.parse(job.payload), new AbortController().signal,
+  )
+  assert.equal(built, true, 'the arrival must not dismiss a job the enqueue side found necessary')
+  assert.equal(derivedBody(store), 'GEN-1', 'and the rollup it was queued to build exists')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('T6: a live derived layer does not discount the price of the set it summarizes', async () => {
+  // PINS: the OTHER self-reference. T2/T3 pin which rows the trigger SELECTS;
+  // this pins that the layer's existence does not make the material look
+  // cheaper. Both are "the trigger must not price its own output", and a
+  // mutant can satisfy either one while breaking the other:
+  //
+  //     raw - blocks * 200 > INJECT_BODY_BUDGET_TOKENS
+  //
+  // reads the correct query with the correct limit, keeps both sides in
+  // agreement, and still freezes the layer. On the live stores it flips two of
+  // the three that hold a derived layer, and before this test existed the whole
+  // suite stayed green on it — T1..T5 all survived it. It is now the ONLY test
+  // that catches it (measured), which is the same relationship T4 has to the
+  // `>=` mutant: a single-point cover, deliberately recorded as such.
+  //
+  // THE FIXTURE IS THE ARGUMENT, and it must be the cheap one. T2's `overflow`
+  // set prices 4660, so discounting it under 1300 would take 17 blocks while
+  // the writer caps at ROLLUP_MAX_SCENARIOS (6) — structurally unreachable, so
+  // T2 could never have caught this however it was written. Here the set
+  // prices 1330 against a 1300 budget, and ONE block is enough. The margin is
+  // asserted below rather than assumed, so a change to how rows are priced
+  // fails loudly instead of quietly making this test vacuous.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await narrowWindowOverflow(service, principal)
+  assert.equal((await rebuildOnce(ctx, store, 'GEN-1')).built, true, 'bootstrap rollup')
+
+  const blocks = store.db
+    .prepare(`SELECT count(*) c FROM memories WHERE derived != 0 AND status = 'active'`)
+    .get().c
+  assert.ok(blocks >= 1, 'precondition: a derived layer is live, so a discount would have something to subtract')
+  const raw = packetTokens(queryInjectableSet(store, ROLLUP_SOURCE_LIMIT))
+  assert.ok(
+    raw > INJECT_BODY_BUDGET_TOKENS &&
+      raw - blocks * INJECT_BODY_BUDGET_TOKENS <= INJECT_BODY_BUDGET_TOKENS,
+    'precondition: the raw set overflows, but by little enough that one block of credit would hide it',
+  )
+
+  // No raw write in between, so the snapshot — and therefore the answer — must
+  // not have moved. Pruning the settled row is only what lets the question be
+  // asked a second time; see T2.
+  cleanupJobs(store, Date.now() + DONE_RETENTION_MS + 1)
+  assert.equal(
+    packetOverflows(store), true,
+    'the RAW set still overflows; a live layer must not discount the price of what it summarizes',
+  )
+  const again = await rebuildOnce(ctx, store, 'GEN-2')
+  assert.equal(again.queued, true, 'so the work is queued again')
+  assert.equal(again.built, true, 'and the arriving job agrees')
+  assert.equal(derivedBody(store), 'GEN-2', 'and the layer advanced instead of freezing')
   registry.dispose()
   cleanup(root)
 })

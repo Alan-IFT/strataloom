@@ -78,10 +78,12 @@ export const readRevision = (store: OpenStore): number => {
  *
  * The container is `queryInjectableSet` — the RAW set — and it has to stay that
  * way. Pricing `queryInjectionRows` instead (what injection actually carries)
- * reads like the more honest measurement and is a self-reference: once a
- * rollup exists, the trigger would be asking about the summary's own size,
- * which the summary is built to keep small, so it would answer "no" forever and
- * the blocks would go on describing a snapshot that has since moved.
+ * reads like the more honest measurement, and it is wrong on TWO INDEPENDENT
+ * counts: it is a self-reference once a rollup exists (the trigger would ask
+ * about the summary's own size, which the summary is built to keep small), and
+ * it silently changes the LIMIT from 200 to 20 even when no rollup exists at
+ * all. Both are measured below. The tests that hold this rule are `T1`..`T5`
+ * in `test/layers.test.mjs`, each naming the mutant it kills.
  *
  * ## Why this container keeps the trigger alive, measured
  *
@@ -115,8 +117,89 @@ export const readRevision = (store: OpenStore): number => {
  * Either way the trigger's question is about the material ("does the raw set
  * still need summarizing?"), and never about the summary's own size.
  *
- * `ROLLUP_SOURCE_LIMIT` rather than `INJECT_TOP_N` for the same reason: the
- * job summarizes the sources, so the test must see all of them.
+ * ## Correction: WHEN the self-reference actually bites
+ *
+ * KEPT AND SUPERSEDED, by the same convention the paragraph above follows. An
+ * earlier revision of this section argued that under `queryInjectionRows` the
+ * trigger would answer "no" once the layer existed and the store would
+ * therefore NEVER REBUILD AGAIN — "there was never a freeze to escape" was
+ * paired with a claimed permanent freeze in the other direction. The direction
+ * of the defect is right; that reachability claim is not, and it is retained
+ * because it names a trap worth recognising: it assumed "the raw set keeps
+ * growing" and "the derived layer stays alive" could hold at the same time.
+ * They cannot. D9's `invalidate_derived_*` triggers delete every derived row on
+ * ANY authoritative raw write and bump `store_revision`, so the growth that
+ * would make the trigger matter is the very event that clears the layer.
+ * Measured end to end — 60 raw rows, a committed rollup, then four growth
+ * cycles of one raw write each:
+ *
+ *     bootstrap                derived rows 1   raw-set rule true, injection rule false
+ *     round 1..4  after write  derived rows 0   both rules true — IDENTICAL
+ *
+ * So on a store that is still growing, that mutant is not distinguishable from
+ * this code at all, and four rounds of it prove nothing either way.
+ *
+ * The divergence is real but needs the OTHER state: a live layer and NO raw
+ * write. The rebuild's idempotence key carries the revision, so while the
+ * snapshot is frozen the settled `done` row absorbs every retrigger — until
+ * `cleanupJobs` prunes it past `DONE_RETENTION_MS` (7 days), after which the
+ * question is put again to an unchanged store. Measured at exactly that point:
+ *
+ *     raw set    4660 tok  -> this code enqueues; the layer advances to GEN-2
+ *     injection     6 tok  -> `queryInjectionRows` answers "no", and the layer
+ *                             stays frozen on the generation it already had
+ *
+ * That effect is OBSERVABLE ON TODAY'S PRODUCTION DATA. Eight repo store
+ * copies, priced read-only through these same functions (2026-09-03); `inj` is
+ * what the mutant would price, and the three flips are all in stores that hold
+ * a derived layer:
+ *
+ *     store       rows  derived   full(200)  limit20   inj   this code / mutant
+ *     3e857510      27        6        3007     2000  1161      true  / false
+ *     ec2636fc      16        5        1808     1808   666      true  / false
+ *     edf7a686      16        4        1916     1916   587      true  / false
+ *     5ed2b4d2      19        0        3866     3866  3866      true  / true
+ *     94394b03      14        0        1229     1229  1229     false  / false
+ *
+ * ## `ROLLUP_SOURCE_LIMIT` rather than `INJECT_TOP_N`: a SECOND, separate count
+ *
+ * `queryInjectionRows` falls back to `queryInjectableSet(store, INJECT_TOP_N)`
+ * when nothing derived exists, so swapping the container silently swaps the
+ * limit from 200 to 20 — a defect that needs no derived layer at all, and one
+ * the self-reference argument never reaches. On 70 small rows, no layer:
+ *
+ *     queryInjectableSet(200)  1330 tok  > 1300  -> rebuild queued (correct)
+ *     queryInjectionRows        380 tok  < 1300  -> never queued
+ *
+ * The two effects are REAL BUT NOT EQUALLY REACHABLE, and keeping them apart is
+ * the point of this section. Read the `limit20` column above: the limit alone
+ * would flip NONE of these stores. `3e857510` is the only one holding more than
+ * `INJECT_TOP_N` injectable rows (27), and even there the 20-row window prices
+ * 2000 — still over budget, so still "true". The other two flipping stores hold
+ * 16 rows, where a limit of 20 does not bite at all. So on today's data the
+ * self-reference is the WHOLE of the observed `true -> false`, and the limit
+ * contributes nothing to it.
+ *
+ * Hence: the self-reference is observable in production NOW; the limit defect
+ * is real but currently requires a constructed fixture (the 70-row case above,
+ * and `T1`/`T5`) to show itself — it is latent, waiting for the first store to
+ * grow past 20 injectable rows while its window still fits. An earlier draft of
+ * this comment offered the limit as an alternative explanation for those three
+ * flips. That was a CONFLATION of two quantities into one claim, which is worse
+ * than a wrong number because it reads as an explanation and quietly redirects
+ * the next reader to the wrong defect; the table is here so the decomposition
+ * can be checked rather than believed.
+ *
+ * The job summarizes the sources, so the test must see all of them.
+ *
+ * Figures above come from two sources, neither hand-counted: the synthetic ones
+ * through the real writer and the real job entry points
+ * (`enqueueRebuildIfOverflowing` / `runRebuildJob`) on temporary stores, and
+ * the table from read-only copies of the live stores priced through
+ * `queryInjectableSet` / `queryInjectionRows` / `packetTokens` and the shipped
+ * constants. The global store is deliberately absent: `enqueueRebuildIfOverflowing`
+ * routes `kind === 'global'` to `enqueuePersonaRebuild`, so it never asks this
+ * question and its numbers would not belong in this table.
  *
  * It must also stay the same container as `runRebuildJob`'s re-check below.
  * If enqueue and execution answered from different sets, one job could be
