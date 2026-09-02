@@ -133,12 +133,32 @@ export const queryAllMemories = (store: OpenStore, limit: number): MemoryHit[] =
  * combinations at once, which is one rule with two execution points (the
  * `worstPersonaTokens` precedent) rather than a duplicate.
  *
- * The LIMIT also promotes the `ORDER BY` from a display preference to a
- * SELECTION PREDICATE: it now decides which rows SQL discards, not merely the
- * sequence they arrive in. Dropping `derived DESC` pushes an older L3 persona
- * out of the window once past `INJECT_TOP_N` derived rows exist, and no test
- * covers that. It cannot be triggered today — the largest real store holds 6
- * derived rows — but it becomes reachable as derived rows grow.
+ * ## The `ORDER BY` is a display preference, and a guard is what keeps it one
+ *
+ * A LIMIT can promote an `ORDER BY` from a display preference to a SELECTION
+ * PREDICATE — the clause stops fixing the sequence rows arrive in and starts
+ * deciding which rows SQL discards. Here it does not, and the reason is
+ * STRUCTURAL rather than a fact about how much data has accumulated so far:
+ *
+ * - The row count is bounded by the WRITER, at `ROLLUP_MAX_SCENARIOS + 1`.
+ *   `pipeline/rebuild.ts` caps its blocks with a `.slice()` and writes them
+ *   delete-then-insert, so replaying a rebuild replaces the layer instead of
+ *   growing it; the portrait writer emits exactly one row and deletes any
+ *   existing portrait first.
+ * - Within ONE store, `derived` is effectively a constant column, so the
+ *   leading sort key never compares anything: the persona branch is reached
+ *   only for the global store (`runRebuildJob` early-returns on
+ *   `store.kind === 'global'`), and the portrait's hardcoded `private`
+ *   visibility is refused on a repo store by the `guard_visibility_insert`
+ *   trigger.
+ *
+ * So this is not a time bomb waiting on data volume — derived rows CANNOT grow
+ * past that sum. What the design actually depends on is the sum staying under
+ * the window, and that is now ENFORCED: guard 3 in `constants.ts` asserts
+ * `ROLLUP_MAX_SCENARIOS + 1 <= INJECT_TOP_N` at load. Raising the block cap
+ * past the window fails the build rather than silently handing this clause the
+ * power to evict an older L3 portrait from the packet. The numbers live in
+ * those constants; restating them here would be the second copy that drifts.
  */
 export const queryInjectionRows = (store: OpenStore): MemoryHit[] =>
   store.timed('inject-top-n', () => {

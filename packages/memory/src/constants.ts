@@ -1410,7 +1410,7 @@ if (worstDerivedTokens > INJECT_BODY_BUDGET_TOKENS) {
  *   including 900, the historical value the live store was measured at. An
  *   earlier draft of this comment said 700 and 900 would still be caught by
  *   `RECALL_FOREIGN_BUDGET_TOKENS` "for an unrelated reason". That was true of
- *   the naive prototype and is FALSE here: guard 3 below now prices the row as
+ *   the naive prototype and is FALSE here: guard 4 below now prices the row as
  *   the writer would CUT it, so it no longer varies with this constant at all,
  *   and the incidental catch is gone with it. Nothing else in this file reads
  *   `ROLLUP_TARGET_CHARS` for a bound.
@@ -1452,7 +1452,65 @@ for (const [label, kind, titleChars, bodyChars, targetName] of satisfiability) {
   }
 }
 /**
- * GUARD 3 (lower bound). The FLOOR on the per-member budget: the dearest L2
+ * GUARD 3 (row count). The derived layer a rebuild can emit must fit the
+ * WINDOW the injection query reads it through:
+ *
+ *     ROLLUP_MAX_SCENARIOS + 1 <= INJECT_TOP_N
+ *
+ * The `+ 1` is the L3 portrait, and it is a structural count rather than a
+ * margin. `pipeline/rebuild.ts` holds the only two writers of derived rows:
+ * `parseScenarios` caps the L2 blocks with `.slice(0, ROLLUP_MAX_SCENARIOS)`
+ * and the writer is delete-then-insert, so blocks replace rather than
+ * accumulate; the portrait writer emits exactly one row, deleting any existing
+ * portrait first. A single store can hold at most one of those two layers in
+ * quantity anyway — `runRebuildJob` early-returns to the persona job when
+ * `store.kind === 'global'`, and the `guard_visibility_insert` trigger refuses
+ * the portrait's hardcoded `private` visibility on a repo store — so this sum
+ * is the most derived rows ANY store can reach, not a reading of today's data.
+ *
+ * ## Why the guards above cannot see this
+ *
+ * They price TOKENS, and this is a ROW bound. Guards 1 and 2 ask whether the
+ * derived rows FIT the budget once they have been selected; `LIMIT
+ * INJECT_TOP_N` in `store/fts.ts: queryInjectionRows` decides how many are
+ * selected AT ALL, and it counts rows without pricing them. The two questions
+ * are independent in the direction that matters: making each row CHEAPER — the
+ * only lever a token guard has — buys no room in this window whatsoever.
+ * Measured by raising `ROLLUP_MAX_SCENARIOS` to 21 and lowering the targets far
+ * enough to keep every existing guard green: all of them pass,
+ * `worstInjectionPacketTokens()` does not move off 1361, and a rebuild may now
+ * emit 22 rows into a 20-row window.
+ *
+ * ## What actually breaks, which is not a shortfall
+ *
+ * Past this point `ORDER BY derived DESC, updated_at DESC` SILENTLY CHANGES
+ * ROLE. While the window admits every derived row the clause is a display
+ * preference — it fixes the sequence rows arrive in and discards nothing. The
+ * moment the LIMIT cuts, the same clause becomes a SELECTION PREDICATE: it
+ * decides which derived rows the model never sees. `derived DESC` is then the
+ * only thing holding the L3 portrait (the highest layer) inside the window, so
+ * a later edit to that clause — the kind of change that reads as purely
+ * presentational, because that is what the clause used to be — would evict an
+ * older portrait from the packet. Nothing downstream reports it: the packet is
+ * well-formed, inside budget, and merely short.
+ *
+ * The guard is here rather than beside the query because the inequality is
+ * between two constants and holds at load, where it can fail before a store
+ * exists. `store/fts.ts` names it at the ORDER BY it protects.
+ */
+const worstDerivedRowCount = ROLLUP_MAX_SCENARIOS + 1
+if (worstDerivedRowCount > INJECT_TOP_N) {
+  throw new Error(
+    `strataloom: the derived layer does not fit its injection window — one rebuild can emit ` +
+      `${worstDerivedRowCount} derived rows (${ROLLUP_MAX_SCENARIOS} L2 blocks + 1 L3 portrait) ` +
+      `against INJECT_TOP_N (${INJECT_TOP_N}), so queryInjectionRows would DISCARD the excess; ` +
+      `that promotes 'ORDER BY derived DESC, updated_at DESC' from a display preference to a ` +
+      `SELECTION PREDICATE, leaving that clause as the only thing keeping an older L3 portrait ` +
+      `in the packet — lower ROLLUP_MAX_SCENARIOS or raise INJECT_TOP_N`,
+  )
+}
+/**
+ * GUARD 4 (lower bound). The FLOOR on the per-member budget: the dearest L2
  * scenario row the write path can legally store, rendered WITH its id (recall
  * renders `withId=true`, and the id is 36 characters the injection path never
  * pays). A per-member budget below this would admit nothing at all from a

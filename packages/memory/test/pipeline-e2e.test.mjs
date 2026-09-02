@@ -440,7 +440,7 @@ test('the derived layer must fit the packet it exists to produce', async () => {
   // wrong once: an earlier draft of this comment claimed 900 would be caught by
   // `RECALL_FOREIGN_BUDGET_TOKENS` instead, "an unrelated guard for an
   // unrelated reason". Measured against today's code, 640, 700 and 900 ALL
-  // throw from THIS guard and all name `ROLLUP_TARGET_CHARS` — guard 3 now
+  // throw from THIS guard and all name `ROLLUP_TARGET_CHARS` — guard 4 now
   // prices the row as the writer would cut it, so it no longer varies with this
   // constant and cannot catch it incidentally. 900 is therefore not a wrong-net
   // probe, just a blunter one: it would keep passing if the threshold silently
