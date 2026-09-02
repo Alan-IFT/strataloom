@@ -1,7 +1,7 @@
 {
   "name": "@strataloom/dsh-memory",
   "description": "StrataLoom repo-scoped memory plugin for DeepSeek Harness (per-repo SQLite stores, principal-gated tools, WAL-fresh context injection, leased extract/reconcile pipeline)",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
