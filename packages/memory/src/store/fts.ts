@@ -106,6 +106,39 @@ export const queryAllMemories = (store: OpenStore, limit: number): MemoryHit[] =
  * `memory_recall`. Recency is a signal we actually have, and the budget makes
  * the rest a non-question: a rebuild emits at most a handful of blocks, of
  * which the budget already admits most.
+ *
+ * ## Why the derived branch is capped at `INJECT_TOP_N`, and not at a constant
+ * ## of its own
+ *
+ * Both branches are held by ONE ruler, deliberately. The load-time guard in
+ * `recall/inject.ts` prices the worst packet by modelling the entry count as
+ * `INJECT_TOP_N * 2` — `buildContextProvider` calls this function once per
+ * side, personal and repo — and that sentence was true of the fallback branch
+ * only. This branch used to return every active derived row, so the count it
+ * contributed was a property of STORED CONTENT rather than of a constant, and
+ * the guard could not see it: the packet is `[header, '', ...lines].join('\n')`,
+ * i.e. `203 + 2 + 4 * INJECT_BODY_BUDGET_TOKENS + (E - 1)` characters at the
+ * tightest, so `E = 40` prices to 1361 tokens (exactly what the guard reports)
+ * while `E = 197` already exceeds `INJECT_PACKET_BUDGET_TOKENS` and an
+ * unbounded branch reaches `E = 325` at 1433. A guard that reports a constant
+ * while the container overflows is a false green, and nothing in the schema
+ * bounds the number of derived rows — the CHECK constrains `derived` to a
+ * layer value, never a count — so "the rebuild only ever emits a handful" is
+ * an invariant of the write path alone, which is not a bound this read path
+ * may assume.
+ *
+ * A separate `INJECT_DERIVED_TOP_N` would be a second number to keep in step
+ * with §4.2 and the guard, i.e. the same rule written twice. Sharing
+ * `INJECT_TOP_N` makes `E <= INJECT_TOP_N * 2` true for all four branch
+ * combinations at once, which is one rule with two execution points (the
+ * `worstPersonaTokens` precedent) rather than a duplicate.
+ *
+ * The LIMIT also promotes the `ORDER BY` from a display preference to a
+ * SELECTION PREDICATE: it now decides which rows SQL discards, not merely the
+ * sequence they arrive in. Dropping `derived DESC` pushes an older L3 persona
+ * out of the window once past `INJECT_TOP_N` derived rows exist, and no test
+ * covers that. It cannot be triggered today — the largest real store holds 6
+ * derived rows — but it becomes reachable as derived rows grow.
  */
 export const queryInjectionRows = (store: OpenStore): MemoryHit[] =>
   store.timed('inject-top-n', () => {
@@ -113,9 +146,10 @@ export const queryInjectionRows = (store: OpenStore): MemoryHit[] =>
       .prepare(
         `SELECT id, kind, title, body FROM memories
          WHERE derived != ${LAYER.RAW} AND status = 'active'
-         ORDER BY derived DESC, updated_at DESC`,
+         ORDER BY derived DESC, updated_at DESC
+         LIMIT ?`,
       )
-      .all() as unknown as MemoryHit[]
+      .all(INJECT_TOP_N) as unknown as MemoryHit[]
     return derived.length > 0 ? derived : queryInjectableSet(store, INJECT_TOP_N)
   })
 

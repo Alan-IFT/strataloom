@@ -274,6 +274,132 @@ test('the priced worst packet is an upper bound on a REALLY assembled double-fal
   cleanup(root)
 })
 
+/**
+ * Seed `count` active derived (L2) rows whose rendered entries are SATURATED:
+ * each is billed `cheapest` tokens and spans exactly `4 * cheapest` characters.
+ *
+ * The saturation is the whole point, and a thin fixture is the trap this pair
+ * of tests exists to avoid. `estimateTokens` is `ceil(len / 4)`, so it discards
+ * every entry's fractional remainder: a minimal `- [fact] x: y` is billed 4
+ * tokens while spending only 13 characters, and a packet of those is CHEAP —
+ * it fits the container even unbounded, so the tests below would pass on the
+ * defect they were written for. The adversary is the entry that spends every
+ * character its token price buys.
+ */
+const seedSaturatedDerived = (store, visibility, count, deps) => {
+  const { LAYER, renderEntry, estimateTokens } = deps
+  const kind = 'fact'
+  const shell = renderEntry({ id: '', kind, title: 'x', body: '' }, false).length
+  const cheapest = estimateTokens(renderEntry({ id: '', kind, title: 'x', body: 'y' }, false))
+  const body = 'y'.repeat(cheapest * 4 - shell)
+  store.tx(() => {
+    for (let i = 0; i < count; i++) {
+      store.db
+        .prepare(
+          `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+           VALUES (?, ?, ?, 'active', 'x', ?, 'derived', 0, ?, ?)`,
+        )
+        .run(`l2-${i}`, kind, visibility, body, i, LAYER.SCENARIO)
+    }
+  })
+  return cheapest
+}
+
+test('the derived branch is held by the same row cap as the fallback branch', async () => {
+  // `queryInjectionRows` has two branches and only one of them used to be
+  // bounded. The fallback took `INJECT_TOP_N` rows; the derived branch returned
+  // every active derived row, so its entry count was a property of STORED
+  // CONTENT. That is the premise the load-time guard in `recall/inject.ts`
+  // spends — it models the worst packet as `INJECT_TOP_N * 2` entries — and a
+  // premise no code enforces is a comment, not an invariant.
+  //
+  // Nothing in the schema bounds derived rows: the ceiling lives in the rebuild
+  // writer, and the real store `3e857510e628` already holds derived rows above
+  // it, so "a rebuild only emits a handful" is exactly the kind of write-path
+  // assumption a read path must not trust.
+  const { LAYER } = await import('../lib/types.js')
+  const { renderEntry, estimateTokens } = await import('../lib/recall/render.js')
+  const { INJECT_TOP_N, INJECT_BODY_BUDGET_TOKENS } = await import('../lib/constants.js')
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+
+  // The most entries the body budget can ever buy — derived, never typed.
+  const cheapest = seedSaturatedDerived(store, 'repo-local', 1, {
+    LAYER,
+    renderEntry,
+    estimateTokens,
+  })
+  const maxEntries = Math.floor(INJECT_BODY_BUDGET_TOKENS / cheapest)
+  store.tx(() => store.db.prepare(`DELETE FROM memories`).run())
+  seedSaturatedDerived(store, 'repo-local', maxEntries, { LAYER, renderEntry, estimateTokens })
+
+  const rows = queryInjectionRows(store)
+  assert.ok(
+    rows.length <= INJECT_TOP_N,
+    `the derived branch returned ${rows.length} rows against a cap of ${INJECT_TOP_N}: it is ` +
+      'not bounded by the ruler the fallback branch and the load-time packet guard share',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('a store full of derived rows cannot overflow the §4.2 container', async () => {
+  // The row-cap test above states the mechanism; this states the CONSEQUENCE,
+  // measured at the outermost ruler (ADR 0009). `renderFramed` alone is not
+  // that ruler — `buildContextProvider` is what a model receives — so the
+  // packet here is assembled by the real provider over a real store.
+  //
+  // Unbounded, this fixture prices past `INJECT_PACKET_BUDGET_TOKENS` while
+  // `worstInjectionPacketTokens()` keeps reporting the same number, because the
+  // guard prices `INJECT_TOP_N * 2` saturated entries and the branch it cannot
+  // see returns `INJECT_BODY_BUDGET_TOKENS / cheapest` of them. Both halves are
+  // asserted: the container must hold, AND the guard must remain an upper bound
+  // on what the runtime actually emits.
+  clearRepoIdentityMemo()
+  const repo = makeRepo()
+  const { LAYER } = await import('../lib/types.js')
+  const { renderEntry, estimateTokens } = await import('../lib/recall/render.js')
+  const { INJECT_BODY_BUDGET_TOKENS } = await import('../lib/constants.js')
+  const { root, registry } = openRegistry()
+  const principal = fakeAgent({ id: 'p', cwd: repo })
+  const ctx = fakeCtx({ agents: [principal] })
+  const svc = service(registry, ctx)
+  const store = svc.storeFor(principal, true)
+
+  const cheapest = seedSaturatedDerived(store, 'repo-local', 1, {
+    LAYER,
+    renderEntry,
+    estimateTokens,
+  })
+  const maxEntries = Math.floor(INJECT_BODY_BUDGET_TOKENS / cheapest)
+  store.tx(() => store.db.prepare(`DELETE FROM memories`).run())
+  seedSaturatedDerived(store, 'repo-local', maxEntries, { LAYER, renderEntry, estimateTokens })
+  // The fixture must really take the branch it is written for, or both
+  // assertions below pass for the wrong reason.
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived != ?`).get(LAYER.RAW).c,
+    maxEntries,
+    'the scenario under test is a store whose derived layer alone can buy the whole body budget',
+  )
+
+  const packet = buildContextProvider(ctx, svc)({ agent: principal })
+  const actual = estimateTokens(packet)
+  assert.ok(
+    actual <= INJECT_PACKET_BUDGET_TOKENS,
+    `a packet assembled through buildContextProvider from ${maxEntries} derived rows costs ` +
+      `${actual} tokens (${countEntries(packet)} entries, ${packet.length} chars) against the ` +
+      `§4.2 container of ${INJECT_PACKET_BUDGET_TOKENS}`,
+  )
+  assert.ok(
+    worstInjectionPacketTokens() >= actual,
+    `the guard prices the worst injection packet at ${worstInjectionPacketTokens()} tokens, but ` +
+      `a real derived-branch packet costs ${actual} (${countEntries(packet)} entries). The guard ` +
+      'is not an upper bound: the derived branch escapes the row cap it models.',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
 test('a memory cannot break out of its bullet to address the model directly', () => {
   // The packet is a flat "- " list under a framing header. A body's own
   // newlines would otherwise let stored text (which can come from tool output

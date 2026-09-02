@@ -209,6 +209,16 @@ const fillEntry = (tokens: number): RenderableHit => {
  * the L3 portrait on any personal raw write; measured absent 41.5% of the time).
  * The entry count is therefore `INJECT_TOP_N * 2`, not `ROLLUP_MAX_SCENARIOS + 1`.
  *
+ * That sentence is a PREMISE, and it is only now true of both branches. The
+ * derived branch of `queryInjectionRows` used to be unbounded, so a side in
+ * that branch contributed as many entries as it held rows — a property of
+ * stored content, which no load-time guard can price. At 325 derived rows this
+ * function still reported 1361 while the real packet cost 1433, past the
+ * container: a false green, not a small error. The `LIMIT INJECT_TOP_N` in
+ * `store/fts.ts` is what executes the premise, for BOTH branches and therefore
+ * for all four side combinations; see that function for the derivation. Do not
+ * relax it without re-pricing this guard.
+ *
  * That matters because the packet is `[header, '', ...lines].join('\n')`, i.e.
  * `headerLen + 2 + Σ(entry lengths) + (E − 1)` characters. Per-entry `ceil`
  * throws away each entry's fractional remainder, so the tight bound RISES WITH
