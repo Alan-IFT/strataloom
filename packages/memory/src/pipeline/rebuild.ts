@@ -51,7 +51,7 @@ import {
   SCENARIO_MAX_TOKENS,
   PERSONA_TITLE,
 } from '../constants.ts'
-import { LAYER, type MemoryHit } from '../types.ts'
+import { DERIVED_PROVENANCE, LAYER, type MemoryHit } from '../types.ts'
 import { queryInjectableSet } from '../store/fts.ts'
 import { packetTokens } from '../recall/inject.ts'
 import { truncatedToBudget } from '../recall/render.ts'
@@ -243,7 +243,7 @@ export const runRebuildJob = async (
     const insert = store.db.prepare(
       `INSERT INTO memories
          (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
-       VALUES (?, 'fact', ?, 'active', ?, ?, 'derived', ?, ?, ${LAYER.SCENARIO})`,
+       VALUES (?, 'fact', ?, 'active', ?, ?, '${DERIVED_PROVENANCE}', ?, ?, ${LAYER.SCENARIO})`,
     )
     const visibility = store.kind === 'global' ? 'private' : 'repo-local'
     for (const scenario of scenarios) {
@@ -425,7 +425,7 @@ const runPersonaJob = async (
       .prepare(
         `INSERT INTO memories
            (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
-         VALUES (?, 'preference', 'private', 'active', ?, ?, 'derived', ?, ?, ${LAYER.PERSONA})`,
+         VALUES (?, 'preference', 'private', 'active', ?, ?, '${DERIVED_PROVENANCE}', ?, ?, ${LAYER.PERSONA})`,
       )
       .run(randomUUID(), PERSONA_TITLE, verdict.body, now, now)
   })

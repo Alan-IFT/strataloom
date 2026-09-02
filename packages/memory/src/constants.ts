@@ -33,9 +33,11 @@ export const APPLICATION_ID = 0x53_54_4c_4d
  * v3 = L0 + global store, v4 = decay/derived, v5 = derived invalidation as a
  * data property rather than a write-path responsibility, v6 = `coding` kind, v7 = `derived` widened to a layer,
  * v8 = `jobs.last_error`, so a dead letter outlives the log line that explained it,
- * v9 = the FTS index is retokenized so CJK is searchable by re-wording, not only verbatim).
+ * v9 = the FTS index is retokenized so CJK is searchable by re-wording, not only verbatim,
+ * v10 = a derived row must carry `provenance = 'derived'`, so the layer column cannot
+ * carry a row past the trust filter written against the provenance column).
  */
-export const TARGET_USER_VERSION = 9
+export const TARGET_USER_VERSION = 10
 
 /**
  * How much of a failure cause is kept on the job row. Long enough for an

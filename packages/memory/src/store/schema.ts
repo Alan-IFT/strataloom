@@ -13,6 +13,7 @@ import type { DatabaseSync } from 'node:sqlite'
 import { APPLICATION_ID, TARGET_USER_VERSION } from '../constants.ts'
 import {
   DERIVED_LAYERS,
+  DERIVED_PROVENANCE,
   LAYER,
   MEMORY_KINDS,
   MEMORY_STATUSES,
@@ -193,6 +194,27 @@ const createMemoryTriggers = (db: DatabaseSync): void => {
 /** Render a string enum as a SQL `IN (...)` list, quoted. */
 const sqlEnum = (values: readonly string[]): string =>
   values.map((value) => `'${value}'`).join(',')
+
+/**
+ * The `derived` column AS OF v10: a layer value, and every non-RAW layer
+ * carries the generator's own provenance.
+ *
+ * Both halves are read from the enums rather than spelled out, the same way
+ * `sqlEnum` reads every other CHECK in this file. `DERIVED_PROVENANCE` is the
+ * `PROVENANCES` member itself, so this constraint and the rebuild writer's
+ * INSERT cannot come to name different strings; a rename fails to compile at
+ * the definition rather than producing a CHECK no row can satisfy.
+ *
+ * A column CHECK, not a table CHECK, even though it reads a second column:
+ * SQLite evaluates both against the whole candidate row, so the two are
+ * equivalent in force (measured — an INSERT naming only `provenance` and
+ * `derived`, in either column order, is refused identically), and keeping it
+ * on the column keeps `rebuildMemories`'s by-name override the single way this
+ * definition is replaced.
+ */
+const DERIVED_COLUMN = `derived     INTEGER NOT NULL DEFAULT ${LAYER.RAW}
+    CHECK (derived IN (${[LAYER.RAW, ...DERIVED_LAYERS].join(',')})
+           AND (derived = ${LAYER.RAW} OR provenance = '${DERIVED_PROVENANCE}'))`
 
 /** The columns of `memories`, current as of the newest rebuild. */
 const MEMORY_COLUMNS = [
@@ -581,6 +603,60 @@ const migrateV9 = (db: DatabaseSync): void => {
   recreateFtsTriggers(db)
 }
 
+/**
+ * user_version = 10: a derived row must carry `provenance = 'derived'`.
+ *
+ * Two columns state one fact and only one of them was checked. `derived !=
+ * RAW` says a row IS generated output; `provenance = 'derived'` says it CAME
+ * FROM the generator. §2.3's trust filter is written against the second
+ * (`tool-output`/`subagent` never inject), while `queryInjectionRows` selects
+ * its derived branch on the FIRST — so a row holding one without the other
+ * rides the layer column straight past the filter.
+ *
+ * The state was reachable, and reachable PERSISTENTLY. Measured on a copy of a
+ * live v9 repo store (2026-09, 33 memories, 6 of them at `derived = SCENARIO`):
+ * a bare `UPDATE memories SET provenance = 'tool-output' WHERE derived != 0`
+ * reported `changes = 6`, all six rows persisted, and `store_revision` stayed
+ * at 27 — not one invalidation trigger responded, because D9 fires on `OLD
+ * .derived = RAW` and these rows were already derived. `queryInjectionRows`
+ * then returned six `tool-output` rows for injection.
+ *
+ * Stated HERE rather than as `AND provenance = 'derived'` on the injection
+ * query, for the reason v5 gives about invalidation — the read path must not
+ * be where a write-path invariant is re-checked. A filter would only make the
+ * row INVISIBLE, not unreachable: it stays stored, `queryRecallRows` admits
+ * every provenance by design, so `memory_recall` serves it anyway, and each
+ * future read exit needs the same clause copied. A CHECK makes the state
+ * unrepresentable instead of unread — one rule, enforced by the data,
+ * including for writers not yet written.
+ *
+ * Safe on the installed base: across all nine live stores (494 memories, no
+ * status filter) both cross cells — `derived != 0 AND provenance != 'derived'`
+ * and `derived = 0 AND provenance = 'derived'` — measured 0, so this migration
+ * refuses no row that already exists. The columns were already co-extensive;
+ * v10 is what keeps them that way.
+ *
+ * ONE DIRECTION ONLY, deliberately. This constrains `derived != RAW ⇒
+ * provenance = 'derived'` and says nothing about the converse, so a row at
+ * `derived = RAW` carrying `provenance = 'derived'` remains writable. That is
+ * left alone because it fails EXCLUDED rather than injected: `'derived'` is
+ * not in `INJECTABLE_PROVENANCE`, so such a row comes back from neither
+ * `queryInjectableSet` nor `queryInjectionRows` (measured — 0 rows from both),
+ * and no writer produces one. The converse would tighten an invariant that has
+ * never been violated and whose violation is already safe — symmetry bought
+ * with a constraint no defect asked for.
+ *
+ * Where the forward direction is NOT already true — a store that acquired a
+ * contradicting row through the UPDATE above — the rebuild's INSERT ... SELECT
+ * hits the new CHECK and the whole migration rolls back at `user_version = 9`
+ * with its rows intact (measured). That is the right failure: the store keeps
+ * working on the old schema and says so, rather than silently dropping the
+ * row that documents the breach.
+ */
+const migrateV10 = (db: DatabaseSync): void => {
+  rebuildMemories(db, DERIVED_COLUMN)
+}
+
 const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
   migrateV1,
   migrateV2,
@@ -591,6 +667,7 @@ const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
   migrateV7,
   migrateV8,
   migrateV9,
+  migrateV10,
 ]
 
 /**

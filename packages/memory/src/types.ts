@@ -120,6 +120,25 @@ export const PROVENANCES = [
 export type Provenance = (typeof PROVENANCES)[number]
 
 /**
+ * The provenance a rebuild stamps on everything it generates.
+ *
+ * Not a new constant — a NAME for the enum member above. Both places that must
+ * agree about this string interpolate THIS symbol: the rebuild writer's two
+ * INSERTs (`pipeline/rebuild.ts`) and the v10 CHECK in `store/schema.ts` that
+ * makes "a derived row carries it" a property of the data. Because neither
+ * holds a copy, they cannot come to name different strings — a rename here
+ * reaches the writer and the constraint together, which is stronger than any
+ * compile error over two independent literals would be.
+ *
+ * The `: Provenance` annotation covers a narrower case, and only that one:
+ * renaming the enum member while leaving THIS line untouched fails to compile
+ * (measured: TS2322, or TS2820 when the new name is near enough that the
+ * checker suggests it). It does not catch a rename applied to both, which is why
+ * the guarantee above rests on the single symbol rather than on the type.
+ */
+export const DERIVED_PROVENANCE: Provenance = 'derived'
+
+/**
  * Provenances allowed into the default injection packet
  * (spec §2.3 content filter; subagent/tool-output are recall-only).
  */

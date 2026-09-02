@@ -10,6 +10,7 @@ import { immediateTx } from '../lib/store/tx.js'
 import { APPLICATION_ID, TARGET_USER_VERSION } from '../lib/constants.js'
 import { StoreRegistry } from '../lib/store/store.js'
 import { toFtsPhrase } from '../lib/store/fts.js'
+import { DERIVED_LAYERS, DERIVED_PROVENANCE, LAYER, PROVENANCES } from '../lib/types.js'
 import { openRegistry, cleanup, tempRoot } from './helpers.mjs'
 
 const openRaw = (path) => {
@@ -310,6 +311,165 @@ test('v8 -> v9 retokenizes the index so Chinese is found by re-wording', () => {
     ).get().c,
     0,
   )
+  db.close()
+  cleanup(root)
+})
+
+test('v9 -> v10 makes "a derived row carries derived provenance" a property of the data', () => {
+  // Two columns state one fact and only one was checked. `derived != RAW` says
+  // a row IS generated output; `provenance = 'derived'` says it CAME FROM the
+  // generator. §2.3's trust filter is written against the second, while
+  // `queryInjectionRows` selects its derived branch on the FIRST — so a row
+  // holding one without the other rides the layer column past the filter.
+  //
+  // The assertion below is that the state is UNREACHABLE, not that some query
+  // hides it. A `provenance` filter on the injection query would leave the row
+  // stored, and `queryRecallRows` admits every provenance by design, so
+  // `memory_recall` would serve it anyway.
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo', 9)
+  const now = Date.now()
+  const insert = (id, provenance, layer) =>
+    db
+      .prepare(
+        `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+         VALUES (?,'fact','repo-local','active',?,'b',?,?,?,?)`,
+      )
+      .run(id, `title ${id}`, provenance, now, now, layer)
+  const violations = () =>
+    db.prepare(
+      `SELECT count(*) c FROM memories WHERE derived != ${LAYER.RAW} AND provenance != ?`,
+    ).get(DERIVED_PROVENANCE).c
+
+  // Precondition at v9, and the reason a read-path filter was not enough: the
+  // bad state is reachable by a bare UPDATE and it PERSISTS. D9's
+  // `invalidate_derived_update` fires on `OLD.derived = RAW`, so rewriting the
+  // provenance of an ALREADY derived row trips no trigger at all.
+  insert('roll', DERIVED_PROVENANCE, LAYER.SCENARIO)
+  const revisionBefore = db.prepare(`SELECT v FROM meta WHERE k='store_revision'`).get()?.v
+  const changed = Number(
+    db.prepare(`UPDATE memories SET provenance = 'tool-output' WHERE derived != 0`).run()
+      .changes,
+  )
+  assert.equal(changed, 1, 'precondition: v9 accepts the rewrite')
+  assert.equal(violations(), 1, 'precondition: and the contradicting row is STORED')
+  assert.equal(
+    db.prepare(`SELECT v FROM meta WHERE k='store_revision'`).get()?.v,
+    revisionBefore,
+    'no invalidation trigger responds — the guard watches OLD.derived = RAW',
+  )
+  db.exec(`DELETE FROM memories`)
+
+  migrate(db, 'repo', 10)
+  assert.equal(userVersion(db), 10)
+
+  // Accepted, half 1. These rows are also the FIXTURE route 3 promotes below,
+  // so the loop runs regardless of what is being asserted. What it establishes
+  // is that a RAW row still takes ANY provenance — the constraint bounds the
+  // derived layer instead of freezing the column.
+  //
+  // Stated as measured rather than as a claim about mutation coverage: with
+  // both `assert.equal`s here deleted and only these loops kept, every mutant
+  // tried is still killed (dropped conjunct, inverted predicate, unregistered
+  // migration, whole column frozen), because an over-tight CHECK makes the
+  // fixture INSERT itself throw. These two assertions say what the loops mean;
+  // they are not what traps those mutants.
+  for (const provenance of PROVENANCES) {
+    insert(`raw-${provenance}`, provenance, LAYER.RAW)
+  }
+  assert.equal(
+    db.prepare(`SELECT count(*) c FROM memories`).get().c,
+    PROVENANCES.length,
+    'every provenance is still writable at the raw layer',
+  )
+
+  // Accepted, half 2, and the fixture route 2 rewrites: a well-formed derived
+  // row still writes at EVERY layer the enum admits, so a layer added later
+  // inherits the rule instead of needing a line here.
+  for (const layer of DERIVED_LAYERS) {
+    insert(`ok-${layer}`, DERIVED_PROVENANCE, layer)
+  }
+  assert.equal(
+    db.prepare(`SELECT count(*) c FROM memories WHERE derived != ${LAYER.RAW}`).get().c,
+    DERIVED_LAYERS.length,
+    'the migration must not make the derived layer unwritable',
+  )
+
+  // Route 1 — INSERT, over the enums rather than a written-out list: a copy of
+  // PROVENANCES here would stop covering the enum the day it grows.
+  for (const provenance of PROVENANCES.filter((p) => p !== DERIVED_PROVENANCE)) {
+    for (const layer of DERIVED_LAYERS) {
+      assert.throws(
+        () => insert(`bad-${provenance}-${layer}`, provenance, layer),
+        /CHECK constraint failed/,
+        `INSERT at layer ${layer} with provenance '${provenance}' must be refused`,
+      )
+    }
+  }
+
+  // Route 2 — rewrite the provenance of a STORED derived row. This is the
+  // route measured above as persistent at v9.
+  for (const provenance of PROVENANCES.filter((p) => p !== DERIVED_PROVENANCE)) {
+    assert.throws(
+      () =>
+        db.prepare(`UPDATE memories SET provenance = ? WHERE derived != 0`).run(provenance),
+      /CHECK constraint failed/,
+      `a stored derived row cannot be relabelled '${provenance}'`,
+    )
+  }
+
+  // Route 3 — promote a low-trust RAW row INTO the derived layer.
+  for (const provenance of PROVENANCES.filter((p) => p !== DERIVED_PROVENANCE)) {
+    for (const layer of DERIVED_LAYERS) {
+      assert.throws(
+        () =>
+          db
+            .prepare(`UPDATE memories SET derived = ? WHERE id = ?`)
+            .run(layer, `raw-${provenance}`),
+        /CHECK constraint failed/,
+        `a '${provenance}' row cannot be promoted to layer ${layer}`,
+      )
+    }
+  }
+
+  // The sentence the read path is now entitled to assume, over the whole table.
+  assert.equal(violations(), 0)
+  db.close()
+  cleanup(root)
+})
+
+test('a store opened at the DEFAULT target refuses a mislabelled derived row', () => {
+  // The test above migrates to 10 EXPLICITLY, so it proves `migrateV10` works
+  // while saying nothing about whether stores ever REACH it. Leaving
+  // `TARGET_USER_VERSION` at 9 with the migration written and registered was
+  // measured to keep the entire suite green: the constraint would never be
+  // applied to a real store, the injection defect would stand back open, and
+  // CI would report success. "The guard is written correctly" and "the guard is
+  // in force" are two claims, and only the second one protects anyone.
+  //
+  // So this opens a store the way production does — default target, no version
+  // argument — and asserts the OUTCOME. Note what it deliberately does NOT do:
+  // `assert.equal(userVersion(db), TARGET_USER_VERSION)` reads the same symbol
+  // on both sides and passes at any value, including 9.
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo')
+  const insert = (id, provenance, layer) =>
+    db
+      .prepare(
+        `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+         VALUES (?,'fact','repo-local','active',?,'b',?,0,0,?)`,
+      )
+      .run(id, `title ${id}`, provenance, layer)
+  for (const provenance of PROVENANCES.filter((p) => p !== DERIVED_PROVENANCE)) {
+    assert.throws(
+      () => insert(`bad-${provenance}`, provenance, LAYER.SCENARIO),
+      /CHECK constraint failed/,
+      `a default-target store must refuse a derived row labelled '${provenance}'`,
+    )
+  }
+  insert('ok', DERIVED_PROVENANCE, LAYER.SCENARIO)
   db.close()
   cleanup(root)
 })
