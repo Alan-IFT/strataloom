@@ -1,7 +1,158 @@
 # 当前状态
 
-> 最后更新：2026-09-02 · **v0.4.9 已发布**：把「派生行必须携带 `derived`
-> provenance」从**没人检查的巧合**变成 **schema v10 的 CHECK**。
+> 最后更新：2026-09-03 · **v0.4.10 已发布**：§2.3 的信任过滤在 **L3 画像的两个
+> 执行点上都不存在**，而这两处还各把同一条谓词手写了一遍。现在两侧共用
+> `queryPersonaSources`。**产品行为零变化**——11 个真实注入包逐字节相同。
+> 本轮结项**上一轮登记的待办 q**，但**它的严重性论证被证伪并已更正**（见下节）。
+> **无 schema 改动**。**每次工作结束时更新本页**，它是新会话的唯一入口。
+>
+> 版本序（**取数时刻 2026-09-03 01:5x**）：装机 **0.4.9**，插件落盘
+> **2026-09-02 23:42:04**，进程启动 **2026-09-02 23:42:36**（PID 2818516）——
+> 进程晚于插件，故 **0.4.9 确已在跑**。**v0.4.10 已发布、尚未安装。**
+>
+> ⬇️ 以下 v0.4.9 一节及其「降级不可逆」警告仍然有效（v10 库不可被 0.4.8 打开）。
+
+## 🆕 v0.4.10：L2 遵守的那条规则，L3 两个执行点都没有（**行为零变化**）
+
+**本轮结项待办 q。但待办 q 的现状栏用错了供给面证据，判据也因此偏了**——
+更正见本节末尾与待办 E。
+
+### 判据：一条规范规则在 L3 上没有执行点，且同一谓词被手写了两遍
+
+`plugin-architecture.md` §12 derived 层那一行明写产物「**注入资格随最低来源**」。
+
+- **L2（repo 库场景摘要）遵守它**：入队 `packetOverflows` 与执行 `runRebuildJob`
+  **都调 `queryInjectableSet`**，该函数带 `provenance IN (${INJECTABLE_LIST})`。
+- **L3（global 库画像）两个执行点都是原样手写 SQL、都无 provenance 过滤**：
+  `enqueuePersonaRebuild` 的 `count(*)` 与 `runPersonaJob` 的 `SELECT`。
+
+后果不是「口径不一致」：低信任 raw 行进画像提示词 → 画像以
+`provenance='derived'` 落库 → **`queryInjectionRows` 的派生分支优先于 raw 集**
+⇒ 被 §2.3 挡在注入外的内容，**换了一身 provenance 后进了注入包**，
+且下游再也分辨不出它来自哪里。
+
+| 检验（实测 2026-09-02/03，走生产函数与原样 SQL） | 结果 |
+|---|---|
+| 往 global 库副本插 `tool-output` / `subagent` 的 d0 行 | **两条都进了画像提示词**（21→23） |
+| 同库同时刻 `queryInjectableSet` | 仍 21，**探针 0 条**（raw 路径过滤正常） |
+| 裸 `UPDATE ... SET provenance='tool-output' WHERE derived=0 AND status='active'` | `changes=21`，**全部持久** |
+| 删掉 `runPersonaJob` 那条 SQL 的 `AND derived = RAW` | **237 全绿**（零覆盖） |
+
+### 两个执行点必须一起改，否则会亲手制造 L2 明令禁止的不一致
+
+`packetOverflows` 的注释早就立了规矩：**入队与执行必须答自同一个集合**，
+否则「一个 job 被入队，然后到货时判定无必要，forever」。
+
+只改执行侧会正好造出它：只持有低信任行的 global 库，`count(*)>0` 会入队，
+执行时源集为空 → 空提交。而 **`store_revision` 骑在幂等键上**
+（`jobId('rebuild', repoKey, expectedRevision)`），每次 revision 变动都是
+**新 job id，幂等键什么都吸收不了**。实测 5 次 revision bump：
+
+```
+只过滤执行侧 : enqueue 返回 [true ×5]   jobs 表残留 5 行
+两处共用定义 : enqueue 返回 [false×5]   jobs 表残留 0 行
+```
+
+### 做了什么：新增一个查询，删掉两段手写 SQL
+
+`fts.ts` 新增 `queryPersonaSources`，**复用既有 `INJECTABLE_LIST` 与 `LAYER.RAW`**
+（不新增常量、不写任何 provenance 字面量）；`rebuild.ts` 两处各归并为一行调用。
+**`rebuild.ts` 的原样手写 SQL 从 2 处归零**，与 L2 形状对齐。
+
+**刻意不复用 `queryInjectableSet`**：它选 `id` 且按 provenance 优先级排序，
+复用会**把 row id 写进提示词并重排记忆** ——「披着重构外衣的行为变更」。
+**共用的是谓词，那才是必须一致的部分。**
+
+> **这里有一个专为后来者留的陷阱警告**：在**生产 global 库上两种排序完全重合**
+> （21 行全 `principal-explicit`，优先级键从不比较任何东西）。**拿生产快照当
+> fixture 去"证明"两者可以互换，会得到一个什么都没证明的绿测试。** 真正能区分
+> 二者的 fixture 是「每种可注入 provenance 各一行、最旧优先」，实测端到端倒置。
+
+### 行为零变化：量到最外面那把尺子
+
+| 尺子 | 结果 |
+|---|---|
+| 9 个生产库副本的真实注入包 | **11 个 packet sha256 与 HEAD 全同**（含「无 repo 会话」、双侧 fallback、personal 缺席） |
+| 画像提示词 sha256 | 两侧同为 `20aeba1e2c8ea331` |
+| L2 侧（8 个 repo 库） | `packetOverflows` / 入队 / jobs / rollup 提示词**逐行 identical** |
+| 异常库矩阵 10 种 + v9→v10 迁移库 | **唯二差异都是修复本身**（「仅低信任」库 HEAD 泄漏 4 个标记、本版 0 条） |
+| 测试 | 237 → **239 passed / 0 fail** |
+
+> ⚠️ **一个会让人误报"提示词变了"的取数陷阱**：对 `llm.stream` 的**整个 options
+> 对象**取 sha **每次都不同**——`createUserMessage` 会盖随机 UUID，**HEAD 自己跑
+> 两次都不一样**。必须对 `system + 各 message 的 text` 取 sha，且**先验证 HEAD
+> 两次同 sha** 再做对比。
+
+### 两条测试，鉴别力互不重叠（删掉任一条都会让那一侧静默回退）
+
+| 变异 | 变红的测试 |
+|---|---|
+| 仅回退 `runPersonaJob` | **只**红测试 1（提示词字节） |
+| 仅回退 `enqueuePersonaRebuild` | **只**红测试 2（jobs 表后果） |
+| 两处全回退（= HEAD） | 两条全红 |
+
+**不是互为独立证据，是「机制 + 后果」的正交对**，已写进测试注释。
+
+### 三次打回，每次抓到的都是注释，不是代码
+
+**代码从第一版起就没被找出产品缺陷**；三轮打回全部命中**注释里的事实断言**。
+
+1. **代码审查打回 2 条被证伪的断言。**
+   - `runPersonaJob` 的注释说空集守卫防的是「入队后被 supersede 或 forget」。
+     **恰恰是它唯一举不出来的例子**：`invalidate_derived_*` 触发器对**任何** RAW
+     行写入都 `store_revision += 1`，而 `runRebuildJob` 首步就是 revision 预检。
+     枚举全部 8 条 `UPDATE` + 2 条 `DELETE` 实测：**10/10 全部 `fencedAtPrecheck`**，
+     根本走不到那个守卫。**守卫该留，但理由是跨进程窗口**（预检读与源查询是两次
+     独立的读，不在同一快照里）。**用错误前提支撑正确结论。**
+   - 测试注释称 v10 CHECK「把 `derived` 绑在非 RAW 行上」。**实测
+     `derived=0 AND provenance='derived'` 插入 ACCEPTED**——CHECK 是**单向**的，
+     `schema.ts` 的 `migrateV10` 自己就写着 "ONE DIRECTION ONLY, deliberately"。
+     排除动作是载重的，但**理由错了**，会让后来者引用一条错误的 CHECK 语义。
+2. **代码审查第二轮打回一个分母**：注释写「nine live stores (552 rows)」，而
+   **9 个真实库是 500 行**；552 来自审查者自己工作目录里的 **11** 个库
+   （9 个真实副本 + 2 个临时 fixture，500+27+25=552）。
+   **一个正确的库数配了一个含污染的行数**，恰好长得最像真实测量。
+   旁证很硬：同仓 `schema.ts` 对同一件事写的是「nine live stores (494 memories)」。
+   > **教训**：报「跨全部真实库」的数时，**分母必须排除自己造的 fixture**。
+   > 这与本仓「绕过真实写者的测量只验证自己的假设」同型，只是这次污染的是**分母**。
+3. **QA 打回口径并抓到 4 种绕过**（见待办 B）。
+
+### 方案评审自己犯了一次，且值得记
+
+评审第一轮判定「入队/执行不对称无害、不必同步改」，依据是三个 tick 后 job 被
+幂等键吸收。**它的夹具冻结了 `store_revision`** ——而 revision 正是骑在幂等键上、
+**唯一会让该失效发作的变量**。补跑 revision churn 后结论反转（5 次 bump 泄漏 5 行）。
+
+> **教训**：**绕过真实触发条件的测量，同样只验证自己的假设**（ADR 0009 教训 7
+> 的又一形态）。这次冻结的不是写者，是**让缺陷显形的那个自变量**。
+
+### ⛔ 待办 q 的严重性论证已作废，原文保留以便复核
+
+待办 q 用 **repo 库**的供给面论证暴露面（「`5ed2b4d2` 库 202 行 d0/tool-output」）。
+**但 `runPersonaJob` 只在 global 库运行**（`store.kind === 'global'` 早返回；
+用 25 行全 `tool-output` 的 repo 库实测 `personaCalls = 0`），那些行**永远到不了 L3**。
+
+而 global 库的写入方只有两个：`propose(scope:'personal')` **恒写
+`principal-explicit`**，与 rebuild 自己写 `derived`；`auto-extract` 走 `storeFor()`
+**必为 repo 库**。故**当前 stock 配置下该缺陷不可触发**。
+
+**这不削弱修复**——规范的执行点该在就得在，且它防的是**配置演化**（低信任行一旦
+能进 global 库，今天这条路径没有任何东西拦得住，而 §2.3 明说要拦）。
+**但必须据实记录**：本仓有「待办描述错误直接生产下一轮错误选题」的前科
+（v0.4.8 待办 k）。
+
+### 📋 本轮登记的六项待办（未排期）
+
+| # | 事项 | 现状（实测 2026-09-02/03） | 处置判据 |
+|---|---|---|---|
+| A | 🟡 **跨进程空集守卫无任何测试** | 删掉 `runPersonaJob` 的 `memories.length === 0` → **239 全绿**，零感知。QA 按「precheck 通过后源集已空」这个**守卫真正面对的分母**实测条件概率 **51.2%/52.8%**（此前记的 0.4% 是「窗口命中率」，**另一个分母**）。**确定性测试已验证可行**：借 `store.test.mjs:592` 的跨进程先例 + store proxy，**12/12 稳定杀死变异，零 flake** | **本轮不修**（HEAD 既有缺口，非本轮引入，本轮是净改善）。**下次触碰 `runPersonaJob` 时必须补**——「难以确定性覆盖」这个免罪理由**已被证伪** |
+| B | 🟡 **子串黑名单的局限写得不全** | 保持行集完全正确、只把低信任 body 变形折进已准入行：**字符反转 / base64 / 零宽字符 / 每标记截掉 1 字符**，**四种全部 239 全绿**。主 agent 独立复现了截断那一种 | **不改断言**（改性质断言代价不成比例，本仓待办 c 已裁定「保留黑名单 + 写清局限」）。**注释已补全这四类**——尤其**截断**：它几乎原样保留原文、根本不是"改写"，最容易被误以为已覆盖。**`kind` 通道与 system prompt 通道已被守住**（断言落在完整 options 字节上，各 238/1） |
+| C | 🟢 **新增 provenance 在存量库写不进去** | 给 `PROVENANCES` 加 `'plugin-hook'`：推导集自动变宽 ✅、239 全绿 ✅，但**新建库 ACCEPTED / 存量库 REFUSED**——`CHECK` 烘焙在建表 SQL 里，加枚举**不触发任何迁移** | **不修**：这是 `rebuildMemories` 的既有设计（扩枚举 = 一次 rebuild migration）。登记是因为「加一个 provenance 会怎样」的完整答案**缺了这一半**，下次真要加时必须连带写迁移 |
+| D | 🟢 **`provenanceFor` 可返回 `'derived'`，v10 CHECK 也放行** | 链路成立：`provenanceFor([human, derived]) → 'derived'`（它取**最低**优先级，而 `derived` 是全场最低 0），`conversations` 的 CHECK **允许**该值，v10 CHECK 也不禁 `derived=0 + prov='derived'` | **不修**：**方向是 fail-closed**（该行不进注入、不进画像，只出现在 recall/list——那两处本就全 provenance 可见），且**可达性 = 0**：`classify()` 值域只有 4 个字面量、全仓无任何 `SET provenance`。**条件**：若 `classify()` 新增分支或出现 provenance 改写路径，**立即升级** |
+| E | 🟢 **待办 q 的供给面描述夸大，已更正** | 见上节。L3 只在 global 库跑；生产 global 库实为 `principal-explicit=25, derived=1` | **仅更正记录**，修复保留。防的是配置演化而非正在冒烟的洞 |
+| F | 🟡 **被污染的历史画像不会被主动清除** | 若 HEAD 期间写过含低信任内容的画像：修复后 `enqueuePersonaRebuild` 返回 **false**（源集为空）**不重判**，而 `queryInjectionRows` **仍注入它**。清除只发生在任意 RAW 行被写时（D9 触发器 `DELETE derived != RAW`）——实测插一行后画像即消失 | **本轮不修**：结合待办 E，**生产 global 库无低信任行，当前无实际污染**（画像唯一 1 行，源全 `principal-explicit`）。**条件**：若 global 库曾/将持有低信任行，需一次性清除——**纯代码修复对存量无效** |
+
+## 🆕 v0.4.9：两个列陈述同一件事，而只有一个被检查（**行为零变化**）
 > **产品行为零变化**——10 组真实注入包逐字节相同。本轮结项的是
 > **上一轮登记的待办 p**，但**修法与当时登记的判据相反**（见下节）。
 > **本轮含一次 schema migration（v9 → v10），是本页少见的不可逆改动**，
@@ -140,7 +291,7 @@ QA 用 `git archive HEAD` 编译出**第二份 lib**，两份代码各自加载�
 
 | # | 事项 | 现状（实测 2026-09-02，全部走生产函数） | 处置判据 |
 |---|---|---|---|
-| q | 🔴 **「注入资格随最低来源」在 L3 画像上没有执行点** | 规范 `plugin-architecture.md:832` 明写派生产物「注入资格随最低来源」。实测：**L2 安全只是巧合**——`rebuild.ts:224` 复用了带 `provenance IN (...)` 的 `queryInjectableSet`，低信任探针 **0/27**；而 **L3 的 `runPersonaJob`（`rebuild.ts:386-390`）原样 SQL 是 `WHERE status='active' AND derived = 0`，无任何 provenance 过滤**，插入的 `tool-output`/`subagent` 探针 **21→23 全部进了画像提示词**。供给侧规模：`5ed2b4d2` 库 233 行中 **202 行是 `d0/tool-output`**，`2631a1750495` 库 **17 行全部**是 `d0/tool-output` | **v10 不缓解它**——新 CHECK 对 `derived = 0` 的行完全不生效，这条是**低信任 raw 行进画像输入**，与本轮修的「派生行冒充」是不同的命题。画像**每个仓库每轮都注入**，故暴露面比待办 p 大。与**待办 n 同族**（都涉 §2.4 fail-closed 与注入安全边界），应合并评估，**不可顺手做** |
+| q | ~~**「注入资格随最低来源」在 L3 画像上没有执行点**~~ → **✅ 已结项**（v0.4.10，见本页顶部），**但本条的严重性论证被证伪** | 实测（当时）：**L2 安全只是巧合**——`rebuild.ts:224` 复用了带 `provenance IN (...)` 的 `queryInjectableSet`，低信任探针 **0/27**；而 **L3 的 `runPersonaJob` 原样 SQL 无任何 provenance 过滤**，`tool-output`/`subagent` 探针 **21→23 全部进了画像提示词**。⛔ 而后半段引的供给面数字（`5ed2b4d2` 202 行、`2631a1750495` 17 行全是 `d0/tool-output`）**张冠李戴**：那些是 **repo 库**，而 `runPersonaJob` **只在 global 库运行**（实测 repo 库 `personaCalls = 0`） | ⛔ **本条现状栏前半为真、后半与判据栏都错，原文保留以便复核**。（1）**暴露面错**：L3 只跑 global 库，而 global 库的写入方只有 `propose(personal)`（恒 `principal-explicit`）与 rebuild（`derived`），`auto-extract` 必走 repo 库 ⇒ **当前 stock 配置下不可触发**；（2）**判据「与待办 n 同族、不可顺手做」错**：真正的修法**不触碰 §2.4 归因**，只是让 L3 两个执行点共用 §2.3 已有的定义，**净删 15 行手写 SQL**；（3）**漏了一半**：入队侧 `enqueuePersonaRebuild` 也是同一条无过滤谓词，只改执行侧会制造 `packetOverflows` 明令禁止的入队/执行不一致
 
 ## 🆕 v0.4.8：`LIMIT` 按行数裁，而所有守卫都按 token 定价（**行为零变化**）
 

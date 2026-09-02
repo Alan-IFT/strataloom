@@ -56,6 +56,7 @@ import { estimateTokens } from '../lib/constants.js'
 import { looksSecret, projectStore, PROJECTION_DIR, PROJECTION_FILE } from '../lib/projection.js'
 import { enqueueJob, claimNextJob, commitClaimedJob } from '../lib/pipeline/jobs.js'
 import { queryInjectableSet, queryInjectionRows } from '../lib/store/fts.js'
+import { DERIVED_PROVENANCE, INJECTABLE_PROVENANCE, PROVENANCES } from '../lib/types.js'
 import {
   openRegistry,
   cleanup,
@@ -1693,6 +1694,276 @@ test('L3: the portrait is written once, and "keep" does not churn it', async () 
   const after = global.db.prepare(`SELECT body FROM memories WHERE derived = 3`).all()
   assert.equal(after.length, 1, 'still exactly one portrait')
   assert.match(after[0].body, /English/)
+  registry.dispose()
+  cleanup(root)
+})
+
+/* ── L3 obeys §2.3: 注入资格随最低来源 ───────────────────────────────────────
+
+   The portrait is not a read-only view of its sources. `runPersonaJob` stores
+   the model's answer as an ordinary row stamped `DERIVED_PROVENANCE`, and
+   `queryInjectionRows` prefers derived rows over the raw set — so whatever
+   reaches the portrait prompt reaches EVERY repository's packet, with its
+   provenance rewritten on the way. A source set wider than the packet's own
+   would therefore launder `subagent` / `tool-output` rows into injected text
+   past the §2.3 filter that exists to keep them out.
+
+   Both call sites read `queryPersonaSources`, and both tests below are needed
+   because they are NOT independent evidence of each other — each names the ONE
+   line whose reversion turns it red, and neither turns red for the other's.
+   Measured, one mutation at a time:
+
+     revert `runPersonaJob`'s source query only  -> only test 1 goes red
+     revert `enqueuePersonaRebuild`'s only       -> only test 2 goes red
+     revert both (HEAD behaviour)                -> both go red
+     keep the row set correct, but fold the
+       low-trust BODIES into an admitted row     -> only test 1 goes red
+
+   Deleting either test therefore lets its own side regress in silence, which is
+   the half-applied paired fix ADR 0007 lesson 6 warns about — and here the
+   halves fail DIFFERENTLY: the execution side leaks low-trust content into the
+   prompt, the enqueue side leaks a `jobs` row per snapshot.
+
+   The fourth row is why test 1 asserts on titles AND bodies. An earlier version
+   checked titles only and stayed GREEN against that mutation, even though the
+   leak it models is the real §2.3 failure: low-trust text in the prompt, stored
+   back as `derived`, injected everywhere. A correct row set is not the property
+   worth asserting — uncontaminated prompt bytes are. */
+
+/**
+ * The provenances §2.3 keeps out of injection, DERIVED from the two exported
+ * tuples rather than spelled out.
+ *
+ * Writing `['subagent', 'tool-output']` here would be today's answer copied
+ * into a fixture: `INJECTABLE_PROVENANCE` is the rule, and a provenance added
+ * to `PROVENANCES` without being made injectable must widen this set by
+ * itself. (STATUS.md item `l` records the same mistake made with a `kind`
+ * literal, where the copied conclusion happened to still be right.)
+ *
+ * `DERIVED_PROVENANCE` is excluded because no production writer ever puts it on
+ * a RAW row: the only two INSERTs that use it (`pipeline/rebuild.ts`) both write
+ * a non-RAW layer, and the two that write RAW rows spell the provenance
+ * `'principal-explicit'` (`service.ts`) or take it from `provenanceFor`
+ * (`pipeline/extract.ts`), which reduces over event categories and can return
+ * `subagent`/`tool-output`/`parent-agent`/`human` but has no branch producing
+ * `'derived'`. Across the nine live stores (500 rows, no status filter) the
+ * `derived = 0 AND provenance = 'derived'` cell measures 0 — the same count and
+ * the same cell `schema.ts`'s `migrateV10` reports (it read 494 rows when it was
+ * written; the six new rows are ordinary growth, and the cell is still 0).
+ *
+ * This is FIXTURE DISCIPLINE, not a schema guarantee, and the difference
+ * matters enough to state: the v10 CHECK constrains ONE direction only
+ * (`derived != RAW ⇒ provenance = 'derived'`) and does NOT forbid the converse.
+ * Measured against a live store — inserting `derived = 0` with
+ * `provenance = 'derived'` is ACCEPTED, while `derived = 3` with
+ * `provenance = 'human'` is refused. `schema.ts`'s `migrateV10` says so itself
+ * ("ONE DIRECTION ONLY, deliberately") and explains why the converse is safe to
+ * leave writable: `'derived'` is not in `INJECTABLE_PROVENANCE`, so such a row
+ * is excluded rather than injected.
+ *
+ * So the exclusion carries weight — without it `seedPersonal` would fabricate a
+ * row the write path never produces, and both tests would assert against an
+ * invented state — but it is enforced HERE, by this filter, and nowhere else.
+ *
+ * KNOWN LIMIT, left in place deliberately. The derivation splits `PROVENANCES`
+ * into "injectable" and "everything else", and treats the second half as
+ * SOURCES a store could hold. A future member that is a generator's stamp
+ * rather than a source — a second `DERIVED_PROVENANCE`, say — would land in the
+ * low-trust half and be seeded as though a writer produced it, making these
+ * tests assert about a row that cannot exist. Naming that case here rather than
+ * coding around it: any predicate for "is this a stamp?" would be a second
+ * hand-maintained list, which is the duplication the derivation exists to
+ * avoid, and it would go stale in exactly the same way.
+ */
+const NON_INJECTABLE_PROVENANCE = PROVENANCES.filter(
+  (p) => p !== DERIVED_PROVENANCE && !INJECTABLE_PROVENANCE.includes(p),
+)
+
+/**
+ * Insert one active RAW personal memory carrying a chosen provenance.
+ *
+ * Title and body carry SEPARATE markers on purpose. A row reaches the prompt
+ * through two independent channels, and a leak can use either: dropping the
+ * provenance filter carries both, while a defect that keeps the row set correct
+ * and merely folds low-trust TEXT into an admitted row's body carries only the
+ * second. Sharing one marker across both fields would collapse that distinction
+ * and leave the body channel unasserted (measured — see the test below).
+ */
+const seedPersonal = (global, provenance) => {
+  global.db
+    .prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+       VALUES (?, 'preference', 'private', 'active', ?, ?, ?, 0, 0, 0)`,
+    )
+    .run(randomUUID(), `TITLE-${provenance}`, `BODY-${provenance}`, provenance)
+}
+
+/** The rule `enqueuePersonaRebuild` used to apply: every active RAW row. */
+const unfilteredSourceCount = (global) =>
+  global.db.prepare(`SELECT count(*) n FROM memories WHERE status = 'active' AND derived = 0`)
+    .get().n
+
+/**
+ * A portrait reply that also RECORDS what `llm.stream` was handed. The capture
+ * is the whole options object serialized, not the rows some query returned:
+ * the claim under test is about what the model is shown, so the assertion has
+ * to sit on the last surface before the bytes leave the process.
+ */
+const capturingPersonaReply = (sink) => ({
+  stream: async function* (options) {
+    sink.seen = JSON.stringify({ system: options.system, messages: options.messages })
+    yield {
+      type: 'text-delta',
+      index: 0,
+      text: JSON.stringify({ verdict: 'rewrite', body: 'a portrait' }),
+    }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  },
+})
+
+test('L3 sources: no low-trust title OR body appears in the portrait prompt bytes', async () => {
+  // Reverting `runPersonaJob`'s source query to the hand-written
+  // `WHERE status='active' AND derived = LAYER.RAW` turns this red, and the
+  // enqueue-side test below stays green — the two halves are asserted apart on
+  // purpose.
+  //
+  // Asserted on the bytes handed to `llm.stream`, not on what
+  // `queryPersonaSources` returns: a test on the query would pass against a
+  // correct query wired into nothing, which is precisely the state HEAD is in
+  // for the other call site.
+  //
+  // ## What this assertion IS, stated at its real strength
+  //
+  // A SUBSTRING BLACKLIST over two channels — the low-trust rows' titles and
+  // their bodies — and not the general property its name might suggest. The
+  // name says "title OR body" rather than "never reaches the prompt" because
+  // the weaker sentence is the one actually checked.
+  //
+  // Both channels are needed, and that is measured rather than assumed. A
+  // mutation that leaves the ROW SET correct (the provenance filter fully
+  // intact) and merely concatenates the non-injectable rows' bodies onto an
+  // admitted row's body leaks exactly what §2.3 exists to stop — low-trust
+  // CONTENT into the portrait prompt, thence into a `derived` row injected in
+  // every repository — and against a title-only assertion it passed green.
+  // Adding the body channel is what turns it red.
+  //
+  // Its limit is equally known, and it is wider than "re-encodes or
+  // paraphrases" suggests. Four mutations that keep the ROW SET correct and
+  // fold the low-trust bodies into an admitted row all pass 239/0 green:
+  // reversing the characters, base64, inserting a zero-width space, and
+  // CHOPPING ONE CHARACTER off each marker. The last one deserves the name:
+  // it is not a rewrite at all — nearly the whole secret survives verbatim —
+  // so "a substring check only catches verbatim substrings" is the honest
+  // statement, not "it only misses paraphrases".
+  //
+  // Two channels ARE covered, and by construction rather than by luck: the
+  // assertion reads the whole `llm.stream` options blob, so smuggling through
+  // `kind` or through the system prompt turns it red (measured, 238/1 each).
+  //
+  // That is the same trade the truncation-mark test below documents —
+  // an honest blacklist with its boundary written down beats an assertion that
+  // claims a property and delivers a word list.
+  const { root, registry, ctx } = setup()
+  const global = registry.get(GLOBAL_STORE_KEY) ?? registry.openGlobal()
+
+  assert.ok(
+    NON_INJECTABLE_PROVENANCE.length > 0,
+    'precondition: §2.3 excludes at least one provenance, or this test asserts nothing',
+  )
+  global.tx(() => {
+    for (const p of INJECTABLE_PROVENANCE) seedPersonal(global, p)
+    for (const p of NON_INJECTABLE_PROVENANCE) seedPersonal(global, p)
+  })
+  // Precondition: the reverted rule and this one DISAGREE on this fixture. A
+  // store of only injectable rows would go green under both, so without this
+  // the test could be decoration and look identical.
+  assert.equal(
+    unfilteredSourceCount(global),
+    INJECTABLE_PROVENANCE.length + NON_INJECTABLE_PROVENANCE.length,
+    'precondition: the unfiltered rule would hand every one of these rows to the model',
+  )
+
+  const sink = {}
+  assert.equal(await judgePersona(ctx, global, capturingPersonaReply(sink), 'pj-prov'), true)
+  assert.ok(sink.seen !== undefined, 'precondition: the portrait job really did call the model')
+
+  // Both channels, per provenance. `field` is named in the message because
+  // "which one leaked" is the difference between a broken row filter and a
+  // body-level contamination, and they have different fixes.
+  for (const p of NON_INJECTABLE_PROVENANCE) {
+    for (const [field, marker] of [
+      ['title', `TITLE-${p}`],
+      ['body', `BODY-${p}`],
+    ]) {
+      assert.ok(
+        !sink.seen.includes(marker),
+        `the ${field} of a '${p}' row reached the portrait prompt. The portrait is written ` +
+          `back as '${DERIVED_PROVENANCE}' and injected in every repository, so anything ` +
+          'admitted here is laundered past the §2.3 filter with no trace of where it came from',
+      )
+    }
+  }
+  // And the filter did not simply empty the prompt — the portrait still has
+  // material, so this is a filter rather than a break. Asserted on both fields
+  // as well, so that a mutation blanking bodies wholesale cannot pass by making
+  // the negative assertions vacuously true.
+  for (const p of INJECTABLE_PROVENANCE) {
+    assert.ok(sink.seen.includes(`TITLE-${p}`), `an injectable '${p}' title is still portrayed`)
+    assert.ok(sink.seen.includes(`BODY-${p}`), `an injectable '${p}' body is still portrayed`)
+  }
+  registry.dispose()
+  cleanup(root)
+})
+
+test('L3 enqueue: a store holding only low-trust rows queues no portrait job, ever', async () => {
+  // Reverting `enqueuePersonaRebuild` to its `count(*)` query turns this red,
+  // and the prompt test above stays green.
+  //
+  // Asserted on the `jobs` table, because the damage is a PERSISTED one.
+  // `packetOverflows`' comment states the rule this enforces at L3: enqueue and
+  // execution must answer from one set, or a job is queued and then dismissed
+  // as unnecessary on arrival. The idempotence key cannot absorb the repeat —
+  // `store_revision` rides it, so every snapshot mints a fresh job id — which
+  // turns "one wasted job" into one leaked row per revision, forever.
+  const { root, registry } = openRegistry()
+  const global = registry.openGlobal()
+  const ctx = fakeCtx({
+    services: { agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) } },
+  })
+
+  global.tx(() => {
+    for (const p of NON_INJECTABLE_PROVENANCE) seedPersonal(global, p)
+  })
+  // Precondition: the store is NOT empty. Under the reverted rule this count is
+  // what decides, so a value of 0 would make both implementations answer "do
+  // not queue" and the test would prove nothing.
+  assert.ok(
+    unfilteredSourceCount(global) > 0,
+    'precondition: an unfiltered count sees rows here, so the two rules differ on this fixture',
+  )
+
+  // Three snapshots, three distinct idempotence keys. One bump would not
+  // distinguish "absorbed by the key" from "never queued".
+  const bump = () =>
+    global.db
+      .prepare(
+        `INSERT INTO meta (k, v) VALUES ('store_revision', ?)
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+      )
+      .run(String(readRevision(global) + 1))
+  for (let pass = 0; pass < 3; pass++) {
+    bump()
+    assert.equal(
+      enqueueRebuildIfOverflowing(ctx, global, Date.now()),
+      false,
+      `pass ${pass}: nothing here may be portrayed, so nothing may be queued to portray it`,
+    )
+  }
+  assert.equal(
+    global.db.prepare(`SELECT count(*) n FROM jobs WHERE kind = 'rebuild'`).get().n,
+    0,
+    'and no rebuild row accumulated — the leak is one row per revision, so it is counted here',
+  )
   registry.dispose()
   cleanup(root)
 })

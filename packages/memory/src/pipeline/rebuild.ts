@@ -52,7 +52,7 @@ import {
   PERSONA_TITLE,
 } from '../constants.ts'
 import { DERIVED_PROVENANCE, LAYER, type MemoryHit } from '../types.ts'
-import { queryInjectableSet } from '../store/fts.ts'
+import { queryInjectableSet, queryPersonaSources } from '../store/fts.ts'
 import { packetTokens } from '../recall/inject.ts'
 import { truncatedToBudget } from '../recall/render.ts'
 
@@ -168,15 +168,36 @@ export const enqueueRebuildIfOverflowing = (
  * The revision still rides the idempotence key, so a portrait judgement is
  * queued at most once per snapshot: repeated maintenance passes over an
  * unchanged store collapse into the job that already ran.
+ *
+ * "Holds personal memories" means the rows `queryPersonaSources` returns — the
+ * ones `runPersonaJob` will actually portray — and NOT every active raw row.
+ * This is `packetOverflows`' container rule at the L3 call site: the two sides
+ * must answer from ONE set, or a job is queued and then found unnecessary on
+ * arrival.
+ *
+ * A `count(*)` here would be the wider set, and the cost is measured rather
+ * than argued. On a fresh global store holding exactly one row per
+ * non-injectable provenance (2 rows — so a count answers "yes" where this
+ * query answers "no"), bumping `store_revision` five times: the count rule
+ * returned true 5 times and left 5 rows in `jobs`; this query returned false 5
+ * times and left 0. The idempotence key cannot absorb the repeat, because the
+ * revision rides it and each snapshot therefore mints a new job id — so the
+ * waste is one row per revision, not one row in total. Running one of those
+ * jobs against the filtered executor confirms it is a pure no-op: empty source
+ * set, no LLM call, no portrait written, row settled `done`.
+ *
+ * `PERSONA_SOURCE_LIMIT` and not `1`, even though only emptiness is tested and
+ * `LIMIT 1` would answer it while reading less. The limit is what makes "the
+ * same set" literally true: with the same argument at both call sites, the
+ * enqueue side asks the execution side's exact question, and no future reader
+ * has to prove that a 1-row probe and a 100-row fetch agree on emptiness. That
+ * proof is easy today and is the kind that quietly stops holding — a later
+ * `WHERE` clause with a subquery, say, need not be limit-independent. The cost
+ * is bounded by the constant and paid only on the maintenance path, which is
+ * a smaller thing than the invariant it buys.
  */
 const enqueuePersonaRebuild = (ctx: Context, store: OpenStore, now: number): boolean => {
-  const source = store.db
-    .prepare(
-      `SELECT count(*) AS n FROM memories
-       WHERE status = 'active' AND derived = ${LAYER.RAW}`,
-    )
-    .get() as { n: number }
-  if (source.n === 0) return false // nothing to portray
+  if (queryPersonaSources(store, PERSONA_SOURCE_LIMIT).length === 0) return false // nothing to portray
   return enqueueRebuild(ctx, store, now)
 }
 
@@ -382,13 +403,40 @@ const runPersonaJob = async (
   payload: RebuildPayload,
   signal: AbortSignal,
 ): Promise<boolean> => {
-  const memories = store.db
-    .prepare(
-      `SELECT kind, title, body FROM memories
-       WHERE status = 'active' AND derived = ${LAYER.RAW}
-       ORDER BY updated_at DESC LIMIT ?`,
-    )
-    .all(PERSONA_SOURCE_LIMIT) as unknown as { kind: string; title: string; body: string }[]
+  // The SAME query the enqueue side asked, for the reason `packetOverflows`
+  // states: the two must answer from one set. It is also where §2.3's content
+  // filter reaches L3 — the portrait is written back with `DERIVED_PROVENANCE`
+  // and injected everywhere, so a row that may not be injected may not be
+  // portrayed either.
+  const memories = queryPersonaSources(store, PERSONA_SOURCE_LIMIT)
+  // Kept even though the enqueue side already refuses an empty set — but NOT
+  // for the reason that first suggests itself. "The last source row was
+  // superseded or forgotten in the meantime" is precisely the example this
+  // guard cannot be reached by: `schema.ts`'s `invalidate_derived_*` triggers
+  // bump `store_revision` on ANY write to a RAW row, and `runRebuildJob`'s
+  // first act is to compare that revision against the payload's. So every
+  // in-process way of emptying the source set fences the job one frame EARLIER,
+  // and control never arrives here. Measured, one mutation applied between
+  // enqueue and execution on a store whose single source row is the target:
+  //
+  //     supersede last source     rev 1->2  fenced  guard not reached  llm 0
+  //     forget/tombstone          rev 1->2  fenced  guard not reached  llm 0
+  //     decay -> dormant          rev 1->2  fenced  guard not reached  llm 0
+  //     hard DELETE               rev 1->2  fenced  guard not reached  llm 0
+  //     provenance -> subagent    rev 1->2  fenced  guard not reached  llm 0
+  //     no mutation (control)     rev 1->1  passes  portrait written   llm 1
+  //
+  // What it does guard is the gap BETWEEN the precheck's read of
+  // `store_revision` and this query: two independent reads, with no snapshot
+  // holding them together, so another process may commit in between and the
+  // precheck then passes on a revision that is already stale. Measured against
+  // a second process flipping the last source row, counting only iterations
+  // where the write landed strictly between the two reads: 2780 of 724277, and
+  // 2716 of 700657 on a repeat — rare per attempt, certain at volume.
+  //
+  // Hence a guard rather than an assertion: writing a portrait from nothing
+  // would be the model inventing a person, and that costs one LLM call to
+  // avoid.
   if (memories.length === 0) {
     commitClaimedJob(store, job.id, job.leaseToken, () => {})
     return false

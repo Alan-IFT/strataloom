@@ -65,6 +65,61 @@ export const queryInjectableSet = (store: OpenStore, limit: number): MemoryHit[]
     .all(limit) as unknown as MemoryHit[]
 
 /**
+ * The L3 portrait's source rows: the same ELIGIBILITY as the packet's working
+ * set, in the portrait's own columns and order.
+ *
+ * `INJECTABLE_LIST` is shared with `queryInjectableSet` above rather than
+ * restated, because §2.3's rule has to mean ONE thing on both paths. The
+ * portrait is not a read-only view of its sources: `runPersonaJob` stores the
+ * model's answer as an ordinary row carrying `DERIVED_PROVENANCE`, and
+ * `queryInjectionRows` prefers derived rows over the raw set, so a portrait is
+ * injected into EVERY repository's packet. A source set wider than the packet's
+ * would therefore launder the exact rows §2.3 keeps out of injection
+ * (`subagent`, `tool-output`) into injected text — with their provenance
+ * rewritten to `derived` on the way, so nothing downstream could tell.
+ * "注入资格随最低来源" (plugin-architecture.md §13 derived-layer row) is that
+ * rule, and this is where L3 obeys it; `packetOverflows` is where L2 does.
+ *
+ * NOT a call to `queryInjectableSet` with a different limit, and the difference
+ * is not cosmetic. That query selects `id` and orders by provenance priority
+ * before recency; this one selects the three columns the portrait payload
+ * carries and orders by recency alone. Reusing it would put row ids into the
+ * prompt and reorder the memories inside it — a different prompt for the same
+ * store, which is a behaviour change wearing the costume of a refactor. The
+ * shared thing is the PREDICATE, which is the part that has to agree.
+ *
+ * The reorder is easy to under-test, so the shape of the evidence matters. On
+ * the live global store the two orderings coincide exactly (21 rows, all
+ * `principal-explicit`, so the priority key never compares anything) — a
+ * fixture drawn from production would have shown no difference at all. On a
+ * store carrying one row per injectable provenance, oldest first, they invert
+ * end to end: `[parent-agent, principal-explicit, human]` here against
+ * `[human, principal-explicit, parent-agent]` there.
+ *
+ * Both persona call sites — `enqueuePersonaRebuild`'s "is there anything to
+ * portray?" and `runPersonaJob`'s "here is what to portray" — read it HERE, for
+ * the reason `packetOverflows` gives: an enqueue side that answers from a wider
+ * set than execution queues a job that arrives with nothing to do, and since
+ * `store_revision` rides the idempotence key, each revision makes that a NEW
+ * job id no key can absorb.
+ * @param limit - row cap; the portrait path passes `PERSONA_SOURCE_LIMIT`.
+ */
+export const queryPersonaSources = (
+  store: OpenStore,
+  limit: number,
+): { kind: string; title: string; body: string }[] =>
+  store.db
+    .prepare(
+      `SELECT kind, title, body
+       FROM memories
+       WHERE status = 'active' AND derived = ${LAYER.RAW}
+         AND provenance IN (${INJECTABLE_LIST})
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+    )
+    .all(limit) as unknown as { kind: string; title: string; body: string }[]
+
+/**
  * Everything a person should be able to see: active, non-derived, whatever the
  * provenance, newest first.
  *
