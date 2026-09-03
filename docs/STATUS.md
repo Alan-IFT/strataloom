@@ -1,6 +1,375 @@
 # 当前状态
 
-> 最后更新：2026-09-03 · **v0.4.13 已发布**：`forget`
+> 最后更新：2026-09-03 · **v0.4.14 待发布**：`schema.ts` 的注释写着
+> 「任何派生层都是**整层重建，从不逐行老化**」，而触发器只挡了 `dormant`
+> **一个**状态。实测 v10 库：`candidate`/`superseded`/`archived`/`tombstone`
+> 在派生行上**全部被接受且持久**——**5 个状态只兑现 1 个**，与 v0.4.13
+> 「注释写对了原则，实现只兑现一半」同族。修法是把不变量下沉为
+> **schema v11 触发器**（`guard_derived_status` ＋ `guard_derived_status_insert`），
+> **纯 `DROP/CREATE TRIGGER`，不重建表**（实测：数据/evidence/FTS 三项计数不变）。
+> 🟡 **结构性缺口，今日无实例**：9 库 521 条记忆、派生行 16、非 active 派生行 **0**；
+> 可持久性已证实，但需**三个并发条件**同时成立（见下）。
+> 测试 256 → **265 / 0 fail**。结项 v0.4.4 **待办 5**。
+> ⛔ **本轮推翻了选题里的两条前提**（reconcile 今日够不到派生 id、M4 是等价变异），
+> 并**发现方案漏了第三条进入路径**（INSERT）。按本仓惯例**保留原判断＋标注证伪**，见下节。
+>
+> ⚠️ **降级不可逆（沿用 v0.4.9 先例）**：v11 库被装机的 **0.4.13 及更早**
+> （`TARGET_USER_VERSION = 10`）打开会抛
+> `MigrationError: store version 11 is newer than supported 10 (downgrade refused)`
+> （已实测原文如此）。`StoreRegistry` **fail-open 跳过该库并 warn**
+> （`openAllKnown` 逐库 try/catch，数据完好、其余库照常）。后果是**该库注入为空**
+> 直到装上 0.4.14。**先升级的机器会让仍跑 0.4.13 的机器打不开共享库**——多机环境请一起升。
+>
+> 🔴 **代码审查打回 5 项、QA 再打回 2 项必修＋1 建议，均已修**（含数条比原缺陷更隐蔽的）：守卫写对了但
+> **对存量库可能根本没生效**（审查）、live 的 INSERT 守卫**完全无行为测试**（QA）——
+> 详见下文「审查打回」与「QA 打回」两节。
+> **每次工作结束时更新本页**，它是新会话的唯一入口。
+>
+> ⬇️ 以下 v0.4.13 一节及更早各节仍然有效（v10 库不可被 0.4.8 打开的警告同样仍有效）。
+
+## 🆕 v0.4.14：注释声明的不变量，5 个状态只挡住 1 个（**schema 下沉**）
+
+**本轮结项 v0.4.4 待办 5。**
+
+### 判据：注释写的是「整层重建，从不逐行老化」，实现只覆盖 `dormant`
+
+`src/store/schema.ts` v4 的注释：
+
+```
+-- Any derived layer is regenerated wholesale, never aged out row by row (v4).
+```
+
+而触发器条件是 `new.status = 'dormant'`。对 v10 库逐状态实测（`derived = SCENARIO`）：
+
+| 目标状态 | v10 实测 | v11 实测 |
+|---|---|---|
+| candidate | **ACCEPTED（持久）** | REFUSED |
+| superseded | **ACCEPTED（持久）** | REFUSED |
+| dormant | REFUSED | REFUSED |
+| archived | **ACCEPTED（持久）** | REFUSED |
+| tombstone | **ACCEPTED（持久）** | REFUSED |
+
+**5 个非 active 状态只守住 1 个。** D9 不响——它按 `OLD.derived = RAW` 触发，
+而这些行**本来就已是派生行**。
+
+### 为什么必须下沉到 schema，而不是在读路径加过滤
+
+派生分支是 `derived.length > 0 ? derived : queryInjectableSet(...)`——**短路**。
+一条非 active 派生行不只是混进注入包，而是**遮蔽整个 raw 集**：
+
+```
+HEAD (guard present)   inject = [ 'REAL MEMORY' ]
+mutant (guard removed) inject = [ 'SUMMARY' ]
+```
+
+沿用待办 p 的既定结论：**读路径过滤只让行「不可见」，不让它「不可达」**
+（`queryRecallRows` 只排除 `EXCLUDED_STATUSES`，故 `candidate`/`dormant`
+的派生行照样被 `memory_recall` 吐出来）。注入查询上那个 `AND status = 'active'`
+**保留**——它是**存量 v10 库**的纵深防御，而 9 个生产库今天**全部是 v10**。
+
+### 做了什么：一个不变量，三个执行点
+
+**「派生行只能是 active」进入该状态有三条路，故是三个执行点而非一个**：
+
+| 路径 | 触发器 | 少了它会怎样（实测） |
+|---|---|---|
+| `UPDATE OF status` | `guard_derived_status` | 就地老化，即 v4 那条只覆盖 1/5 的路 |
+| `UPDATE OF derived` | 同上（列清单含 `derived`） | **静默丢数据**：提升被接受，D9 `invalidate_derived_update` 随即在**同一语句**删掉该行。带 `OF derived` 时是**拒绝且行还在**，不带时是**行没了** |
+| `INSERT` | `guard_derived_status_insert` | 直接生出非 active 派生行。**今日无写入方**（`rebuild.ts` 两处 INSERT 都硬编码 `'active'`），但不变量属于**数据**而非**转移**——D9 的教训 |
+
+**整层 DELETE 不受影响**（实测 `changes=2`）：`rebuild.ts` 的 delete-then-insert
+照常，即**整层重建合法、逐行老化不可表示**——正是 v4 注释一直宣称的语义。
+
+**迁移 v10 → v11 是纯 `DROP/CREATE TRIGGER`，不调 `rebuildMemories`。**
+触发器是 `sqlite_master` 里的独立对象，不像 CHECK 那样烘焙在建表 SQL 里；
+而重建表才是昂贵且有风险的那条路（要关外键、有 evidence 级联删除风险、要重灌 FTS）。
+实测：迁移后 memories/evidence/FTS 三项计数不变，`foreign_key_check` 为空。
+
+> **`DROP TRIGGER IF EXISTS` 不是防御性写法，是实测出来的必需品。**
+> `migrateV10` 走 `rebuildMemories` → `createMemoryTriggers`（**live 定义**），
+> 所以**今天新建的库到达 v10 时已经带着新名字**，裸 `DROP guard_derived_dormant`
+> 报 `no such trigger`；而上一版发布出去的存量 v10 库带的是**旧名字**。
+> 两条到达路径都要能升，故两个名字都 `IF EXISTS` 地 drop。
+
+### 🔴 本轮推翻的前提（保留原判断 ＋ 标注证伪）
+
+本仓惯例是**保留原判断并标注证伪**，不悄悄改掉。选题里有三处与实测不符：
+
+**① 「事实 C：reconcile 的模型能拿到派生 id，因为 `queryRecallRows` 不过滤 `derived`」——❌ 证伪。**
+`runReconcileJob` 的 `existing` 集**不是**来自 `queryRecallRows`，而是自
+`15b80b7`（v0.4.9）起来自 `queryAllMemories`，后者**明写 `AND derived = LAYER.RAW`**。
+实测把一条 raw 行与一条派生行放进同库，模型收到的 `existing` 只有
+`["RAW ROW"]`。**即今天模型根本看不到派生 id。** 该写入方仍然加固了，
+但理由是「回复里**万一**报了一个派生 id」与「将来有人再放宽那个窗口」，
+**不是**「模型今天拿得到」。
+
+**② 「M4（去掉 `OF derived`）可能是等价变异」——❌ 证伪，它可观测且必须挡。**
+两向对照实测：带 `OF derived` 时 UPDATE 被**拒绝、行还在**；不带时 UPDATE 被
+**接受**，D9 随即在同一语句把行**删掉**。差别不是「挡不挡得住」，而是
+**拒绝 vs 静默丢数据**。M4 实测**被 T2 打红**。
+
+**③ 方案漏了第三条进入路径：`INSERT`。** 方案只给了
+`BEFORE UPDATE OF status, derived` 一条触发器。实测在只装 UPDATE 守卫的库上
+`INSERT (status='superseded', derived=2)` **被接受且持久**（`persistent bad rows = 1`）。
+故本轮**增补了 `guard_derived_status_insert`**。M10（只删这条 INSERT 守卫）
+实测**被 T2 与两条既有迁移测试打红**——它不是摆设。
+
+### 📌 lead 自陈的 fixture 顺序错误：已独立复现，确认更正成立
+
+lead 原先的复现 fixture 把**摘要建在 `forget` 之前**并声称能复现；这是**错的**，
+因为 `forget` 本身是对 raw 行的 UPDATE，满足 D9 `invalidate_derived_update` 的
+`OLD.derived = RAW`，**在 forget 那一刻就把派生层删光了**。原始贴出的
+`derived rows before: 1` 是在 forget **之前**量的。A/B 对照已确认评审的更正成立。
+
+> **教训（扩写版，本轮再次被它咬到）**：D9 有 **INSERT/UPDATE/DELETE 三个**触发器。
+> v0.4.12 记的经验只写了「摘要必须最后插入」——**那只防住 INSERT 一路**。
+> 凡 fixture 里在摘要之后还有任何 raw 行的 **UPDATE 或 DELETE**，摘要照样会在
+> 断言跑到之前就没了。**本轮写 T4 时正是栽在这条上**：把 `raw-keep` 的 INSERT
+> 放在派生行之后，派生层被整删，`after v11 ... 'candidate'` 断言报
+> `Missing expected exception`。修法是把**全部 raw 写入排到派生行之前**。
+> 判定一个 fixture 是否安全，要问的不是「摘要是不是最后插入的」，而是
+> **「摘要之后还有没有任何 raw 行的增/改/删」**。
+
+### 配套判断：`supersedeOld` 加谓词，`propose` 也加，但两者性质不同
+
+**这不是「一条规则两个实现」**：触发器说的是**数据可以处于哪些状态**（不变量，
+对一切写入方生效，包括还没写的）；SQL 谓词回答的是**这个写入方该不该去碰这一行**
+（资格judgement，`supersedeOld` 本来就已经在问「是不是 active」「是不是 preference」
+两个同类问题）。**两者角色不同，且差别可观测**——这正是它挣到位置的地方：
+
+不加谓词时，回复里一个派生 id 会让触发器 ABORT，而 reconcile 的**整批是一个事务**（D6），
+于是**整批候选全部回滚**——实测连**决策本身完全正常的 c1** 一起丢，随后 job 烧掉重试
+配额走向 dead letter。加了谓词，该决策**降级为普通 activate**，走的是「目标不可被
+supersede」**本来就已存在**的那条路。
+
+**崩一个 job 与静默损坏，哪个是我们想要的？** ADR 0006 的既定判例是
+**「维护失败不得连坐流水线」**——一个环节坏掉不该带走本来没问题的工作。
+一批因为一个坏 id 而整批中止，正是同一个连坐，只不过发生在 job 内部。
+故**两者都不选**：靠触发器保证不静默损坏，靠谓词保证不连坐。
+
+`service.ts` 的 `propose({replaces})` 同样加了 `AND derived = LAYER.RAW`，
+**但如实登记为等价变异**（见下 M7）：它**今天不可达**，因为 INSERT 先落地且是
+raw 写，D9 已把整个派生层删光，UPDATE 无论带不带谓词都匹配 0 行（实测两向皆
+`changes = 0`）。之所以还是加——**「今天够不到」在本仓是明确判过不成立的免罪理由**
+（待办 p），且这个保证来自 **D9 的语句顺序**而非这个写入方本身，
+将来有人调换这两条语句就会把缺陷悄悄交回来。
+
+### 变异矩阵（每条都改产品代码 → 重新 build → 跑**全量**）
+
+最终基线（审查＋QA 修复后）**265 / 0**。变异全部在 `/tmp` 副本上做，还原后复跑确认读数回到基线。
+两向读数里的基线数随轮次变化（262 → 263 → 265），已逐条标注。
+
+**口径说明**：`schema.ts` 里同一条触发器有**两份定义**——`createMemoryTriggers`
+（**live**，每次表重建都会重装）与 `migrateV11`（**冻结副本**）。凡改触发器的变异，
+下表**一律注明改的是哪一份**：只改一份而全绿，说明另一份在替它兜底，
+**那是覆盖缺口而不是安全**（M2 与 M4 都栽在这上面）。
+
+| # | 改了什么（改哪份定义） | 读数 | 结果 |
+|---|---|---|---|
+| M0 | CONTROL（不改） | 263/263/0 | ✅ 全绿 |
+| M1 | 删 `queryInjectionRows` 的 `AND status = 'active'` | 262/261/**1** | ☠️ **T1** |
+| M2 | 退回只禁 `dormant`（**仅 live**） | 262/261/**1** | ☠️ **「LIVE trigger set」** |
+| M2b | 退回只禁 `dormant`（**仅冻结副本**） | 262/259/**3** | ☠️ T2 ＋ 两条迁移测试 |
+| M3 | `new.derived = LAYER.SCENARIO`（只挡 L2，**两份**） | 263/262/**1** | ☠️ **T2**（`DERIVED_LAYERS` 循环） |
+| M4 | 去掉 `OF derived`（**两份**） | 262/261/**1** | ☠️ **T2**（**非等价变异**，见证伪 ②） |
+| **M4-live** | 去掉 `OF derived`（**仅 live**） | **修前 262/262/0 存活** → **修后 263/262/1** | ☠️ **「LIVE trigger set」**（审查发现，见下） |
+| M5 | 删 `supersedeOld` 的 `derived === LAYER.RAW` | 263/262/**1** | ☠️ **T5**（评审警告会静默存活的那条，**确认真的红**） |
+| M6 | 去掉 `derived != RAW` 条件（误伤 raw 行，**两份**） | 39+ fail，`e2e` 挂死 | ☠️ **T3** ＋ 全域崩塌 |
+| M7 | 删 `propose({replaces})` 的 `AND derived = LAYER.RAW` | 262/262/0 | ⚪ **等价变异**（已证行为不可区分） |
+| M8 | `new.status` → `old.status`（形状对、意图架空，**两份**） | 100+ fail | ☠️ T2/T1 ＋ 全域 |
+| M9 | `new.derived` → `old.derived`（提升路径失守，**两份**） | 85+ fail | ☠️ T2/T1 ＋ 全域 |
+| M10 | 删掉 INSERT 执行点（**两份**） | 263/260/**3** | ☠️ **T2** ＋ 两条迁移测试 |
+| M11 | `supersedeOld` 的判据改成恒真 `!== undefined` | 262/261/**1** | ☠️ **T5** |
+| **X3** | `TARGET_USER_VERSION` 退回 **10**（迁移写好但没库到得了） | **修前 262/262/0 存活** → **修后 263/262/1** | ☠️ **「EXISTING v10 store」**（审查发现，**最严重**） |
+| **X1** | reconcile commit 内加 `DELETE FROM memories WHERE derived != RAW` | **修前 262/262/0 存活** → **修后 263/262/1** | ☠️ **「no raw write」**（审查发现） |
+| **X2** | 删掉 T5 stub 里的 `insertDerived`（**抽掉 fixture 自身前提**） | **修前全绿** → **修后 263/261/2** | ☠️ T5 ＋「no raw write」（property 3 现在真的在钉） |
+| **N19** | live **INSERT** 守卫退回 dormant-only（**仅 live**） | **修前 263/263/0 存活** → **修后 264/263/1** | ☠️ **「LIVE trigger set」**（QA 发现） |
+| **N8** | live **INSERT** 守卫 `WHEN` 架空为 `1 = 0`（**名字与计数都不变**） | **修前 264/264/0 存活** → **修后 264/263/1** | ☠️ **「LIVE trigger set」**（QA 发现） |
+| N9 | live INSERT 守卫**整条删除**（名字消失） | 263/261/**2** | ☠️ v5→v6 / v6→v7 的**触发器计数**断言（**对照组**：见下） |
+| **N4** | `supersedeOld` 判据改成 `!== LAYER.SCENARIO`（放行 L1/L3） | **修前 263/263/0 存活** → **修后 264/263/1** | ☠️ **T5**（QA 发现，fixture 退化第 7 次） |
+| **N1** | 两条 live 守卫 `RAISE(ABORT)` → `RAISE(ROLLBACK)`（**仅 live**） | **修前 263/263/0 存活** → **修后 265/264/1** | ☠️ **「ABORT…the live definition」**（QA 建议项，已补测） |
+| N1c | 同上，**仅冻结副本** | 265/264/**1** | ☠️ **「ABORT…the v11 migration copy」** |
+
+### 🟠 QA 打回的 2 项必修 ＋ 1 项建议（全部已修）
+
+#### 必修 1：live 的 **INSERT** 守卫**完全没有行为测试**（N8 / N19 双双存活）
+
+**根因是执行点不对称。** live 专测覆盖了 `UPDATE OF status` 与 `UPDATE OF derived`
+（两者共用一个列清单），**唯独漏了 INSERT**——而 `guard_derived_status_insert`
+是**独立的第二个触发器**。T2 走的是 `migrateV11` 的**冻结副本**，看不见 live 定义。
+于是 live 的 INSERT 守卫**没有任何测试**。
+
+复现（只退回 **live** 的 INSERT 守卫，冻结副本不动）：全量 **263 / 263 / 0 全绿**，
+而同一构建下真实行为已漏 4/5：
+
+```
+{"candidate":"ACCEPTED (BAD)","superseded":"ACCEPTED (BAD)",
+ "dormant":"refused","archived":"ACCEPTED (BAD)","tombstone":"ACCEPTED (BAD)"}
+persistent bad rows: 4
+```
+
+> **教训：现有防线只「数触发器」，不「验行为」。**
+> N9（**整条删掉**，名字消失）会被 v5→v6 / v6→v7 的**计数**断言抓到（实测 263/261/2）；
+> 但只要**名字还在**、`WHEN` 被架空（`1 = 0` 或退回 dormant-only），
+> **计数照样对、全量照样绿**（N8/N19 实测）。
+> **N9 与 N8/N19 的这组对照，正是「计数不是行为」的判据。**
+> 后果不是理论的：`rebuildMemories` 重装的就是 live 集合，
+> **下一次加宽任何 CHECK 的迁移都会把被削弱的 live 定义静默装回去。**
+
+#### 必修 2：T5 的 fixture 只钉住 SCENARIO 一层（N4 存活）——**fixture 退化第 7 次**
+
+`insertDerived` 默认 `layer = LAYER.SCENARIO`，T5 从未传别的层。于是把
+`supersedeOld` 的判据改成 `!== LAYER.SCENARIO`（**放行 L1 SUMMARY 与 L3 PERSONA**）
+**263 / 263 / 0 全绿存活**。已改为**对 `DERIVED_LAYERS` 循环**（与 T2 同一写法），
+每层各开一个干净库。
+
+#### 建议项 3：`RAISE(ABORT)` 的选择无测试（N1 存活）→ **判断是补测，不是登记**
+
+**理由：这不是拼写，是一个被论证过的决定，而论证只写在注释里。**
+`reconcile.ts` 花了大段篇幅援引 ADR 0006 论证「一个坏 id 不得连坐整批」，
+而那个结论**只在动词是 ABORT 时成立**。实测两者差异（用 `jobs` 表做无关写入，
+避开 D9）：
+
+```
+RAISE(ABORT   )  COMMIT ok      | the job row survived: true
+RAISE(ROLLBACK)  COMMIT FAILED  | the job row survived: false
+```
+
+即 ROLLBACK 会**连坐销毁同一事务里的 job 记账写入**——正是 ADR 0006 明令禁止的形态。
+「今天到不了」在本仓不是免罪理由（待办 p），且此处**代价极低**，故补测而非登记。
+
+> ⚠️ **补测过程中又踩到同一个坑，记下来**：第一版测试只用 `openRegistry()`
+> （当前 target ⇒ **冻结副本**），结果 **N1 仍然存活**（264/264/0）——
+> 与 N8/N19 是**同一个 live/冻结不对称**。已改为**对两份定义各跑一遍**
+> （`target = 10` 够到 live，默认 target 够到冻结副本），N1 与 N1c 各自被对应那条杀死。
+> **判据：凡涉及触发器语义的测试，必须两份定义都跑。**
+
+#### ⚪ 如实登记为等价／准等价，不补测试
+
+| 变异 | 定性 | 判据 |
+|---|---|---|
+| **N2**（`BEFORE` → `AFTER`） | 准等价 | 多种观测均无法区分。`BEFORE` 是更省的写法（不必先写再撤），保持现状 |
+| **N5**（`status='active'` → `status NOT IN (EXCLUDED_LIST)`） | **今天严格等价** | QA **导入生产常量实测**：`MEMORY_STATUSES` 减 `EXCLUDED_STATUSES` 恰为 `["active"]`。**但写死 `'active'` 是更强的写法**——它不随 `EXCLUDED_STATUSES` 变动而漂移，故保持现状 |
+| **N10/N11/N14/N15** | 纯拼写等价 | 不可观测的拼写不该钉进测试（本仓判例） |
+| **M7** | 等价 | 已证行为不可区分（D9 先删空派生层）；QA 独立复核确认成立 |
+
+### 🔴 代码审查打回的 5 项（全部已修，两向读数见上表）
+
+#### 1（最严重）：守卫写对了，但对**存量库**可能根本没生效——且无测试会发现
+
+变异 X3：把 `TARGET_USER_VERSION` 退回 **10**（迁移写好、注册好，但没有库到得了）。
+**修前实测 262 / 262 / 0 全绿存活。**
+
+根因是**两条到达路径只有一条依赖 `migrateV11`**：
+
+| 路径 | 谁装的触发器 | TARGET=10 时 |
+|---|---|---|
+| **新建库** | `createMemoryTriggers`（live） | `user_version = 10`，**却已带着 v11 守卫** → 老化被拒 → 测试照绿 |
+| **存量 v10 库**（9 个生产库全在此列） | 只能靠 `migrateV11` | **守卫根本没装** → 老化被接受 → **缺陷原样敞着** |
+
+原测试用 `migrate(db,'repo')` **新建**库，正好落在**看不见缺陷的那条路径**上。
+
+> **教训：「守卫写对了」与「守卫生效了」是两个命题，测试必须钉后者。**
+> 而本仓已经吃过这一记——原测试的注释**逐字预言了这个失败模式**
+> （"Leaving TARGET_USER_VERSION at 9 … was measured to keep the entire suite green"），
+> 然后**伸手去拿了唯一观测不到它的 fixture**。**注释写对了原则、代码兑现的是另一件事**
+> ——与本轮所修的缺陷、与 v0.4.13，是同一个错误的第三次出现。
+> **判据：写「迁移是否生效」的测试，fixture 必须是「存量的旧版本库」，不能是新建库。**
+
+修法：改写为 `'an EXISTING v10 store, reopened at the default target, reaches v11 and is constrained'`
+——造真实 v10 库（装回 v4 的 `guard_derived_dormant`），**先断言老化在升级前确实被接受**
+（前置条件），再用默认 target 重开并断言被拒。
+
+#### 2 与 3：T5 有两处断言是空转的（**保留原错误并标注**）
+
+**② property 3 断言了与自己注释相反的事。** 原代码：
+
+```js
+// Property 3: the derived row is REALLY there on the eve of the commit …
+const derivedBefore = …
+assert.equal(derivedBefore, 0, 'the summary is planted by the llm stub, mid-job')
+```
+
+它跑在 `runReconcileJob` **之前**，此时 stub 还没种下那一行——**断言的是「摘要不在」，
+而注释宣称「摘要真的在」**。变异 X2（删掉 stub 里的 `insertDerived`，让派生行**从未存在**）
+实测：干净代码与叠加 M5 **都全绿**——即**方案评审要求的那道防线并没有建立**
+（M5 之所以被杀是因为抛异常，与 property 3 无关）。
+修法：把采样点移进 stub **末尾**（commit 前最后一刻，唯一有意义的时刻），断言 `= 1`。
+
+**③ `if (summary !== undefined)` 把两条断言变成死代码。** 干净路径下 `sum-1` 实测就是
+`undefined`（被 D9 删了），故那两条断言**一次都没执行过**。变异 X1（在 commit 内加
+`DELETE FROM memories WHERE derived != RAW`，即**销毁整个派生层**）**修前全绿存活**。
+修法：删掉空壳，改为**正面断言**「派生行已被 D9 retire」并说明原因。
+
+**X1 需要一条新测试，因为原 fixture 在原理上看不见它。** T5 里 `c1` 会被 activate，
+那是一次 raw 写，D9 随即整删派生层——**于是「reconcile 没动摘要」与「reconcile 销毁了摘要」
+的终态逐字节相同**。可区分的窗口是**整批零 raw 写**的 commit（所有候选都已离开
+`candidate`，`activate` 匹配 0 行，D9 不响，派生层活到事务结束）。故新增
+`'reconcile: a commit with no raw write leaves the derived layer standing'`。
+
+#### 4：`schema.ts` 注释「three triggers」与实现不符
+
+实测 `guard_derived*` 触发器数 = **2**（前两条路共用一个 `OF status, derived` 列清单）。
+三条路确实都封住了，但**三个执行点 ≠ 三个触发器**。已改为
+"three EXECUTION POINTS — carried by TWO triggers"，并注明是数出来的。
+**本轮的尺子必须量到自己身上。**
+
+#### 5：缺「降级不可逆」警告 → 已按 v0.4.9 先例补在页首
+
+#### 6（建议项）：live 定义专测漏了 promote 路径
+
+审查实测 **M4-live**（只改 live 定义去掉 `OF derived`）**262 / 262 / 0 存活**——
+因为该专测只跑 `SET status = ?`，没跑 `SET derived = ?`。**只改一份定义就全绿，
+说明另一份在替它兜底**，而 `rebuildMemories` 装的正是 live 那份。已补 promote
+路径断言（含「拒绝而非删除」）。同时**变异矩阵已统一注明每条改的是哪份定义**——
+原表只有 M2/M2b 作了区分，M4 没有，属口径不一致。
+
+**M7 如实标注为等价变异，不补测试。** 已实测证明其**行为不可区分**而非仅仅未被覆盖：
+`propose` 在同一事务里**先 INSERT 一条 raw 行**，D9 `invalidate_derived_insert`
+当场删空派生层，随后的 UPDATE 带与不带谓词**都是 `changes = 0`**。
+本仓判例是**不可观测的拼写不该钉进测试**——要为它造红，只能去测「D9 的语句顺序」，
+那是另一条规则的测试，钉在这里会变成一条**名不副实**的测试。
+
+### 取数陷阱（本轮新增两条）
+
+- **M2 一开始「存活」，不是测试没写对，而是它测不到。** `migrateV11` 跑在**最后**，
+  它那份**冻结副本**会覆盖 `createMemoryTriggers` 装的东西，于是 **live 定义对
+  其余每一条测试都不可见**——把 live 定义退回旧语义，全量 **262/262 全绿**。
+  而 `rebuildMemories` 装的正是 **live 定义**，所以下一次任何加宽 CHECK 的迁移
+  都会把当时的 live 定义重新装上：live 定义一旦被削弱，缺陷会在下次重建时**无声复原**。
+  故补了一条专测 live 定义的测试，用 `target = 10`（最后一步是重建、且之后无迁移覆盖）够到它。
+- **迁移测试的 fixture 必须还原「真实的 v10 库」，而不是 `migrate(db,'repo',10)` 的产物。**
+  两者**不是一回事**：后者由今天的 build 装上 live 触发器，**已经带着 v11 的守卫**。
+  真实 v10 库是**上一版发布**写的，带的是 v4 那条 `guard_derived_dormant`。
+  T4 里显式把旧触发器装回去，否则它测的是一个**从未存在过的库**（前置断言会直接失败——
+  实测第一版就是这样红的）。
+- **（审查／QA 补充）「只改一份定义就全绿」永远是覆盖缺口的信号，不是安全的证明。**
+  本轮**栽了四次**：M2、M4、N8/N19、N1——每次都是只改 live 定义就全绿，冻结副本替它兜底。
+  **凡同一规则有两份定义，变异必须分别只改一份**——两份一起改是最弱的变异，
+  它连「哪一份在真正生效」都回答不了。本轮变异矩阵已按此口径标注每一条。
+  **推论（写测试时用）：凡涉及触发器语义的测试，必须对两份定义各跑一遍**
+  （`target = 10` 够到 live，默认 target 够到冻结副本）。补 N1 测试时第一版
+  只跑了冻结副本，N1 照样存活——同一个坑当轮踩了第二次。
+- **（QA）「数触发器」不是「验行为」。** 把守卫**整条删掉**会被既有的触发器**计数**
+  断言抓到（N9：263/261/2），于是很容易误以为这条防线管用；但只要**名字还在**、
+  `WHEN` 条件被架空（`1 = 0`、或退回 dormant-only），**计数照样对、全量照样绿**
+  （N8/N19：263/263/0，而真实行为已漏 4/5、留下 4 条脏行）。
+  **判据：一个只检查「对象存不存在」的断言，永远挡不住「对象还在但不干活」。**
+- **判断一条测试是否在钉住某件事，去抽掉它的前提，而不是去看它的断言。**
+  T5 的 property 3 断言写得很像回事，注释也说得很确定，但把 fixture 的前提
+  （那行 `insertDerived`）整行删掉之后，它**照样全绿**——即它从未钉住任何东西。
+  **「抽掉前提仍然绿」是空转断言的判定方法**，比重读断言可靠。
+
+### 本轮登记的待办
+
+| # | 事项 | 现状（实测 2026-09-03） | 处置判据 |
+|---|---|---|---|
+| 1 | **存量 v10 库里若已有非 active 派生行，v11 迁移不会拒绝也不会清理** | 9 库实测该类行 **0**，故今日无影响 | 迁移是纯触发器 DDL，**不校验存量数据**——与 v10 的做法（`INSERT ... SELECT` 撞 CHECK 则整体回滚）不同。今天两者等价仅因存量为 0。若将来真出现这类行，它会**留在库里**并继续被注入查询过滤掉；要改成迁移期清理，须先想清楚「删一行用户数据」是否该由迁移擅自决定 |
+| 2 | **`queryInjectionRows` 的 `AND status = 'active'` 现在是纵深防御，不是唯一防线** | v11 后新库不可能有该类行；但 9 个生产库**全部还在 v10** | **不要因为「schema 已经保证了」就删掉它**——存量库升级前它是唯一防线。等到全部库都到 v11 之后，删它才是安全的，且届时应由**一次实测**（全部库 `user_version = 11`）而非推断来决定 |
+
+---
+
+> 【v0.4.13 发布说明，原文保留】`forget`
 > 从不刷新工作区投影——D5 明写要关闭的**四个**读取面里，`（recall/context/派生/
 > 投影）`的最后一个**没有任何执行点**。库里 title/body 已清空，同样的字节仍完整
 > 躺在 `<workspace>/.repo_memory/memories.md`。修法是**新增一个私有方法
@@ -1951,7 +2320,7 @@ extract 提示词那句 "no secrets" 是给模型的请求而非机制）；`con
 | 2 | ~~**合规派生层可因换行密度突破预算**~~ → **✅ 已结项**（v0.4.5，见本页顶部） | ~~6 块全部 ≤ `ROLLUP_TARGET_CHARS` 时，行长 ≤6 字符即 >1300（最高 1.5×），运行时静默丢块~~ | 已按本条当时登记的判据实施（约束单位由字符改为渲染后 token）。**但当时这条只登记了 `parseScenarios` 一个执行点，实际是两个**：`parsePersona` 同型，且后果更重——画像是**整条丢弃**而非逐块掉。详见 [ADR 0013](decisions/0013-bound-the-write-in-the-unit-the-container-spends.md) |
 | 3 | **`store.kind` 三元分派是 fail-open** | QA 实测：`kind` 为 `undefined`/`null`/`'GLOBAL'`/`''` 时一律走**不加帽**分支，画像缺失态误差 34.1× | 今由 `StoreKind = 'repo' \| 'global'` 封闭联合兜住。**注意 `rebuild.ts` 有三处既有的同形状分派**，要改就四处一起改；单改一处会造成「同一个二元分派四个执行点方向不一」，比现状更糟 |
 | 4 | ~~**`queryInjectionRows` 的派生扫描无 LIMIT**~~ → **✅ 已结项**（v0.4.7，见本页顶部，与待办 j 是同一条 LIMIT） | ~~QA 实测 50k 派生行 → 192ms、物化 30MB~~ | 已加 `LIMIT INJECT_TOP_N`。50k 行实测由 67.6ms/351MB 降至 **41.3ms/0.16MB**，`PRAGMA temp_store = MEMORY` 不再是读路径硬依赖。**但当时只登记了性能与 temp_store，漏掉了真正严重的那一半**：该扫描同时能让注入包**溢出 §4.2 容器而护栏不报警**。⚠️ 查询计划**未改善**（仍 `SCAN` + `USE TEMP B-TREE`），省的是物化到 JS，别误读 |
-| 5 | **派生查询的 `status='active'` 过滤零覆盖** | QA 变异实测：去掉该过滤 **224/224 全绿** | 今日不可达仅因 9 库**非 active 的派生行数全为 0**——**数据巧合而非机制保证**，与 v0.4.3 第 3 项同型。该过滤同时服务运行时注入路径，不只 metrics |
+| 5 | ~~**派生查询的 `status='active'` 过滤零覆盖**~~ → **✅ 已结项**（v0.4.14，见本页顶部） | ~~QA 变异实测：去掉该过滤 **224/224 全绿**~~（v0.4.13 上复测仍 **256/0 全绿**，零覆盖持续到本轮） | 已补覆盖（T1），**但修法比本条当时登记的判据更进一步**：本条只说「过滤零覆盖」，实测发现该过滤守的是一个**短路分支**——一条非 active 派生行不只是混进注入包，而是**遮蔽整个 raw 集**。故除补测试外，把不变量下沉为 schema v11 触发器（读路径过滤只让行「不可见」不让它「不可达」——沿用待办 p 的既定结论）。本条「今日不可达系数据巧合」的判断**经复测成立**：9 库 521 条记忆、派生行 16、非 active 派生行 **0** |
 
 ## 📋 v0.4.3 遗留的五项待办（未排期）
 

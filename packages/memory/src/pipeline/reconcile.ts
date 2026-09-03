@@ -7,7 +7,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { OpenStore } from '../store/store.ts'
-import type { MemoryKind } from '../types.ts'
+import { LAYER, type MemoryKind } from '../types.ts'
 import { RECONCILE_EXISTING_LIMIT } from '../constants.ts'
 import { queryAllMemories } from '../store/fts.ts'
 import { callPipelineLlm, parseStrictJson, PipelineLlmError, type PinnedRoute } from './llm-call.ts'
@@ -170,13 +170,44 @@ export const runReconcileJob = async (
       }
       if (decision.action === 'supersede') {
         const oldRow = store.db
-          .prepare(`SELECT kind, status FROM memories WHERE id = ?`)
-          .get(decision.supersedes) as { kind: MemoryKind; status: string } | undefined
-        // Two rules, stated so a new kind inherits one rather than needing a
+          .prepare(`SELECT kind, status, derived FROM memories WHERE id = ?`)
+          .get(decision.supersedes) as
+          | { kind: MemoryKind; status: string; derived: number }
+          | undefined
+        // Three rules, stated so a new kind inherits one rather than needing a
         // branch: a `preference` is never superseded (only the user resolves
-        // conflicting preferences, spec §3.4), and a vanished or inactive
-        // target degrades to plain activation — durable state outranks the
-        // reply. Everything else is replaced, and the replaced row is
+        // conflicting preferences, spec §3.4); a DERIVED target is not a
+        // memory to supersede at all (it is a generated restatement of rows
+        // already in this list, and `forget`/`share` refuse one by name for the
+        // same reason); and a vanished or inactive target degrades to plain
+        // activation — durable state outranks the reply.
+        //
+        // The `derived` clause is an eligibility test, NOT a second copy of the
+        // v11 `guard_derived_status` trigger. The trigger states an INVARIANT —
+        // which states the data may be in, enforced against every writer
+        // including ones not yet written. This expression answers a different
+        // question the job must answer anyway: is the row the reply NAMED a
+        // legitimate target? That question already had two clauses here, and a
+        // derived id fails it for the same reason an archived one does. The
+        // distinction is observable in the failure mode, which is why the
+        // clause earns its place rather than merely duplicating: without it a
+        // reply naming a derived id makes the trigger ABORT, and because the
+        // whole batch is one commit (D6) that rolls back EVERY candidate in it
+        // — measured, including candidates whose own decisions were fine — then
+        // burns the job's retries to a dead letter. With it, the decision
+        // degrades to plain activation on the path already written for a target
+        // that cannot be superseded. ADR 0006's rule is that a failure in one
+        // chore must not take down work that is independently fine; a batch
+        // aborted over one bad id is that same connected failure inside a job.
+        //
+        // Reachability, stated honestly: no production writer reaches this
+        // today. Since `15b80b7` the `existing` set comes from
+        // `queryAllMemories`, which filters `derived = LAYER.RAW`, so the model
+        // is never SHOWN a derived id (measured: the offered set holds the raw
+        // row only). This is the guard for a reply that names one anyway, and
+        // for a future change that re-widens that window.
+        //
+        // Everything else is replaced, and the replaced row is
         // `archived` when it was a `procedure` (superseding a procedure is
         // versioning — the old sequence still describes what used to work)
         // and `superseded` otherwise, including `coding`: a corrected
@@ -186,7 +217,11 @@ export const runReconcileJob = async (
         // row leaving 'active', pointing at a row entering 'active' from
         // 'candidate', and nothing ever transitions back INTO 'candidate'.
         // Every id is written at most once, so the graph cannot close a loop.
-        if (oldRow?.status === 'active' && oldRow.kind !== 'preference') {
+        if (
+          oldRow?.status === 'active' &&
+          oldRow.kind !== 'preference' &&
+          oldRow.derived === LAYER.RAW
+        ) {
           supersedeOld.run(
             oldRow.kind === 'procedure' ? 'archived' : 'superseded',
             candidate.id,

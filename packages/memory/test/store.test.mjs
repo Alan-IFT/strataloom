@@ -10,7 +10,13 @@ import { immediateTx } from '../lib/store/tx.js'
 import { APPLICATION_ID, TARGET_USER_VERSION } from '../lib/constants.js'
 import { StoreRegistry } from '../lib/store/store.js'
 import { toFtsPhrase } from '../lib/store/fts.js'
-import { DERIVED_LAYERS, DERIVED_PROVENANCE, LAYER, PROVENANCES } from '../lib/types.js'
+import {
+  DERIVED_LAYERS,
+  DERIVED_PROVENANCE,
+  LAYER,
+  MEMORY_STATUSES,
+  PROVENANCES,
+} from '../lib/types.js'
 import { openRegistry, cleanup, tempRoot } from './helpers.mjs'
 
 const openRaw = (path) => {
@@ -158,10 +164,15 @@ test('v5 -> v6 rebuilds the memories table without losing evidence or guards', (
     1,
   )
   // Every trigger came back: FTS sync (3), visibility guard (2), derived
-  // dormant guard (1), D9 invalidation (3).
+  // status guard (2 — UPDATE and INSERT, since v11), D9 invalidation (3).
+  //
+  // A rebuild reinstalls the LIVE set (`createMemoryTriggers`), not the set of
+  // the version being migrated to, so this count tracks today's schema rather
+  // than v6's. That is the deliberate consequence of having one definition:
+  // the number moves when the live set does.
   assert.equal(
     db.prepare(`SELECT count(*) c FROM sqlite_master WHERE type='trigger'`).get().c,
-    9,
+    10,
   )
 
   // The point of the migration: the new kind is accepted, unknown ones are not.
@@ -200,7 +211,9 @@ test('v6 -> v7 widens derived to a layer and carries the guards across', () => {
   migrate(db, 'repo', 7)
   assert.equal(userVersion(db), 7)
   assert.equal(db.prepare(`SELECT excerpt FROM evidence WHERE memory_id='raw'`).get()?.excerpt, 'the words')
-  assert.equal(db.prepare(`SELECT count(*) c FROM sqlite_master WHERE type='trigger'`).get().c, 9)
+  // 10 as of v11 — the rebuild reinstalls the live set, which now guards the
+  // derived layer on INSERT as well as UPDATE.
+  assert.equal(db.prepare(`SELECT count(*) c FROM sqlite_master WHERE type='trigger'`).get().c, 10)
 
   // The new layers are now expressible, and nonsense is still refused.
   db.exec(`INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
@@ -439,6 +452,226 @@ test('v9 -> v10 makes "a derived row carries derived provenance" a property of t
   cleanup(root)
 })
 
+test('v10 -> v11 makes "a derived row is only ever active" the whole sentence', () => {
+  // v4 stated the principle in a comment — regenerated wholesale, never aged
+  // out row by row — and enforced `dormant` alone. The precondition below
+  // measures what that actually covered: 1 of the 5 non-active statuses.
+  //
+  // It matters because the injection read path LEANS on the property, and the
+  // derived branch of `queryInjectionRows` is a SHORT-CIRCUIT — one non-active
+  // derived row does not merely add itself to the packet, it shadows the whole
+  // raw set behind it.
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo', 10)
+  const now = Date.now()
+  const insert = (id, status, layer, provenance = DERIVED_PROVENANCE) =>
+    db
+      .prepare(
+        `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+         VALUES (?,'fact','repo-local',?,?,'b',?,?,?,?)`,
+      )
+      .run(id, status, `title ${id}`, provenance, now, now, layer)
+  const nonActive = MEMORY_STATUSES.filter((s) => s !== 'active')
+
+  // The fixture is a store as it EXISTS ON DISK at v10, which is not what
+  // `migrate(db,'repo',10)` alone produces. `migrateV10` rebuilds the table and
+  // therefore reinstalls the LIVE trigger set, so a store migrated by today's
+  // build already carries v11's guard before v11 runs. Real v10 stores — all
+  // nine live ones — were written by the PREVIOUS release and carry the v4-era
+  // `guard_derived_dormant`. Restoring it here is what makes this an upgrade
+  // test rather than a test of a store that never existed.
+  //
+  // This is also the measured reason `migrateV11` drops by
+  // `DROP TRIGGER IF EXISTS` on BOTH names: the two arrival paths genuinely
+  // carry different triggers, and a bare DROP of either name fails on the
+  // other.
+  db.exec(`
+    DROP TRIGGER IF EXISTS guard_derived_status;
+    DROP TRIGGER IF EXISTS guard_derived_status_insert;
+    CREATE TRIGGER guard_derived_dormant BEFORE UPDATE OF status, derived ON memories
+      WHEN new.status = 'dormant' AND new.derived != ${LAYER.RAW}
+      BEGIN SELECT RAISE(ABORT, 'a derived rollup cannot go dormant'); END;
+  `)
+
+  // Data that must survive the migration untouched, including the evidence row
+  // whose cascade a table rebuild would have endangered — the reason this
+  // migration is pure trigger DDL and rebuilds nothing.
+  //
+  // These RAW rows go in BEFORE the derived row, and the order is not
+  // cosmetic: D9 has three triggers, and `invalidate_derived_insert` deletes
+  // the entire derived layer on any raw INSERT. Planting the summary first
+  // means it is already gone before the assertions run — which is precisely how
+  // this test failed when it was first written.
+  insert('raw-keep', 'active', LAYER.RAW, 'human')
+  db.prepare(
+    `INSERT INTO evidence (memory_id,kind,ref,excerpt) VALUES ('raw-keep','session','s1','the exact words')`,
+  ).run()
+
+  // Precondition, stated over the enum rather than a list of five: the old
+  // guard names ONE status, so every other one is accepted on a derived row and
+  // the row PERSISTS. D9 does not fire on these UPDATEs — it watches
+  // `OLD.derived = RAW`, and this row is already derived. This is the defect,
+  // measured.
+  insert('roll', 'active', LAYER.SCENARIO)
+  const acceptedAtV10 = nonActive.filter((status) => {
+    try {
+      db.prepare(`UPDATE memories SET status = ? WHERE id = 'roll'`).run(status)
+      db.prepare(`UPDATE memories SET status = 'active' WHERE id = 'roll'`).run()
+      return true
+    } catch {
+      return false
+    }
+  })
+  assert.deepEqual(
+    acceptedAtV10,
+    nonActive.filter((s) => s !== 'dormant'),
+    'precondition: v10 guards `dormant` alone and accepts every other non-active status',
+  )
+
+  const before = {
+    memories: db.prepare(`SELECT count(*) c FROM memories`).get().c,
+    evidence: db.prepare(`SELECT excerpt FROM evidence WHERE memory_id='raw-keep'`).get().excerpt,
+  }
+
+  migrate(db, 'repo', 11)
+  assert.equal(userVersion(db), 11)
+
+  // Data is intact and the index still resolves — a rebuild's hazards, checked
+  // even though this migration deliberately avoids a rebuild.
+  assert.equal(db.prepare(`SELECT count(*) c FROM memories`).get().c, before.memories)
+  assert.equal(
+    db.prepare(`SELECT excerpt FROM evidence WHERE memory_id='raw-keep'`).get().excerpt,
+    before.evidence,
+    'no evidence row may be lost',
+  )
+  assert.equal(
+    db.prepare(`SELECT count(*) c FROM memories_fts WHERE memories_fts MATCH '"title raw-keep"'`)
+      .get().c,
+    1,
+    'the FTS index still matches the surviving row',
+  )
+  assert.equal(db.prepare('PRAGMA foreign_key_check').all().length, 0)
+
+  // The permissive trigger is GONE, not merely shadowed by a stricter one.
+  // Asserting absence by name is what catches a migration that adds the new
+  // guard while leaving the old one behind.
+  assert.equal(
+    db.prepare(`SELECT count(*) c FROM sqlite_master WHERE type='trigger' AND name='guard_derived_dormant'`).get().c,
+    0,
+    'the permissive v4 trigger must be dropped, not left alongside',
+  )
+
+  // And the new constraint is in force over the WHOLE enum.
+  for (const status of nonActive) {
+    assert.throws(
+      () => db.prepare(`UPDATE memories SET status = ? WHERE id = 'roll'`).run(status),
+      /cannot leave active/,
+      `after v11 a derived row must not reach '${status}'`,
+    )
+  }
+  const kept = db.prepare(`SELECT status, derived FROM memories WHERE id = 'roll'`).get()
+  assert.equal(kept?.status, 'active', 'the refused row survives — a refusal, not a deletion')
+  assert.equal(kept?.derived, LAYER.SCENARIO, 'and is still a scenario block')
+  // Reverse discrimination: raw rows keep their whole lifecycle.
+  for (const status of MEMORY_STATUSES) {
+    db.prepare(`UPDATE memories SET status = ? WHERE id = 'raw-keep'`).run(status)
+  }
+  db.close()
+  cleanup(root)
+})
+
+test('the LIVE trigger set carries the v11 rule, not just the v11 migration', () => {
+  // Two definitions of `guard_derived_status` exist by design: the frozen one
+  // in `migrateV11`, and the live one in `createMemoryTriggers` that every
+  // table rebuild reinstalls. On a current store the migration runs LAST, so
+  // its copy wins and the live definition is invisible to every other test —
+  // measured: reverting the live definition to the old `dormant`-only rule
+  // leaves the entire suite green (261/261).
+  //
+  // That gap is not theoretical. `rebuildMemories` reinstalls the LIVE set, so
+  // the next migration that widens any CHECK silently re-installs whatever the
+  // live definition says — the same "one definition, applied to a freshly
+  // rebuilt table" mechanism this file's header describes. A weakened live
+  // definition would therefore reopen the defect at the next rebuild, with no
+  // test objecting.
+  //
+  // Reaching it needs a store whose LAST schema step was a rebuild, which is
+  // what `target = 10` produces: `migrateV10` calls `rebuildMemories`, and no
+  // later migration overwrites its triggers.
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo', 10)
+  db.prepare(
+    `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+     VALUES ('sc','fact','repo-local','active','a scenario','b',?,0,0,?)`,
+  ).run(DERIVED_PROVENANCE, LAYER.SCENARIO)
+  for (const status of MEMORY_STATUSES.filter((s) => s !== 'active')) {
+    assert.throws(
+      () => db.prepare(`UPDATE memories SET status = ? WHERE id = 'sc'`).run(status),
+      /cannot leave active/,
+      `the live trigger set must refuse '${status}' on a derived row`,
+    )
+  }
+
+  // The PROMOTE route as well, or this test only covers one of the two
+  // execution points the shared column list carries. Measured: dropping
+  // `derived` from that list in the LIVE definition alone leaves the whole
+  // suite green without these lines — T2 catches it only through the frozen
+  // copy in `migrateV11`, so the live definition needs its own check on the
+  // very route the column list exists for.
+  for (const status of MEMORY_STATUSES.filter((s) => s !== 'active')) {
+    const id = `promote-${status}`
+    db.prepare(
+      `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+       VALUES (?,'fact','repo-local',?,'t','b','human',0,0,?)`,
+    ).run(id, status, LAYER.RAW)
+    assert.throws(
+      () =>
+        db
+          .prepare(`UPDATE memories SET derived = ?, provenance = ? WHERE id = ?`)
+          .run(LAYER.SCENARIO, DERIVED_PROVENANCE, id),
+      /cannot leave active/,
+      `the live trigger set must refuse promoting a '${status}' row into the layer`,
+    )
+    // Refused, not deleted — the distinction the column list actually buys.
+    assert.equal(
+      db.prepare(`SELECT derived FROM memories WHERE id = ?`).get(id)?.derived,
+      LAYER.RAW,
+      `the refused row survives at RAW ('${status}')`,
+    )
+  }
+
+  // The THIRD execution point, which had no behavioural test at all. The two
+  // loops above cover the routes the shared `OF status, derived` column list
+  // carries; `guard_derived_status_insert` is a SEPARATE trigger, and it was
+  // exercised only through `migrateV11`'s frozen copy (T2) — never through the
+  // live definition that `rebuildMemories` reinstalls.
+  //
+  // What hid the gap is that the existing defence COUNTS triggers instead of
+  // exercising them. Deleting this trigger outright changes the count, and the
+  // v5→v6 / v6→v7 migration tests catch that; but keeping the NAME while
+  // gutting its WHEN clause keeps the count correct and passed the whole suite.
+  // Measured with the live definition reverted to `dormant`-only: 263/263/0
+  // green, while 4 of the 5 non-active statuses were ACCEPTED and 4 bad rows
+  // persisted. A count is not a behaviour.
+  for (const status of MEMORY_STATUSES.filter((s) => s !== 'active')) {
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+             VALUES (?,'fact','repo-local',?,'t','b',?,0,0,?)`,
+          )
+          .run(`born-${status}`, status, DERIVED_PROVENANCE, LAYER.SCENARIO),
+      /must be born active/,
+      `the live trigger set must refuse a derived row born '${status}'`,
+    )
+  }
+  db.close()
+  cleanup(root)
+})
+
 test('a store opened at the DEFAULT target refuses a mislabelled derived row', () => {
   // The test above migrates to 10 EXPLICITLY, so it proves `migrateV10` works
   // while saying nothing about whether stores ever REACH it. Leaving
@@ -470,6 +703,157 @@ test('a store opened at the DEFAULT target refuses a mislabelled derived row', (
     )
   }
   insert('ok', DERIVED_PROVENANCE, LAYER.SCENARIO)
+  db.close()
+  cleanup(root)
+})
+
+/**
+ * The guards raise ABORT, and ABORT is a DECISION rather than a default.
+ *
+ * `RAISE(ABORT)` undoes the offending STATEMENT and leaves the surrounding
+ * transaction alive and committable. `RAISE(ROLLBACK)` tears the whole
+ * transaction down at the point of the raise. Both refuse the write, so both
+ * satisfy every other assertion in the suite — measured: swapping the verb left
+ * 264/264/0 green.
+ *
+ * The difference is exactly what ADR 0006 is about. The pipeline commits a
+ * job's business writes and its OWN bookkeeping in one transaction (D6), so
+ * under ROLLBACK a single refused row destroys the job row beside it and the
+ * enclosing COMMIT fails. Measured directly: with ROLLBACK the `jobs` row is
+ * gone, with ABORT both survive. `reconcile.ts` argues at length that one bad
+ * id must not take down work that is independently fine — an argument that
+ * holds only while the verb stays ABORT, and nothing was pinning the verb.
+ *
+ * Run against BOTH copies of the guard, for the reason the live-set test above
+ * exists: a store at the current target carries `migrateV11`'s frozen copy, so
+ * a version of this test written only against `openRegistry()` would leave the
+ * live definition unpinned. Measured — swapping the verb in the live definition
+ * ALONE survived that version of this test.
+ *
+ * Note the fixture order, the D9 trap this release keeps re-teaching: the
+ * unrelated write in the transaction targets `jobs`, not `memories`. Any raw
+ * write to `memories` here would fire `invalidate_derived_update` and delete
+ * the very row meant to be refused, and the test would pass without the guard
+ * ever firing.
+ */
+for (const [label, target] of [
+  ['the live definition (last step is a rebuild)', 10],
+  ['the v11 migration copy (current target)', undefined],
+]) {
+  test(`derived guards ABORT the statement, never ROLLBACK the transaction — ${label}`, () => {
+    const root = tempRoot()
+    const db = openRaw(join(root, 'm.sqlite'))
+    migrate(db, 'repo', target)
+    db.prepare(
+      `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+       VALUES ('sc','fact','repo-local','active','a scenario','b',?,0,0,?)`,
+    ).run(DERIVED_PROVENANCE, LAYER.SCENARIO)
+
+    db.exec('BEGIN IMMEDIATE')
+    // The job bookkeeping that shares this transaction with the business write.
+    db.prepare(
+      `INSERT INTO jobs (id, kind, payload, state, attempts, run_after, created_at)
+       VALUES ('j1','reconcile','{}','done',1,0,0)`,
+    ).run()
+    assert.throws(
+      () => db.prepare(`UPDATE memories SET status = 'superseded' WHERE id = 'sc'`).run(),
+      /cannot leave active/,
+      'the refused write still raises',
+    )
+    // Under ROLLBACK the transaction is already gone here, so this COMMIT
+    // throws "no transaction is active"; under ABORT it is alive and commits.
+    db.exec('COMMIT')
+
+    assert.equal(
+      db.prepare(`SELECT count(*) c FROM jobs WHERE id = 'j1'`).get().c,
+      1,
+      'a refused derived write must not destroy the unrelated work in its transaction',
+    )
+    assert.equal(
+      db.prepare(`SELECT status FROM memories WHERE id = 'sc'`).get().status,
+      'active',
+      'and the refused row itself is unchanged',
+    )
+    db.close()
+    cleanup(root)
+  })
+}
+
+/**
+ * An EXISTING v10 store, reopened the way production reopens one, must arrive
+ * at v11 and be constrained.
+ *
+ * This test replaces one that opened a BRAND NEW store at the default target,
+ * and the difference is the whole point. A new store is built by
+ * `createMemoryTriggers`, which carries the v11 rule whatever
+ * `TARGET_USER_VERSION` says — so the new-store route is guarded even when
+ * `migrateV11` is never reached. Measured: with `TARGET_USER_VERSION` reverted
+ * to 10, a new store stamps `user_version = 10` and STILL installs
+ * `guard_derived_status`, so the old test stayed green and the whole suite read
+ * 262/262 while every existing store went unprotected.
+ *
+ * The defect only shows on the OTHER route — a store already at v10, which is
+ * what all nine production stores are. That route reaches the guard only if
+ * `migrateV11` actually runs, so this is the route that pins the registration.
+ *
+ * The irony is worth recording: the replaced test's own comment predicted this
+ * exact failure ("Leaving TARGET_USER_VERSION at 9 … was measured to keep the
+ * entire suite green"), and then reached for the one fixture that cannot
+ * observe it. The comment stated the principle; the code exercised something
+ * else — the same shape as the defect this whole release fixes.
+ */
+test('an EXISTING v10 store, reopened at the default target, reaches v11 and is constrained', () => {
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+
+  // A genuine v10 store, not `migrate(db,'repo',10)`'s output. That call runs
+  // today's `createMemoryTriggers` and therefore already carries v11's guard;
+  // a real v10 store was written by the PREVIOUS release and carries v4's
+  // `guard_derived_dormant`. Restoring it is what makes this an upgrade.
+  migrate(db, 'repo', 10)
+  db.exec(`
+    DROP TRIGGER IF EXISTS guard_derived_status;
+    DROP TRIGGER IF EXISTS guard_derived_status_insert;
+    CREATE TRIGGER guard_derived_dormant BEFORE UPDATE OF status, derived ON memories
+      WHEN new.status = 'dormant' AND new.derived != ${LAYER.RAW}
+      BEGIN SELECT RAISE(ABORT, 'a derived rollup cannot go dormant'); END;
+  `)
+  db.prepare(
+    `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+     VALUES ('sc','fact','repo-local','active','a scenario','b',?,0,0,?)`,
+  ).run(DERIVED_PROVENANCE, LAYER.SCENARIO)
+
+  // Precondition: on the store as it exists today, aging out is ACCEPTED.
+  db.prepare(`UPDATE memories SET status = 'superseded' WHERE id = 'sc'`).run()
+  assert.equal(
+    db.prepare(`SELECT status FROM memories WHERE id = 'sc'`).get().status,
+    'superseded',
+    'precondition: a real v10 store lets a derived row be aged out',
+  )
+  db.prepare(`UPDATE memories SET status = 'active' WHERE id = 'sc'`).run()
+
+  // Reopen exactly as production does: default target, no version argument.
+  migrate(db, 'repo')
+
+  // The OUTCOME, not the version number. Deliberately not
+  // `assert.equal(userVersion(db), TARGET_USER_VERSION)`: that reads the same
+  // symbol on both sides and passes at any value, including 10.
+  for (const status of MEMORY_STATUSES.filter((s) => s !== 'active')) {
+    assert.throws(
+      () => db.prepare(`UPDATE memories SET status = ? WHERE id = 'sc'`).run(status),
+      /cannot leave active/,
+      `an upgraded store must refuse to move a derived row to '${status}'`,
+    )
+  }
+  // And the permissive trigger is gone by name, so this cannot pass merely
+  // because some other guard happened to object.
+  assert.equal(
+    db.prepare(
+      `SELECT count(*) c FROM sqlite_master WHERE type='trigger' AND name='guard_derived_dormant'`,
+    ).get().c,
+    0,
+    'the v4 trigger must be dropped by the upgrade',
+  )
   db.close()
   cleanup(root)
 })

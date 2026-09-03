@@ -35,9 +35,12 @@ export const APPLICATION_ID = 0x53_54_4c_4d
  * v8 = `jobs.last_error`, so a dead letter outlives the log line that explained it,
  * v9 = the FTS index is retokenized so CJK is searchable by re-wording, not only verbatim,
  * v10 = a derived row must carry `provenance = 'derived'`, so the layer column cannot
- * carry a row past the trust filter written against the provenance column).
+ * carry a row past the trust filter written against the provenance column,
+ * v11 = a derived row is only ever active, over every route into the state — v4
+ * stated that principle in a comment and enforced `dormant` alone, which
+ * measured 1 of the 5 non-active statuses).
  */
-export const TARGET_USER_VERSION = 10
+export const TARGET_USER_VERSION = 11
 
 /**
  * How much of a failure cause is kept on the job row. Long enough for an

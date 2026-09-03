@@ -149,6 +149,56 @@ const recreateFtsTriggers = (db: DatabaseSync): void => {
  * *introduce* a trigger still define it inline (a v3 store must not gain v5's
  * behaviour early); this function is the CURRENT full set, applied to a
  * freshly rebuilt table.
+ *
+ * ## "A derived row is only ever active" needs THREE execution points
+ *
+ * v4 wrote that principle in a comment — "regenerated wholesale, never aged out
+ * row by row" — and enforced `status = 'dormant'` alone. Measured on a v10
+ * store, that is 1 of the 5 non-active statuses: `candidate`, `superseded`,
+ * `archived` and `tombstone` were all ACCEPTED on a `derived = SCENARIO` row.
+ * A row reaches the forbidden state by three routes, so the invariant needs
+ * three EXECUTION POINTS — carried by TWO triggers, because the first two share
+ * one `BEFORE UPDATE OF status, derived` column list. Counted rather than
+ * assumed: a store carries exactly `guard_derived_status` and
+ * `guard_derived_status_insert`. Execution points and triggers are not the same
+ * number, and this release is about comments that state a count they do not
+ * deliver:
+ *
+ * WHICH COPY IS IN FORCE depends on how the store arrived, and it is not always
+ * this one. Migrations run last, so a store that has just been migrated carries
+ * `migrateV11`'s FROZEN copy. This live definition is what `rebuildMemories`
+ * installs, so it governs any store whose final schema step was a table rebuild
+ * — and it is what the NEXT rebuild migration will install everywhere. The two
+ * are identical today and must be kept so: weakening this one is invisible to a
+ * freshly migrated store and reappears at the next rebuild. `test/store.test.mjs`
+ * exercises THIS copy deliberately, through a store migrated to 10 (whose last
+ * step is `migrateV10`'s rebuild), because tests that open a store at the
+ * current target only ever observe the frozen copy.
+ *
+ * - `UPDATE OF status` — the row is aged out where it lies. The v4 case,
+ *   widened here from one status to "not active".
+ * - `UPDATE OF derived` — an already non-active RAW row is PROMOTED into the
+ *   layer, reaching the same state through the other column. Dropping `derived`
+ *   from the column list is not a spelling variation: the promotion is then
+ *   ACCEPTED, and D9's `invalidate_derived_update` (which fires on
+ *   `OLD.derived = RAW`) deletes the row inside the same statement. Measured
+ *   both ways — with the column listed the row is refused and survives; without
+ *   it the row is gone. The column list is what makes this a refusal instead of
+ *   silent data loss.
+ * - `INSERT` — the row is BORN non-active, having never been active to leave.
+ *   No writer emits this today (`pipeline/rebuild.ts` hardcodes 'active' at
+ *   both derived INSERTs, and it was measured ACCEPTED with only the UPDATE
+ *   guards installed). It is guarded anyway for the reason v5 gives about
+ *   invalidation: an UPDATE-only guard states the rule over TRANSITIONS, while
+ *   the sentence is about the DATA, and the data-shaped form covers writers not
+ *   yet written.
+ *
+ * The whole-layer DELETE is deliberately NOT constrained. `pipeline/rebuild.ts`
+ * replaces the layer delete-then-insert, and a DELETE is neither an `UPDATE OF`
+ * nor an INSERT, so regeneration is untouched (measured: `changes = 2` against
+ * a two-layer store, and the rebuild's own re-insert of active derived rows
+ * still succeeds). Wholesale replacement stays legal; row-by-row aging becomes
+ * unrepresentable — which is exactly what v4's comment always claimed.
  */
 const createMemoryTriggers = (db: DatabaseSync): void => {
   // `!= 0`, never `= 1`: `derived` is a LEVEL, so every derived layer is
@@ -171,10 +221,15 @@ const createMemoryTriggers = (db: DatabaseSync): void => {
         <> ((SELECT v FROM meta WHERE k = 'store_kind') = 'global')
       BEGIN SELECT RAISE(ABORT, 'visibility does not match this store kind'); END;
 
-    -- Any derived layer is regenerated wholesale, never aged out row by row (v4).
-    CREATE TRIGGER guard_derived_dormant BEFORE UPDATE OF status, derived ON memories
-      WHEN new.status = 'dormant' AND new.derived != ${LAYER.RAW}
-      BEGIN SELECT RAISE(ABORT, 'a derived row cannot go dormant'); END;
+    -- A derived row is only ever active (v4's principle; v11's enforcement).
+    -- Three execution points, one per route into the state — see this
+    -- function's header for why each is load-bearing.
+    CREATE TRIGGER guard_derived_status BEFORE UPDATE OF status, derived ON memories
+      WHEN new.status != 'active' AND new.derived != ${LAYER.RAW}
+      BEGIN SELECT RAISE(ABORT, 'a derived row cannot leave active'); END;
+    CREATE TRIGGER guard_derived_status_insert BEFORE INSERT ON memories
+      WHEN new.status != 'active' AND new.derived != ${LAYER.RAW}
+      BEGIN SELECT RAISE(ABORT, 'a derived row must be born active'); END;
 
     -- D9: invalidation is a property of the data, not of the writer (v5).
     -- The guard matches RAW only, so a rebuild writing its own derived rows
@@ -657,6 +712,75 @@ const migrateV10 = (db: DatabaseSync): void => {
   rebuildMemories(db, DERIVED_COLUMN)
 }
 
+/**
+ * user_version = 11: "a derived row is only ever active" becomes the whole
+ * sentence, enforced over every route into the state.
+ *
+ * v4 wrote the principle in a comment — "regenerated wholesale, never aged out
+ * row by row" — and enforced `status = 'dormant'` alone. Measured against a v10
+ * store, that is 1 of 5 non-active statuses: `candidate`, `superseded`,
+ * `archived` and `tombstone` were all ACCEPTED on a `derived = SCENARIO` row.
+ * The same family as v10 and D5 — the comment states the rule, the
+ * implementation covers part of it.
+ *
+ * It matters because the injection read path LEANS on the property. The derived
+ * branch of `queryInjectionRows` is a SHORT-CIRCUIT: `derived.length > 0 ?
+ * derived : queryInjectableSet(...)`. So one non-active derived row does not
+ * merely add itself to the packet — it SHADOWS the entire raw set behind it.
+ * Measured through that function: the packet flips from the real memory to the
+ * stale summary.
+ *
+ * Stated here rather than as `AND status = 'active'` on the injection query,
+ * for the reason v5 and v10 both give: a read filter makes the row INVISIBLE,
+ * not UNREACHABLE. It stays stored, `queryRecallRows` excludes only
+ * `EXCLUDED_STATUSES` (so a `candidate` or `dormant` derived row is served by
+ * `memory_recall` regardless), and every future read exit needs the clause
+ * copied. The guard on the injection query is kept even so — it is the
+ * defence-in-depth for stores still on v10, and v10 stores exist (all nine live
+ * ones are at v10 today).
+ *
+ * NO `rebuildMemories`, deliberately, and this is the cheapest correct path
+ * rather than an optimization. A trigger is an independent object in
+ * `sqlite_master`, not text baked into `CREATE TABLE` the way a CHECK is, so
+ * replacing one needs no table rebuild — and a rebuild is the expensive,
+ * hazardous operation (foreign keys off, `evidence` cascade risk, FTS refill).
+ * Measured on a v10 store carrying memories, evidence and FTS rows: after this
+ * migration all three counts are unchanged, `PRAGMA foreign_key_check` is
+ * empty, and the index still matches by title.
+ *
+ * `DROP TRIGGER IF EXISTS`, not a bare DROP, and the reason is a real ordering
+ * hazard rather than defensiveness. `migrateV10` calls `rebuildMemories`, which
+ * calls `createMemoryTriggers` — the LIVE definition, which now emits the NEW
+ * names. So a store that reaches v10 today already carries
+ * `guard_derived_status`, and a bare `DROP TRIGGER guard_derived_dormant` fails
+ * with "no such trigger" (measured, both paths). Older stores that stopped at
+ * v10 under the previous release still carry the old name. Both must upgrade,
+ * so the drop must tolerate either. `migrateV4` is NOT touched: it is history,
+ * and a migration reproduces the schema of its own version.
+ *
+ * The trigger text below is written out rather than shared with
+ * `createMemoryTriggers`, which is this file's standing convention for a
+ * migration that INTRODUCES a trigger (v3, v4 and v5 each do the same) and not
+ * a second copy of one rule. The two say the same thing only today: this one is
+ * frozen at what v11 means, while the live set is free to move on, exactly as
+ * v4's `= 'dormant'` stayed frozen while this migration widened it. The copy
+ * that must never be made is the one `createMemoryTriggers` exists to prevent —
+ * a REBUILD restating the current set — and that is still made in one place.
+ */
+const migrateV11 = (db: DatabaseSync): void => {
+  db.exec(`
+    DROP TRIGGER IF EXISTS guard_derived_dormant;
+    DROP TRIGGER IF EXISTS guard_derived_status;
+    DROP TRIGGER IF EXISTS guard_derived_status_insert;
+    CREATE TRIGGER guard_derived_status BEFORE UPDATE OF status, derived ON memories
+      WHEN new.status != 'active' AND new.derived != ${LAYER.RAW}
+      BEGIN SELECT RAISE(ABORT, 'a derived row cannot leave active'); END;
+    CREATE TRIGGER guard_derived_status_insert BEFORE INSERT ON memories
+      WHEN new.status != 'active' AND new.derived != ${LAYER.RAW}
+      BEGIN SELECT RAISE(ABORT, 'a derived row must be born active'); END;
+  `)
+}
+
 const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
   migrateV1,
   migrateV2,
@@ -668,6 +792,7 @@ const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
   migrateV8,
   migrateV9,
   migrateV10,
+  migrateV11,
 ]
 
 /**

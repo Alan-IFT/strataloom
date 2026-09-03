@@ -67,7 +67,14 @@ import { estimateTokens } from '../lib/constants.js'
 import { looksSecret, projectStore, PROJECTION_DIR, PROJECTION_FILE } from '../lib/projection.js'
 import { enqueueJob, claimNextJob, cleanupJobs, commitClaimedJob } from '../lib/pipeline/jobs.js'
 import { queryInjectableSet, queryInjectionRows } from '../lib/store/fts.js'
-import { DERIVED_PROVENANCE, INJECTABLE_PROVENANCE, PROVENANCES } from '../lib/types.js'
+import {
+  DERIVED_LAYERS,
+  DERIVED_PROVENANCE,
+  INJECTABLE_PROVENANCE,
+  LAYER,
+  MEMORY_STATUSES,
+  PROVENANCES,
+} from '../lib/types.js'
 import {
   openRegistry,
   cleanup,
@@ -1267,20 +1274,162 @@ test('decay leaves evidence entirely alone: the quote outlives any age', async (
   cleanup(root)
 })
 
-test('a derived rollup can never go dormant (both writers now exist)', () => {
+/**
+ * T2 — the schema v11 invariant, over the STATUS ENUM rather than a list.
+ *
+ * v4 wrote "a derived layer is regenerated wholesale, never aged out row by
+ * row" in a comment and enforced `status = 'dormant'` alone. Measured against
+ * v10, that covered 1 of the 5 non-active statuses; `candidate`, `superseded`,
+ * `archived` and `tombstone` were all ACCEPTED on a derived row. This test is
+ * the comment's actual claim.
+ *
+ * The expectation is DERIVED from `MEMORY_STATUSES`, never a written-out list
+ * of five: a status added later must be covered by this test the day it is
+ * added, without anyone remembering to come back here. Same reason the v10
+ * test loops over `PROVENANCES` and `DERIVED_LAYERS`.
+ */
+test('a derived row can never leave active — every non-active status, every layer', () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  const nonActive = MEMORY_STATUSES.filter((s) => s !== 'active')
+  assert.ok(nonActive.length > 0, 'the enum must actually offer non-active statuses')
+
+  for (const layer of DERIVED_LAYERS) {
+    const id = `roll-${layer}`
+    // Written directly rather than through the rebuild job because the point is
+    // the DATA constraint: any writer producing this row must be refused.
+    store.tx(() => {
+      store.db
+        .prepare(
+          `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+           VALUES (?,'fact','repo-local','active','rollup','body',?,0,0,?)`,
+        )
+        .run(id, DERIVED_PROVENANCE, layer)
+    })
+    for (const status of nonActive) {
+      assert.throws(
+        () => store.db.prepare(`UPDATE memories SET status = ? WHERE id = ?`).run(status, id),
+        /cannot leave active/,
+        `a derived row at layer ${layer} must not be movable to '${status}'`,
+      )
+    }
+    // Still there, still active: a refusal, not a silent deletion. Without this
+    // the test would also pass if the guard destroyed the row it was asked to
+    // protect — which is exactly what the missing `OF derived` column does on
+    // the promotion route below.
+    const kept = store.db.prepare(`SELECT status, derived FROM memories WHERE id = ?`).get(id)
+    assert.equal(
+      kept?.status,
+      'active',
+      `the derived row survives every refused transition at layer ${layer}`,
+    )
+    assert.equal(kept?.derived, layer, `and stays at layer ${layer}`)
+    store.db.prepare(`DELETE FROM memories WHERE id = ?`).run(id)
+  }
+
+  // The second route into the same forbidden state: promote an ALREADY
+  // non-active RAW row INTO the layer, arriving through the `derived` column
+  // instead of the `status` one. This is what the trigger's `OF derived`
+  // column list buys, and dropping it is not cosmetic — the promotion is then
+  // accepted and D9's `invalidate_derived_update` deletes the row inside the
+  // same statement, so the failure mode is silent data loss rather than a
+  // refusal. Asserting the row SURVIVES is what makes that observable.
+  for (const status of nonActive) {
+    const id = `promote-${status}`
+    store.tx(() => {
+      store.db
+        .prepare(
+          `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+           VALUES (?,'fact','repo-local',?,'t','b','human',0,0,?)`,
+        )
+        .run(id, status, LAYER.RAW)
+    })
+    assert.throws(
+      () =>
+        store.db
+          .prepare(`UPDATE memories SET derived = ?, provenance = ? WHERE id = ?`)
+          .run(LAYER.SCENARIO, DERIVED_PROVENANCE, id),
+      /cannot leave active/,
+      `a '${status}' row must not be promotable into the derived layer`,
+    )
+    const survivor = store.db.prepare(`SELECT status, derived FROM memories WHERE id = ?`).get(id)
+    assert.equal(
+      survivor?.status,
+      status,
+      `the refused row is still THERE — the guard must not delete what it rejects`,
+    )
+    assert.equal(survivor?.derived, LAYER.RAW, 'and was not promoted into the layer')
+  }
+
+  // The third route: born non-active. No writer emits this today (rebuild
+  // hardcodes 'active'), so it is guarded over the data rather than over the
+  // transitions — the D9 lesson about writers not yet written.
+  for (const layer of DERIVED_LAYERS) {
+    for (const status of nonActive) {
+      assert.throws(
+        () =>
+          store.db
+            .prepare(
+              `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+               VALUES (?,'fact','repo-local',?,'t','b',?,0,0,?)`,
+            )
+            .run(`born-${layer}-${status}`, status, DERIVED_PROVENANCE, layer),
+        /must be born active/,
+        `a derived row must not be INSERTable at '${status}' (layer ${layer})`,
+      )
+    }
+  }
+
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived != ? AND status != 'active'`)
+      .get(LAYER.RAW).c,
+    0,
+    'the sentence the injection read path is now entitled to assume',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * T3 — reverse discrimination. The guard must bound the DERIVED layer, not
+ * freeze the status column: decay writes `dormant`, reconcile writes
+ * `superseded`/`archived` and `forget` writes `tombstone`, all on RAW rows, and
+ * an over-broad trigger would break the entire lifecycle while still passing
+ * T2. Dropping `AND new.derived != LAYER.RAW` is the mutant this traps.
+ */
+test('a RAW row still moves to every status — the guard bounds the layer, not the column', () => {
   const { root, registry } = openRegistry()
   const store = registry.open('k1')
   store.tx(() => {
     store.db
       .prepare(
         `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
-         VALUES ('roll','fact','repo-local','active','rollup','body','derived',0,0,1)`,
+         VALUES ('raw','fact','repo-local','active','t','b','human',0,0,?)`,
       )
-      .run()
+      .run(LAYER.RAW)
   })
-  assert.throws(
-    () => store.db.prepare(`UPDATE memories SET status = 'dormant' WHERE id = 'roll'`).run(),
-    /cannot go dormant/,
+  for (const status of MEMORY_STATUSES) {
+    store.db.prepare(`UPDATE memories SET status = ? WHERE id = 'raw'`).run(status)
+    assert.equal(
+      store.db.prepare(`SELECT status FROM memories WHERE id = 'raw'`).get().status,
+      status,
+      `a raw row must still be movable to '${status}'`,
+    )
+  }
+  // And INSERTable at every status, which is the same rule on the third
+  // execution point: `extract.ts` writes 'candidate' rows through it.
+  for (const status of MEMORY_STATUSES) {
+    store.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+         VALUES (?,'fact','repo-local',?,'t','b','human',0,0,?)`,
+      )
+      .run(`ins-${status}`, status, LAYER.RAW)
+  }
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM memories`).get().c,
+    MEMORY_STATUSES.length + 1,
+    'every raw INSERT landed',
   )
   registry.dispose()
   cleanup(root)

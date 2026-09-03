@@ -667,3 +667,78 @@ test('cross-process freshness: a write from another OS process is visible to the
   registry.dispose()
   cleanup(root)
 })
+
+/**
+ * T1 — the `status = 'active'` guard on the DERIVED branch of
+ * `queryInjectionRows`, which had zero coverage: removing it was measured to
+ * leave the whole suite green (256/0).
+ *
+ * What makes this branch different from an ordinary filter is that it is a
+ * SHORT-CIRCUIT: `derived.length > 0 ? derived : queryInjectableSet(...)`. So a
+ * single non-active derived row does not merely add itself to the packet, it
+ * SHADOWS the entire raw set behind it — the packet flips from the real
+ * memories to a stale summary that should not be there at all.
+ *
+ * The fixture therefore carries BOTH a raw row and a derived row. With only the
+ * derived row, "filtered out" and "there was nothing anyway" produce the same
+ * empty result and the assertion proves nothing. The raw row is the witness
+ * that the fallback was reached rather than merely that the packet was small.
+ *
+ * The row is written by a direct UPDATE because as of schema v11 no writer —
+ * and no trigger-respecting statement — can produce it at all; the point here
+ * is the read path's behaviour given such a row, which is what a v10 store can
+ * still hold. `guard_derived_status` is dropped for the duration for exactly
+ * that reason: this asserts the READ path's own defence, independently of the
+ * write-path guard that now also prevents the state.
+ */
+test('a non-active derived row is neither injected NOR allowed to shadow the raw set', () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  store.tx(() => {
+    store.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+         VALUES ('raw-1','fact','repo-local','active','REAL MEMORY','the real body','human',0,1,0)`,
+      )
+      .run()
+    // Derived rows go in AFTER every raw write: D9's `invalidate_derived_insert`
+    // deletes the whole layer on any raw write, so a summary written first is
+    // already gone before the assertions run.
+    store.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+         VALUES ('der-1','fact','repo-local','active','SUMMARY','the summary body','derived',0,2,2)`,
+      )
+      .run()
+  })
+
+  // Precondition: while the derived row IS active it legitimately replaces the
+  // raw set. This is the substitution the layer exists to perform, and it is
+  // what makes the next assertion a statement about `status` alone.
+  assert.deepEqual(
+    queryInjectionRows(store).map((r) => r.title),
+    ['SUMMARY'],
+    'precondition: an ACTIVE derived row replaces the raw set by design',
+  )
+
+  // Now push it out of active. The v11 trigger refuses this, so it is dropped
+  // for the duration — a v10 store on disk can hold this row, and this test is
+  // about what the read path does when handed one.
+  store.db.exec(`DROP TRIGGER guard_derived_status`)
+  store.db.prepare(`UPDATE memories SET status = 'superseded' WHERE id = 'der-1'`).run()
+  assert.equal(
+    store.db.prepare(`SELECT count(*) c FROM memories WHERE derived != 0`).get().c,
+    1,
+    'the derived row must still be STORED — otherwise this tests nothing',
+  )
+
+  const titles = queryInjectionRows(store).map((r) => r.title)
+  assert.ok(!titles.includes('SUMMARY'), 'a superseded derived row must not be injected')
+  assert.deepEqual(
+    titles,
+    ['REAL MEMORY'],
+    'and the raw set must be reached, not shadowed by the row that was filtered',
+  )
+  registry.dispose()
+  cleanup(root)
+})

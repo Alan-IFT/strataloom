@@ -14,7 +14,7 @@ import {
   RECONCILE_EXISTING_LIMIT,
   TOOL_CALL_VALUE_CHARS,
 } from '../lib/constants.js'
-import { LAYER } from '../lib/types.js'
+import { DERIVED_LAYERS, LAYER } from '../lib/types.js'
 import {
   openRegistry,
   cleanup,
@@ -1658,6 +1658,220 @@ test('reconcile dedupes against the whole stored set, not the injectable subset'
   // both survive: the leaked row there is the pending CANDIDATE, and this exact
   // deepEqual is what refuses it. Keep the 'tool-output' provenance above —
   // making these two rows uniform is what lets the wrong-container mutant pass.
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * T5 — `supersedeOld` must not aim at a derived row, measured through the real
+ * `runReconcileJob` rather than hand-written SQL standing in for it.
+ *
+ * THE FIXTURE IS THE WHOLE TEST. A simple one cannot tell the fixed code from
+ * the broken code, because `activate` succeeds in both cases and D9's
+ * `invalidate_derived_update` then deletes the derived layer on that raw write
+ * — erasing the evidence and leaving the two end states byte-identical. Three
+ * properties are each load-bearing:
+ *
+ *   1. The candidate LEAVES 'candidate' between the fetch and the commit, so
+ *      `activate` matches zero rows. A zero-row UPDATE fires no AFTER UPDATE
+ *      trigger, so D9 stays silent and the derived row is still there to be
+ *      damaged.
+ *   2. The derived row is created AFTER that raw write. D9 has THREE triggers,
+ *      not just the INSERT one: any later UPDATE or DELETE of a raw row deletes
+ *      the layer just as thoroughly. A summary planted before the `forget`
+ *      would already be gone before the job runs.
+ *   3. The derived row is asserted to be PRESENT immediately before the commit.
+ *      Without that, any future change to D9 or to the writer order degrades
+ *      this test to green while proving nothing.
+ */
+test('reconcile: a supersede naming a derived row degrades instead of destroying the batch', async () => {
+  // Over EVERY derived layer, not just the one the fixture happened to use.
+  // `insertDerived` defaults to `LAYER.SCENARIO`, and with that single value a
+  // guard narrowed to `derived !== LAYER.SCENARIO` — which lets an L1 summary
+  // and the L3 portrait straight through — passed the whole suite (263/263/0).
+  // Driving the loop from `DERIVED_LAYERS` is the same rule T2 follows: a layer
+  // added later is covered the day it is added, without anyone remembering to
+  // come back here.
+  for (const layer of DERIVED_LAYERS) {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  store.tx(() => {
+    insertActive(store, 'raw-1', 'fact', 'a real memory', { at: 1000 })
+    insertCandidate(store, 'c0', 'fact', 'a new fact')
+    insertCandidate(store, 'c1', 'fact', 'an unrelated fact')
+  })
+
+  // Property 1: c0 leaves 'candidate' after the job fetches it. `forget`'s
+  // shape — a raw UPDATE — which is also why property 2 matters.
+  // Property 2: the derived row is created AFTER that raw write, so D9 has
+  // already fired and the layer survives into the commit.
+  //
+  // Property 3 is sampled HERE, at the end of the stub, because this is the
+  // last instant the fixture can observe before `runReconcileJob` parses the
+  // reply and commits. Sampling it outside the job would be inert in both
+  // directions: before the job the row has not been planted, and after the job
+  // D9 has already taken it away.
+  let derivedAtCommit
+  const ctx = fakeCtx({
+    services: {
+      llm: {
+        stream: () => {
+          store.db.prepare(`UPDATE memories SET status = 'tombstone' WHERE id = 'c0'`).run()
+          insertDerived(store, 'sum-1', 'tooling', 'a generated restatement', 9000, layer)
+          derivedAtCommit = store.db
+            .prepare(`SELECT count(*) AS n FROM memories WHERE derived != ${LAYER.RAW}`)
+            .get().n
+          return textStream(
+            JSON.stringify({
+              decisions: [
+                { candidateIndex: 0, action: 'supersede', supersedes: 'sum-1' },
+                { candidateIndex: 1, action: 'activate' },
+              ],
+            }),
+          )
+        },
+      },
+    },
+  })
+  const payload = reconcilePayload(['c0', 'c1'])
+  enqueueJob(store, 'reconcile', 'r1', payload, 0)
+
+  await runReconcileJob(ctx, store, claim(store), payload, new AbortController().signal)
+
+  // Property 3, asserted. An earlier revision of this test sampled the count
+  // BEFORE the job and asserted it was ZERO, under a comment claiming the row
+  // was "REALLY there on the eve of the commit" — the assertion and its own
+  // comment stated opposite things. It was measured inert: deleting the
+  // `insertDerived` line from the stub, so that no derived row ever existed,
+  // left this test green both on clean code and with the `supersedeOld` guard
+  // removed. The fixture's central premise went unchecked, which is exactly the
+  // silent degradation this property exists to prevent.
+  assert.equal(
+    derivedAtCommit,
+    1,
+    `the summary at layer ${layer} must really be in the store when the job ` +
+      'commits — without it this test says nothing about what happens to a derived row',
+  )
+
+  // The durable consequences. Without the `derived = LAYER.RAW` clause in
+  // `supersedeOld` the v11 trigger ABORTS this commit, and because the batch is
+  // one transaction (D6) EVERY candidate rolls back — including c1, whose own
+  // decision was fine — and the job burns its retries toward a dead letter.
+  assert.equal(
+    store.db.prepare(`SELECT status FROM memories WHERE id = 'c1'`).get().status,
+    'active',
+    `a candidate with a sound decision must not be lost to another decision's bad id (layer ${layer})`,
+  )
+  assert.equal(
+    store.db.prepare(`SELECT state FROM jobs WHERE id = 'r1'`).get().state,
+    'done',
+    `the job must settle, not abort into a retry (layer ${layer})`,
+  )
+  // c0's own decision degraded to plain activation — it named a target that
+  // cannot be superseded, which is the same path a vanished or `preference`
+  // target already took. Its row left 'candidate' mid-job, so `activate`
+  // matched nothing and it stays where the outside write put it.
+  assert.equal(
+    store.db.prepare(`SELECT status FROM memories WHERE id = 'c0'`).get().status,
+    'tombstone',
+    'the degraded decision writes nothing of its own — durable state outranks the reply',
+  )
+  // The summary is GONE, and stating why is the point: D9's
+  // `invalidate_derived_update` fired when c1 was activated — a raw write — and
+  // took the whole derived layer with it. Asserted positively rather than as
+  // `if (summary !== undefined) { ... }`, which is how this block was first
+  // written: on the clean path that row is always absent, so both assertions
+  // inside the guard were dead code that never ran once.
+  assert.equal(
+    store.db.prepare(`SELECT count(*) AS n FROM memories WHERE id = 'sum-1'`).get().n,
+    0,
+    `D9 retires the derived layer on the raw write this job commits (layer ${layer})`,
+  )
+  // The claim that block MEANT to make, phrased over what survives: no row in
+  // the store was moved out of 'active' by this job except through a legitimate
+  // supersede of a RAW row. Nothing here superseded anything, so no pointer.
+  assert.equal(
+    store.db
+      .prepare(`SELECT count(*) AS n FROM memories WHERE superseded_by IS NOT NULL`)
+      .get().n,
+    0,
+    `a derived target yields no supersede pointer anywhere (layer ${layer})`,
+  )
+  registry.dispose()
+  cleanup(root)
+  }
+})
+
+/**
+ * The companion to the test above, and the ONLY one that can see a derived row
+ * survive a reconcile commit.
+ *
+ * The test above activates `c1`, which is a raw write, so D9's
+ * `invalidate_derived_update` retires the layer no matter what the job did to
+ * it. That makes the two states — "reconcile left the summary alone" and
+ * "reconcile destroyed the summary" — byte-identical after the commit.
+ * Measured: a mutant adding `DELETE FROM memories WHERE derived != RAW` to the
+ * commit body survives the whole suite, because on every other fixture D9
+ * deletes those rows anyway.
+ *
+ * The discriminating window is a batch that performs ZERO raw writes: every
+ * fetched candidate has left 'candidate' before the commit, so `activate`
+ * matches nothing, no AFTER UPDATE trigger fires, and the derived layer is
+ * still standing when the transaction closes. That is the same window the
+ * durability of the original defect depended on, which is why it is worth a
+ * fixture of its own rather than a variation of the one above.
+ */
+test('reconcile: a commit with no raw write leaves the derived layer standing', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  store.tx(() => {
+    insertActive(store, 'raw-1', 'fact', 'a real memory', { at: 1000 })
+    insertCandidate(store, 'c0', 'fact', 'a new fact')
+  })
+
+  let derivedAtCommit
+  const ctx = fakeCtx({
+    services: {
+      llm: {
+        stream: () => {
+          // The candidate is forgotten mid-job (a raw write), and the summary is
+          // planted AFTER it — so D9 has already fired and the layer survives
+          // into the commit.
+          store.db.prepare(`UPDATE memories SET status = 'tombstone' WHERE id = 'c0'`).run()
+          insertDerived(store, 'sum-1', 'tooling', 'a generated restatement', 9000)
+          derivedAtCommit = store.db
+            .prepare(`SELECT count(*) AS n FROM memories WHERE derived != ${LAYER.RAW}`)
+            .get().n
+          return textStream(
+            JSON.stringify({ decisions: [{ candidateIndex: 0, action: 'activate' }] }),
+          )
+        },
+      },
+    },
+  })
+  const payload = reconcilePayload(['c0'])
+  enqueueJob(store, 'reconcile', 'r1', payload, 0)
+  await runReconcileJob(ctx, store, claim(store), payload, new AbortController().signal)
+
+  assert.equal(derivedAtCommit, 1, 'the summary really is present when the job commits')
+  // `activate` matched zero rows — c0 is a tombstone — so the commit performed
+  // no raw write at all. Pinning this is what keeps the fixture in its window:
+  // if a future change makes this job write a raw row, D9 fires and the
+  // assertion below stops meaning anything.
+  assert.equal(
+    store.db.prepare(`SELECT status FROM memories WHERE id = 'c0'`).get().status,
+    'tombstone',
+    'the batch performed no raw write — durable state outranks the reply',
+  )
+  assert.equal(
+    store.db.prepare(`SELECT count(*) AS n FROM memories WHERE derived != ${LAYER.RAW}`).get().n,
+    1,
+    'reconcile must not touch the derived layer: with no raw write, D9 never fires',
+  )
+  assert.equal(
+    store.db.prepare(`SELECT state FROM jobs WHERE id = 'r1'`).get().state,
+    'done',
+  )
   registry.dispose()
   cleanup(root)
 })

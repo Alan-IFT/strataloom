@@ -334,6 +334,28 @@ END;
 ＋ trigger「derived rollup 不得 dormant」（此时两侧写入方均存在）
 ＋ `memories_decay` 索引 ＋ jobs.kind 扩展为四种（重建表实现）。
 
+〔v0.4.14 更正：本条的规范意图一直是「派生层**整层重建**，不逐行老化」，
+但 `dormant` 只是 5 个非 active 状态里的**一个**。实测 v10 库：
+`candidate`/`superseded`/`archived`/`tombstone` 四个状态在派生行上**全部被接受**
+且持久。即**注释写对了原则，实现只兑现 1/5**——与 D7–D9 同族。
+v11 已将其收敛为「派生行只能是 active」，见下。〕
+
+**user_version = 11（v0.4.14）**：把 v4 的原则补全为**不变量**——
+`guard_derived_status`（`BEFORE UPDATE OF status, derived`）＋
+`guard_derived_status_insert`（`BEFORE INSERT`）：
+`new.status != 'active' AND new.derived != RAW` 一律 ABORT。
+
+**三个执行点，因为进入该状态有三条路**：① `UPDATE status` 就地老化；
+② `UPDATE derived` 把一个**已经非 active 的 raw 行提升进派生层**——
+少了列清单里的 `derived`，这条 UPDATE 会被**接受**，随即 D9 的
+`invalidate_derived_update`（按 `OLD.derived = RAW` 触发）在同一语句里
+**把该行删掉**，故失败模式是**静默丢数据**而非拒绝（已实测两向对照）；
+③ `INSERT` 直接生出非 active 的派生行（今日无写入方，但不变量属于**数据**
+而非**转移**，这正是 D9 的教训）。
+
+**整层 DELETE 不在约束内**（`rebuild.ts` 的 delete-then-insert 照常，
+实测 `changes=2`）：**整层重建合法，逐行老化不可表示**——正是 v4 的原话。
+
 **user_version = 5（v2.7）**：派生失效的三个触发器（D9）——任何非 derived 行
 的增/改/删都整删 rollup 并推进 meta 中的 `store_revision`。
 

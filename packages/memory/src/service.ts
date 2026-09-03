@@ -906,10 +906,30 @@ export class MemoryService extends Service {
         )
         .run(id, candidate.kind, personal ? 'private' : 'repo-local', title, body, now, now)
       if (candidate.replaces !== undefined) {
+        // `AND derived = LAYER.RAW` for the reason `forget` and `share` refuse
+        // a derived id by name: a generated summary is not a memory a caller
+        // may replace. It is the same eligibility question the `status =
+        // 'active'` clause beside it already asks, not a copy of the v11
+        // `guard_derived_status` trigger — the trigger says which states the
+        // DATA may hold, this says which rows this WRITER may name, and the two
+        // differ in what the caller gets: matching zero rows produces the
+        // actionable MemoryInputError below, while reaching the trigger would
+        // abort the transaction with raw SQL text.
+        //
+        // Reachability, stated honestly rather than assumed: this is
+        // UNREACHABLE today, and measured so. The INSERT above lands first, and
+        // it is a raw write, so D9's `invalidate_derived_insert` has already
+        // deleted the entire derived layer by the time this UPDATE runs — the
+        // derived row is gone rather than superseded, and the statement matches
+        // zero rows either way. The clause is here because "unreachable today"
+        // is not a reason this project accepts (todo p was closed on exactly
+        // that correction): the guarantee comes from D9's ordering, not from
+        // this writer, and a future reordering of these two statements would
+        // hand the defect back silently.
         const changed = store.db
           .prepare(
             `UPDATE memories SET status = 'superseded', superseded_by = ?, updated_at = ?
-             WHERE id = ? AND status = 'active'`,
+             WHERE id = ? AND status = 'active' AND derived = ${LAYER.RAW}`,
           )
           .run(id, now, candidate.replaces)
         if (Number(changed.changes) !== 1) {
