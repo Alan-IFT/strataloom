@@ -5,13 +5,16 @@ import { runExtractJob } from '../lib/pipeline/extract.js'
 import { collectTurnEvents, provenanceFor } from '../lib/transcript.js'
 import { captureTurn, readTurn } from '../lib/store/conversations.js'
 import { runReconcileJob } from '../lib/pipeline/reconcile.js'
+import { reconcileSystemPrompt } from '../lib/pipeline/prompts.js'
 import { callPipelineLlm, parseStrictJson, PipelineLlmError } from '../lib/pipeline/llm-call.js'
 import { enqueueJob, claimNextJob } from '../lib/pipeline/jobs.js'
 import {
   EXTRACT_EVENT_EXCERPT_CHARS,
   EXTRACT_TRANSCRIPT_CHARS,
+  RECONCILE_EXISTING_LIMIT,
   TOOL_CALL_VALUE_CHARS,
 } from '../lib/constants.js'
+import { LAYER } from '../lib/types.js'
 import {
   openRegistry,
   cleanup,
@@ -1336,13 +1339,31 @@ const insertCandidate = (store, id, kind, title) =>
     )
     .run(id, kind, title)
 
-const insertActive = (store, id, kind, title) =>
+// `provenance`/`at`/`body` default to what the decision tests already used, so
+// the reconcile tests below can vary the three axes the `existing` window turns
+// on (eligibility, recency, content) without a second copy of this INSERT.
+const insertActive = (store, id, kind, title, { provenance = 'human', at = 0, body = 'body' } = {}) =>
   store.db
     .prepare(
       `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
-       VALUES (?, ?, 'repo-local', 'active', ?, 'body', 'human', 0, 0)`,
+       VALUES (?, ?, 'repo-local', 'active', ?, ?, ?, 0, ?)`,
     )
-    .run(id, kind, title)
+    .run(id, kind, title, body, provenance, at)
+
+/**
+ * A generated row of a derived layer, exactly as `runRebuildJob` writes one:
+ * `derived != LAYER.RAW`, which the v10 column CHECK then forces to carry
+ * `DERIVED_PROVENANCE`. These must be inserted AFTER every raw row of a
+ * fixture: the D9 `invalidate_derived_insert` trigger deletes the whole
+ * derived layer on any raw write, so a summary written first is already gone.
+ */
+const insertDerived = (store, id, title, body, at, layer = LAYER.SCENARIO) =>
+  store.db
+    .prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+       VALUES (?, 'fact', 'repo-local', 'active', ?, ?, 'derived', 0, ?, ?)`,
+    )
+    .run(id, title, body, at, layer)
 
 const reconcilePayload = (ids) => ({
   sessionId: 'sess-1',
@@ -1424,6 +1445,219 @@ test('reconcile: decisions must cover every candidate exactly once (else retry e
     runReconcileJob(ctx, store, job, payload, new AbortController().signal),
     PipelineLlmError,
   )
+  registry.dispose()
+  cleanup(root)
+})
+
+// ---- reconcile: the `existing` window is the STORED set, never the derived layer ----
+//
+// The bug these three pin: `runReconcileJob` built `existing` with inline SQL
+// that filtered `status` but not `derived`, so generated L2/L3 summaries were
+// handed to the model as if they were stored memories. The fix reuses
+// `queryAllMemories`, which already means "active AND derived = LAYER.RAW".
+// Each test measures a different outermost ruler — the prompt bytes, the
+// durable row state, the container's eligibility rule — because no one of them
+// alone distinguishes the fix from every plausible wrong version of it.
+
+test('reconcile: the prompt carries no derived row, and summaries do not shorten the window', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  // The production shape: a store with at least a full window of raw memories,
+  // whose derived layer was rebuilt LAST and therefore sorts first under
+  // `updated_at DESC`. On HEAD those 6 summaries both entered the prompt AND
+  // pushed 6 real memories out of it — one defect with two visible faces.
+  //
+  // One MORE raw row than the window, deliberately. With exactly
+  // `RECONCILE_EXISTING_LIMIT` eligible rows this fixture cannot tell 30 from
+  // any LARGER cap — every over-limit returns the same 30 rows, so `LIMIT + 1`
+  // survives while only under-limits are caught. The surplus row makes the cap
+  // observable in both directions, and is the same fixture-degeneracy the
+  // container test below guards against on the provenance axis.
+  store.tx(() => {
+    for (let i = 0; i < RECONCILE_EXISTING_LIMIT + 1; i += 1) {
+      insertActive(store, `raw-${i}`, 'fact', `raw memory ${i}`, { at: 1000 + i })
+    }
+    insertCandidate(store, 'c0', 'fact', 'a new fact')
+    for (let i = 0; i < 6; i += 1) {
+      insertDerived(store, `sum-${i}`, `scenario block ${i}`, `summary body ${i}`, 9000 + i)
+    }
+  })
+  let seen
+  const ctx = fakeCtx({
+    services: {
+      llm: {
+        stream: (options) => {
+          seen = options
+          return textStream(JSON.stringify({ decisions: [{ candidateIndex: 0, action: 'activate' }] }))
+        },
+      },
+    },
+  })
+  const payload = reconcilePayload(['c0'])
+  enqueueJob(store, 'reconcile', 'r1', payload, 0)
+  await runReconcileJob(ctx, store, claim(store), payload, new AbortController().signal)
+
+  // Assert on `system` and each message's text, NOT a hash of the options
+  // object: `createUserMessage` stamps a fresh UUID per call, so the object
+  // differs from itself between runs and a whole-object digest can only ever
+  // fail. The prompt bytes are still the outermost ruler here — this is the
+  // exact payload the provider would receive.
+  assert.equal(seen.system, reconcileSystemPrompt())
+  const sent = JSON.parse(seen.messages.map((m) => m.content.map((c) => c.text).join('')).join(''))
+  const ids = sent.existing.map((row) => row.id)
+  assert.deepEqual(
+    ids.filter((id) => id.startsWith('sum-')),
+    [],
+    'no derived row may be offered as a stored memory',
+  )
+  // The window must still be FULL. A fix that merely filtered the summaries out
+  // of an already-fetched 30 rows would leave 24 here, silently shrinking what
+  // the model dedupes against; the filter has to be inside the LIMIT.
+  assert.equal(ids.length, RECONCILE_EXISTING_LIMIT)
+  // Newest raw first, and the 6 slots the summaries occupied on HEAD now carry
+  // the 6 real memories they had displaced. With one row more than the window,
+  // the OLDEST raw row is the one legitimately cut by the cap — so this also
+  // pins the limit from above: a larger cap would readmit `raw-0` and lengthen
+  // the list, and `ids.length` above would catch it.
+  assert.equal(ids[0], `raw-${RECONCILE_EXISTING_LIMIT}`)
+  assert.equal(ids.at(-1), 'raw-1')
+  assert.ok(!ids.includes('raw-0'), 'the oldest row past the cap must stay out')
+  assert.equal(new Set(ids).size, RECONCILE_EXISTING_LIMIT)
+  registry.dispose()
+  cleanup(root)
+})
+
+test('reconcile: a candidate the model drops as a duplicate OF A SUMMARY survives', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  // The data-loss path, end to end. `pnpm` lives in exactly one raw memory; the
+  // scenario block restates it, which is what a summary is FOR. On HEAD the
+  // model saw the block among `existing`, judged the candidate a duplicate of
+  // it, and answered `drop` — and the block is then deleted by the D9
+  // invalidation trigger on the next raw write, so what it was judged a
+  // duplicate of does not survive either.
+  //
+  // Measured on HEAD with THIS fixture: c0 ends `superseded`, and its own
+  // wording ('workspaces') is left in no active row — while 'pnpm' still
+  // measures 1, because the original raw row is untouched. So the loss this
+  // fixture proves is the CANDIDATE's, not the whole topic's. (The stronger
+  // "0 active rows carrying pnpm" is NOT reachable by any production path: it
+  // needs a live summary over a `dormant` raw row, and decay's UPDATE of the
+  // raw row is itself a raw write that deletes the derived layer in the same
+  // statement. A rebuild cannot re-create it either — `queryInjectableSet`
+  // filters `status='active'`, so a dormant row is not in its source set. Only
+  // hand-planting a summary after decay reaches that state.)
+  store.tx(() => {
+    insertActive(store, 'raw-pnpm', 'fact', 'the repo uses pnpm', {
+      at: 1000,
+      body: 'builds run through pnpm',
+    })
+    insertCandidate(store, 'c0', 'fact', 'the repo uses pnpm workspaces')
+    insertDerived(store, 'sum-tooling', 'tooling', 'this repo builds with pnpm', 9000)
+  })
+  // A model that answers only from what it was shown: `drop` when a summary
+  // restating the candidate is present, `activate` when it is not. The reply is
+  // a FUNCTION of the prompt, so the assertion below measures the fix rather
+  // than a hard-coded verdict.
+  const ctx = fakeCtx({
+    services: {
+      llm: {
+        stream: (options) => {
+          const body = options.messages.map((m) => m.content.map((c) => c.text).join('')).join('')
+          const sawSummary = JSON.parse(body).existing.some((row) => row.id === 'sum-tooling')
+          return textStream(
+            JSON.stringify({
+              decisions: [{ candidateIndex: 0, action: sawSummary ? 'drop' : 'activate' }],
+            }),
+          )
+        },
+      },
+    },
+  })
+  const payload = reconcilePayload(['c0'])
+  enqueueJob(store, 'reconcile', 'r1', payload, 0)
+  await runReconcileJob(ctx, store, claim(store), payload, new AbortController().signal)
+
+  // The outermost ruler is the DURABLE state, not the decision: what the user
+  // loses is the row.
+  assert.equal(store.db.prepare(`SELECT status FROM memories WHERE id = 'c0'`).get().status, 'active')
+  // And the whole-store statement the harm is actually phrased in. The summary
+  // is transient by construction — it is gone the moment any raw row is
+  // written — so counting only ACTIVE RAW rows is what "did the knowledge
+  // survive?" means.
+  assert.equal(
+    store.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM memories
+         WHERE status = 'active' AND derived = ${LAYER.RAW} AND (title LIKE '%pnpm%' OR body LIKE '%pnpm%')`,
+      )
+      .get().n,
+    2,
+    'both the original and the candidate must remain',
+  )
+  // NOT single-point coverage on the HEAD mutant: measured, all three of these
+  // tests go red on it, so this one is not its sole killer. It is still the
+  // only one that measures the DURABLE consequence — the other two assert on
+  // the prompt, which shows the summary was offered but not that a write was
+  // destroyed. It IS the sole killer of a narrower mutant worth keeping in
+  // mind: any change that keeps the prompt correct while mishandling `drop`
+  // would be invisible to the prompt-shape tests.
+  registry.dispose()
+  cleanup(root)
+})
+
+test('reconcile dedupes against the whole stored set, not the injectable subset', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  // The fixture MUST carry a non-injectable row. With uniformly 'human' rows
+  // `queryAllMemories` and `queryInjectableSet` return the same thing on this
+  // data, and a wrong-container fix substituting the latter passes every
+  // assertion — measured: that mutant SURVIVES a same-provenance fixture. The
+  // two containers differ in two ways and this pins both: `tool-output` is not
+  // in INJECTABLE_PROVENANCE (eligibility), and `queryInjectableSet` sorts by
+  // provenance priority before recency (order).
+  store.tx(() => {
+    insertActive(store, 'raw-tool', 'fact', 'learned from a tool result', {
+      provenance: 'tool-output',
+      at: 3000,
+    })
+    insertActive(store, 'raw-human', 'fact', 'stated by the user', { provenance: 'human', at: 1000 })
+    insertCandidate(store, 'c0', 'fact', 'a new fact')
+    insertDerived(store, 'sum-0', 'scenario block', 'summary body', 9000)
+  })
+  let sent
+  const ctx = fakeCtx({
+    services: {
+      llm: {
+        stream: (options) => {
+          sent = JSON.parse(
+            options.messages.map((m) => m.content.map((c) => c.text).join('')).join(''),
+          )
+          return textStream(JSON.stringify({ decisions: [{ candidateIndex: 0, action: 'activate' }] }))
+        },
+      },
+    },
+  })
+  const payload = reconcilePayload(['c0'])
+  enqueueJob(store, 'reconcile', 'r1', payload, 0)
+  await runReconcileJob(ctx, store, claim(store), payload, new AbortController().signal)
+
+  // Recency order, both rows present: exactly `queryAllMemories`. Under
+  // `queryInjectableSet` the tool-output row is absent AND the survivor leads
+  // on provenance priority, so this single deepEqual fails on both counts.
+  assert.deepEqual(
+    sent.existing.map((row) => row.id),
+    ['raw-tool', 'raw-human'],
+  )
+  // SINGLE-POINT COVERAGE, measured twice over. This is the SOLE killer of the
+  // `queryInjectableSet` mutant: that container still excludes derived rows, so
+  // R1 stays green, and hiding a stored row loses no write, so R2 stays green
+  // too — the harm is a duplicate activated as new, which only the container's
+  // contents can show. It is ALSO the sole killer of dropping the
+  // `status = 'active'` clause from `queryAllMemories` itself, which R1 and R2
+  // both survive: the leaked row there is the pending CANDIDATE, and this exact
+  // deepEqual is what refuses it. Keep the 'tool-output' provenance above —
+  // making these two rows uniform is what lets the wrong-container mutant pass.
   registry.dispose()
   cleanup(root)
 })

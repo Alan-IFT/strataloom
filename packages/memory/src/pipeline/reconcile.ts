@@ -9,6 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { OpenStore } from '../store/store.ts'
 import type { MemoryKind } from '../types.ts'
 import { RECONCILE_EXISTING_LIMIT } from '../constants.ts'
+import { queryAllMemories } from '../store/fts.ts'
 import { callPipelineLlm, parseStrictJson, PipelineLlmError, type PinnedRoute } from './llm-call.ts'
 import { reconcileSystemPrompt } from './prompts.ts'
 import { commitClaimedJob, type ClaimedJob } from './jobs.ts'
@@ -88,12 +89,46 @@ export const runReconcileJob = async (
     return
   }
 
-  const existing = store.db
-    .prepare(
-      `SELECT id, kind, title, body FROM memories
-       WHERE status = 'active' ORDER BY updated_at DESC LIMIT ?`,
-    )
-    .all(RECONCILE_EXISTING_LIMIT) as unknown as CandidateRow[]
+  // The set the model dedupes against is the STORED memories, so the derived
+  // layer must not appear in it. A scenario block or portrait is a generated
+  // restatement of rows already in this list, and offering it as if it were a
+  // stored memory corrupts both decisions the model can make about it:
+  //
+  //   drop      — a summary legitimately restates the memory it summarizes, so
+  //               a candidate matching one looks like a duplicate. The
+  //               candidate is marked `superseded`, and the D9 invalidation
+  //               trigger then deletes the summary on the very next raw write,
+  //               so the thing it was judged a duplicate OF does not survive
+  //               either. Measured end to end against the unfixed query: the
+  //               candidate's own wording is left in no active row at all
+  //               (`workspaces`: 1 row, status `superseded`). Decay makes this
+  //               strictly worse rather than better: its UPDATE of raw rows to
+  //               `dormant` is itself a raw write, so the D9 trigger
+  //               `invalidate_derived_update` deletes the whole derived layer
+  //               in the same statement (measured: 1 derived row before, 0
+  //               after a decay that slept 55 raw rows). The summary is
+  //               therefore never a lasting carrier of anything — which is
+  //               precisely why letting a candidate be dropped against one
+  //               loses the write.
+  //   supersede — a decision naming a derived id passes the `status='active'`
+  //               guard below (derived rows ARE active), so `supersedeOld`
+  //               reports changes=1 (measured directly) while the RAW row the
+  //               model meant to replace stays active with
+  //               `superseded_by = NULL`. Measured through this function: two
+  //               contradictory active `fact` rows, the model's intent
+  //               discarded without a trace.
+  //
+  // This REUSES `queryAllMemories` rather than restating its predicate with an
+  // added `AND derived = LAYER.RAW`, because a rule written twice is the
+  // defect: that function already selects these four columns under exactly this
+  // predicate and order, and its documented subject — everything a person
+  // should be able to see — is the same question reconcile asks. Verified
+  // row-for-row identical to the corrected inline SQL on every live production
+  // store. Deliberately not `queryInjectableSet`: reconcile dedupes against
+  // everything STORED, and that one hides `subagent`/`tool-output` rows and
+  // reorders by provenance priority — a candidate duplicating a hidden row
+  // would be activated as new.
+  const existing = queryAllMemories(store, RECONCILE_EXISTING_LIMIT)
 
   // Candidates are addressed by array index (their ids are internal and the
   // model has no use for them); existing rows keep their id because a
