@@ -19,7 +19,7 @@
  * anyone must not be able to inject memories (D1).
  * @module @strataloom/dsh-memory/projection
  */
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { OpenStore } from './store/store.ts'
 import type { MemoryHit } from './types.ts'
@@ -62,8 +62,45 @@ const render = (rows: readonly MemoryHit[]): string => {
 
 /**
  * Rewrite the projection from the store's approved, team-shareable rows.
- * Removes the directory when nothing qualifies, so revoking the last shared
- * memory leaves no stale file behind.
+ * Removes ONLY the projected file when nothing qualifies, so revoking the last
+ * shared memory leaves no stale file behind; the directory itself is removed
+ * only if that leaves it empty.
+ *
+ * It used to say "removes the directory when nothing qualifies" and it meant
+ * it literally: `rmSync(dir, { recursive: true })`.
+ *
+ * ORIGINAL JUSTIFICATION, KEPT AND MARKED REFUTED (house rule: a judgement
+ * that turned out wrong is annotated, not quietly rewritten). This comment
+ * argued the recursive delete had been safe only because the zero-row branch
+ * was DEAD — `share` being the sole caller, pre-scanning with `looksSecret`
+ * before promoting the row, so `safe.length >= 1` always held — and concluded
+ * that `refreshProjection`, via `forget`, was "the first caller that can
+ * genuinely reach zero rows". That is FALSE, and the reasoning error was
+ * stepping over an `await`: `share` suspends between its status check and its
+ * UPDATE to ask a human for approval, that UPDATE carries `AND status =
+ * 'active'`, and `runDecayJob` runs concurrently off `ctx.interval` putting
+ * idle rows to sleep. Reproduced on UNMODIFIED HEAD through the production
+ * writer path (`enqueueJob` / `claimNextJob` / `runDecayJob`) with one decay
+ * pass inside the approval window: the UPDATE matched nothing, this SELECT
+ * returned zero rows, `share` reported "0 memory/memories", and the recursive
+ * delete erased a checked-in `.repo_memory/` down to a hand-written
+ * `NOTES.md`.
+ *
+ * So narrowing the delete is not prevention of a risk this module was about
+ * to introduce — it REPAIRS A DEFECT HEAD CAN ALREADY REACH. `.repo_memory/`
+ * is a CHECKED-IN directory: a team may keep `NOTES.md`, a `README.md`, or
+ * whole subtrees beside the generated file, and recursively deleting it
+ * destroys hand-written, version-controlled work this module never wrote.
+ *
+ * FAILURES ARE NOT HANDLED HERE, deliberately. This function may throw — a
+ * `memories.md` that is a DIRECTORY makes `rmSync` raise EISDIR, which
+ * `force: true` does not suppress (it suppresses ENOENT only) — and
+ * `MemoryService.refreshProjection` owns the single try/catch that decides
+ * what a projection failure means. An earlier revision wrapped the directory
+ * cleanup alone, leaving `rmSync`, `mkdirSync` and `writeFileSync` bare while
+ * this comment already stated the right principle, "a forget must not fail
+ * because tidying up did": the principle was correct and the implementation
+ * honoured it for one call out of four. One rule, one place.
  */
 export const projectStore = (store: OpenStore, workspaceDir: string) => {
   const rows = store.db
@@ -80,7 +117,13 @@ export const projectStore = (store: OpenStore, workspaceDir: string) => {
   const path = join(dir, PROJECTION_FILE)
 
   if (safe.length === 0) {
-    rmSync(dir, { recursive: true, force: true })
+    // Delete what this module wrote, and nothing else.
+    rmSync(path, { force: true })
+    // Drop the directory only when removing our file left it empty, so a
+    // team's own files keep it alive. Uncaught on purpose: see the note above
+    // — the caller's single handler decides whether a projection failure is
+    // fatal, and duplicating that judgement here is what made it half true.
+    if (existsSync(dir) && readdirSync(dir).length === 0) rmdirSync(dir)
     return { written: 0, skippedSecrets: rows.length - safe.length, path }
   }
   mkdirSync(dir, { recursive: true })

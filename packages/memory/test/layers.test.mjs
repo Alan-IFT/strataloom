@@ -7,8 +7,17 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { MemoryService } from '../lib/service.js'
 import { GLOBAL_STORE_KEY } from '../lib/store/store.js'
 import { captureTurn, readTurn, pruneConversations } from '../lib/store/conversations.js'
@@ -2879,14 +2888,372 @@ test('an approved share promotes, projects the file, and revoking removes it', a
   assert.match(text, /make deploy/)
   assert.match(text, /never read back/, 'the file states it is not an input')
 
-  // Forgetting the shared memory rewrites the projection away.
   await service.forget(id, principal)
-  const store = service.storeFor(principal, false)
-  const report = projectStore(store, repo)
-  assert.equal(report.written, 0)
+  // This assertion used to be preceded by the test CALLING `projectStore`
+  // itself, under the comment "Forgetting the shared memory rewrites the
+  // projection away". That comment described what the TEST did, not what the
+  // product did: `service.forget` never refreshed the projection, and the two
+  // manual lines were the only thing making the file disappear. Removing them
+  // on HEAD turned this test red (247/1) — the measurement that found the D5
+  // projection-face gap. Kept here, mistake and all, because a test that
+  // performs the behaviour it claims to observe is indistinguishable from a
+  // passing one until someone deletes the setup.
   assert.equal(existsSync(file), false, 'no stale shared file survives')
   registry.dispose()
   cleanup(root)
+})
+
+test('forget closes the projection face D5 names, by refreshing it — not by deleting the file', async () => {
+  const { repo, root, registry, principal, ctx, service } = setup()
+  service.ctx = approvalCtx(ctx, 'allowed-once')
+  const alpha = await service.propose(
+    { title: 'alpha rotation', body: 'rotate the alpha staging cluster weekly', kind: 'procedure' },
+    principal,
+  )
+  const beta = await service.propose(
+    { title: 'beta rotation', body: 'the beta cluster is rotated by hand', kind: 'procedure' },
+    principal,
+  )
+  // B15: the count in the note is a STATEMENT TO THE USER about how many
+  // memories now sit in the shared file, so it has to come from the projection
+  // rather than from the fact that one share just happened. Two shares in a
+  // row make a hardcoded `1` observable — with a single share, "wrote one row"
+  // and "always says one" are indistinguishable.
+  assert.match((await service.share(alpha.id, principal)).note, /^Shared\. 1 memory/)
+  assert.match((await service.share(beta.id, principal)).note, /^Shared\. 2 memor/)
+
+  const file = join(repo, PROJECTION_DIR, PROJECTION_FILE)
+  assert.match(readFileSync(file, 'utf8'), /alpha staging cluster/)
+
+  // ONLY the product call. Nothing in this test touches `projectStore`.
+  await service.forget(alpha.id, principal)
+
+  const text = readFileSync(file, 'utf8')
+  assert.equal(/alpha staging cluster/.test(text), false, 'the forgotten bytes are gone from disk')
+  assert.match(text, /rotated by hand/, 'a refresh, not a deletion: beta is still published')
+
+  // A rolled-back forget must leave the file untouched. The filesystem is not
+  // in the transaction, so this only holds while the refresh runs strictly
+  // AFTER `commitL1Mutation` — move it before and a refusal would still have
+  // rewritten a checked-in file.
+  await assert.rejects(service.forget(alpha.id, principal), /already forgotten/)
+  assert.equal(readFileSync(file, 'utf8'), text, 'a refused forget writes nothing to disk')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('forget refreshes only THIS checkout: one store maps to N checkouts', async () => {
+  clearRepoIdentityMemo()
+  const base = tempRoot()
+  // Two clones of the same origin. `deriveRepoIdentity` hashes the REMOTE URL,
+  // so they are one store — the fact that makes "which checkout holds the
+  // projection?" unanswerable from a store.
+  const checkouts = ['A', 'B'].map((name) => {
+    const dir = join(base, name)
+    mkdirSync(dir, { recursive: true })
+    execFileSync('git', ['init', '-q'], { cwd: dir })
+    execFileSync('git', ['remote', 'add', 'origin', 'https://example.invalid/t/shared.git'], {
+      cwd: dir,
+    })
+    return dir
+  })
+  const { root, registry } = openRegistry()
+  const inA = fakeAgent({ id: 'pa', cwd: checkouts[0] })
+  const inB = fakeAgent({ id: 'pb', cwd: checkouts[1] })
+  const service = Reflect.construct(function () {}, [])
+  Object.setPrototypeOf(service, MemoryService.prototype)
+  service.ctx = approvalCtx(fakeCtx({ agents: [inA, inB] }), 'allowed-once')
+  service.stores = registry
+
+  assert.equal(
+    service.storeFor(inA, true),
+    service.storeFor(inB, true),
+    'same origin ⇒ same store: a store cannot name the checkout that holds its projection',
+  )
+
+  // TWO shared memories, and only one is forgotten. That detail is the whole
+  // fixture: with a single share, forgetting it leaves zero projectable rows,
+  // and the zero-row branch writes nothing ANYWAY — so a build with no
+  // `existsSync` guard at all would still leave B clean and the test would
+  // pass while measuring nothing. A surviving second row is what makes a
+  // missing guard observable: without it the refresh CREATES B's projection.
+  const { id } = await service.propose(
+    { title: 'release ritual', body: 'tag from main only', kind: 'procedure' },
+    inA,
+  )
+  const survivor = await service.propose(
+    { title: 'review ritual', body: 'two approvals before merge', kind: 'procedure' },
+    inA,
+  )
+  await service.share(id, inA)
+  await service.share(survivor.id, inA)
+  assert.equal(existsSync(join(checkouts[0], PROJECTION_DIR, PROJECTION_FILE)), true)
+  assert.equal(existsSync(join(checkouts[1], PROJECTION_DIR)), false, 'share never reached B')
+
+  // B2: B now gets a checked-in `.repo_memory/` holding the team's OWN files
+  // and no generated projection — the realistic state of a fresh clone, since
+  // `.repo_memory/` is committed. It is also what separates guard 3's two
+  // plausible spellings: testing for the DIRECTORY here would report "a
+  // projection lives here" and publish approved memories into a checkout
+  // nobody published into, so the guard must test for the FILE.
+  const dirB = join(checkouts[1], PROJECTION_DIR)
+  mkdirSync(dirB, { recursive: true })
+  writeFileSync(join(dirB, 'NOTES.md'), '# team notes, checked in, not ours\n', 'utf8')
+
+  // Forgetting from B must not fabricate a projection in B. B never had one;
+  // creating one there would publish approved memories into a checkout nobody
+  // asked to publish into — a new leak invented by a deletion.
+  await service.forget(id, inB)
+  assert.equal(
+    existsSync(join(dirB, PROJECTION_FILE)),
+    false,
+    'forget refreshes an existing projection; it never creates one',
+  )
+  assert.equal(existsSync(join(dirB, 'NOTES.md')), true, "B's own files are untouched")
+  registry.dispose()
+  cleanup(root)
+  cleanup(base)
+})
+
+test('forgetting a personal memory never touches the repo projection (ADR 0001)', async () => {
+  const { repo, root, registry, principal, ctx, service } = setup()
+  service.ctx = approvalCtx(ctx, 'allowed-once')
+  const shared = await service.propose(
+    { title: 'build command', body: 'run npm run build before testing', kind: 'procedure' },
+    principal,
+  )
+  assert.equal((await service.share(shared.id, principal)).shared, true)
+  const file = join(repo, PROJECTION_DIR, PROJECTION_FILE)
+  const before = readFileSync(file, 'utf8')
+
+  // Lives in the global store, which is not this session's repo store.
+  const personal = await service.propose(
+    { title: 'be terse', body: 'short answers, no preamble', kind: 'preference', scope: 'personal' },
+    principal,
+  )
+  await service.forget(personal.id, principal)
+
+  assert.equal(readFileSync(file, 'utf8'), before, 'a global-store forget writes no repo file')
+  registry.dispose()
+  cleanup(root)
+})
+
+test('forget removes the generated file only, leaving hand-written neighbours alone', async () => {
+  const { repo, root, registry, principal, ctx, service } = setup()
+  service.ctx = approvalCtx(ctx, 'allowed-once')
+  const { id } = await service.propose(
+    { title: 'oncall handoff', body: 'hand over at 09:00 local time', kind: 'procedure' },
+    principal,
+  )
+  assert.equal((await service.share(id, principal)).shared, true)
+
+  // `.repo_memory/` is checked in: teams keep their own files beside ours.
+  const dir = join(repo, PROJECTION_DIR)
+  const notes = join(dir, 'NOTES.md')
+  writeFileSync(notes, '# hand-written, version-controlled, not ours\n', 'utf8')
+
+  await service.forget(id, principal)
+
+  assert.equal(existsSync(join(dir, PROJECTION_FILE)), false, 'the generated file is gone')
+  assert.equal(existsSync(notes), true, 'the hand-written neighbour survives')
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * T5/T6 pin the rule "a projection write that fails must not fail a forget".
+ * The tombstone commits BEFORE the refresh, so by the time the file is touched
+ * the deletion is permanently done: throwing would report failure for finished
+ * work and send the model into a retry that `already forgotten` refuses —
+ * a split brain whose only escape hatch, a later refresh, no longer exists.
+ *
+ * Two obstructions, because they enter `projectStore` through different calls:
+ * a read-only FILE stops `writeFileSync` with EACCES on the rewrite path,
+ * while a `memories.md` that is a DIRECTORY stops `rmSync` on the zero-row
+ * path with EISDIR — which `force: true` does NOT suppress, it suppresses
+ * ENOENT only. An earlier revision guarded only the `readdirSync`/`rmdirSync`
+ * cleanup and left `rmSync`, `mkdirSync` and `writeFileSync` bare, so both of
+ * these threw.
+ *
+ * T5 obstructs the FILE, not the directory, and that was a measured
+ * correction rather than a preference: the first version chmod'ed the
+ * DIRECTORY to 0o500 and survived every mutant, because POSIX write
+ * permission on a directory governs creating and unlinking entries, not
+ * rewriting an existing file through an already-resolvable path (measured:
+ * `writeFileSync` into a 0o500 directory succeeds when the file exists).
+ * The test was green for the same reason a build with no error handling at
+ * all was green — nothing ever threw. Same family as the T2 fixture
+ * degeneracy: an obstruction that does not obstruct pins nothing.
+ */
+test('forget survives a projection write it cannot perform (read-only file)', async () => {
+  const { repo, root, registry, principal, ctx, service } = setup()
+  service.ctx = approvalCtx(ctx, 'allowed-once')
+  const alpha = await service.propose(
+    { title: 'alpha rotation', body: 'rotate the alpha staging cluster weekly', kind: 'procedure' },
+    principal,
+  )
+  const beta = await service.propose(
+    { title: 'beta rotation', body: 'the beta cluster is rotated by hand', kind: 'procedure' },
+    principal,
+  )
+  await service.share(alpha.id, principal)
+  await service.share(beta.id, principal)
+
+  // A survivor keeps this on the REWRITE path: with beta still projectable the
+  // refresh must call `writeFileSync`, which a read-only FILE refuses with
+  // EACCES. Forgetting the last row instead would take the zero-row path and
+  // measure something else — that one is T6's job.
+  const dir = join(repo, PROJECTION_DIR)
+  const file = join(dir, PROJECTION_FILE)
+  chmodSync(file, 0o400)
+  try {
+    await service.forget(alpha.id, principal)
+  } finally {
+    chmodSync(file, 0o600)
+  }
+
+  // The deletion is real and complete in the store, which is what makes
+  // swallowing the write failure honest rather than a cover-up.
+  const row = service
+    .storeFor(principal, false)
+    .db.prepare(`SELECT status, title, body FROM memories WHERE id = ?`)
+    .get(alpha.id)
+  assert.deepEqual(
+    { status: row.status, title: row.title, body: row.body },
+    { status: 'tombstone', title: '', body: '' },
+    'the forget itself happened',
+  )
+
+  // And the store is still the truth: once the obstruction is gone, the next
+  // forget re-projects and the stale bytes leave disk. The swallow costs a
+  // delay, not the guarantee.
+  await service.forget(beta.id, principal)
+  assert.equal(
+    existsSync(join(dir, PROJECTION_FILE)),
+    false,
+    'a later refresh heals the file the failed one could not write',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+test('forget survives a projection path that cannot be removed (memories.md is a directory)', async () => {
+  const { repo, root, registry, principal, ctx, service } = setup()
+  service.ctx = approvalCtx(ctx, 'allowed-once')
+  const { id } = await service.propose(
+    { title: 'oncall handoff', body: 'hand over at 09:00 local time', kind: 'procedure' },
+    principal,
+  )
+  assert.equal((await service.share(id, principal)).shared, true)
+
+  // Needs no special permissions: EISDIR is reachable by any user.
+  const file = join(repo, PROJECTION_DIR, PROJECTION_FILE)
+  rmSync(file)
+  mkdirSync(file)
+
+  // The single shared row: forgetting it leaves zero projectable rows, so the
+  // refresh takes the `rmSync` path and hits EISDIR.
+  await service.forget(id, principal)
+
+  const row = service
+    .storeFor(principal, false)
+    .db.prepare(`SELECT status, title, body FROM memories WHERE id = ?`)
+    .get(id)
+  assert.deepEqual(
+    { status: row.status, title: row.title, body: row.body },
+    { status: 'tombstone', title: '', body: '' },
+    'the forget itself happened',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * `share` takes the OPPOSITE branch of the same rule, and that asymmetry is
+ * the whole reason `refreshProjection` returns `ok` instead of just a count.
+ * `share` is a publish: a human was asked "commit this so your team sees it"
+ * and said yes, so reporting "Shared." over a file that was never written is
+ * its own dishonesty. It is also recoverable in a way `forget` is not — the
+ * row stays `team-shareable, human_confirmed = 1`, so sharing again
+ * re-projects the whole table — which makes an error something the caller can
+ * act on rather than the dead end swallowing would create.
+ */
+test('share REPORTS a projection write it cannot perform, and stays retryable', async () => {
+  const { repo, root, registry, principal, ctx, service } = setup()
+  service.ctx = approvalCtx(ctx, 'allowed-once')
+  const { id } = await service.propose(
+    { title: 'deploy ritual', body: 'deploy from main after the smoke suite', kind: 'procedure' },
+    principal,
+  )
+
+  const dir = join(repo, PROJECTION_DIR)
+  mkdirSync(dir, { recursive: true })
+  chmodSync(dir, 0o500)
+  try {
+    await assert.rejects(
+      service.share(id, principal),
+      /could not be written/,
+      'a publish that published nothing must not answer "Shared."',
+    )
+  } finally {
+    chmodSync(dir, 0o700)
+  }
+
+  // Retryable, and the retry actually publishes: the approval is not consumed
+  // by the failure, so the human is not asked to bless the same memory twice.
+  const retry = await service.share(id, principal)
+  assert.equal(retry.shared, true)
+  assert.match(readFileSync(join(dir, PROJECTION_FILE), 'utf8'), /smoke suite/)
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * B5: "`refreshProjection` is the only writer of the projection" is the
+ * invariant the whole design rests on, and it was the one thing no test could
+ * see — inlining `projectStore` back into `share` left all 252 green, because
+ * the inlined call produces byte-identical output on the happy path. The
+ * difference only surfaces in the guards and the failure handling, which is
+ * exactly what a future "this indirection is pointless" tidy-up would delete.
+ *
+ * So this asserts over the SOURCE, the way the guidance-budget guard already
+ * does in this package. That is deliberately structural, and justified here
+ * because the property IS structural: a behavioural test cannot distinguish
+ * "one writer" from "two writers that happen to agree today".
+ */
+test('B5: projectStore has exactly one call site, and it is inside refreshProjection', () => {
+  const src = join(dirname(dirname(fileURLToPath(import.meta.url))), 'src')
+  const callSites = []
+  for (const file of readdirSync(src, { recursive: true, encoding: 'utf8' })) {
+    if (!file.endsWith('.ts') || file.endsWith('projection.ts')) continue
+    const text = readFileSync(join(src, file), 'utf8')
+    // Call sites only: `projectStore(` with an argument list. The import in
+    // service.ts reads `projectStore,` and does not match.
+    for (const [index, line] of text.split('\n').entries()) {
+      if (/\bprojectStore\s*\(/.test(line)) callSites.push({ file, index })
+    }
+  }
+  assert.equal(
+    callSites.length,
+    1,
+    'projectStore must be called from exactly one place. A second call site bypasses the ' +
+      'three guards AND the single failure handler, and no behavioural test can catch that ' +
+      'because the happy path is byte-identical.',
+  )
+  // Deliberately NOT asserting the call line verbatim: that would pin the
+  // expression's spelling rather than the invariant, and break on any harmless
+  // refactor. What matters is that the one call sits inside `refreshProjection`
+  // — so locate the enclosing method by the nearest preceding declaration.
+  assert.equal(callSites[0].file, 'service.ts')
+  const before = readFileSync(join(src, 'service.ts'), 'utf8')
+    .split('\n')
+    .slice(0, callSites[0].index)
+  const enclosing = before.findLast((line) => /^ {2}(private |async |)[a-zA-Z]\w*\(/.test(line))
+  assert.match(
+    enclosing ?? '',
+    /refreshProjection/,
+    'the single projectStore call must live in refreshProjection, not in a caller',
+  )
 })
 
 test('a credential-shaped memory is refused BEFORE anyone is asked to approve it', async () => {

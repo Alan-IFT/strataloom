@@ -1,13 +1,382 @@
 # 当前状态
 
-> 最后更新：2026-09-03 · **v0.4.12 已发布**：`runReconcileJob` 把**生成的派生层
+> 最后更新：2026-09-03 · **未发版（版本号未动，发版由 lead 决策）**：`forget`
+> 从不刷新工作区投影——D5 明写要关闭的**四个**读取面里，`（recall/context/派生/
+> 投影）`的最后一个**没有任何执行点**。库里 title/body 已清空，同样的字节仍完整
+> 躺在 `<workspace>/.repo_memory/memories.md`。修法是**新增一个私有方法
+> `refreshProjection`，把投影收敛成唯一写入点**，`share` 与 `forget` 都走它。
+> 顺带**收窄 `projection.ts` 零行分支的爆炸半径**（原为递归删整个目录）——
+> 经证伪后确认这**修的是 HEAD 上已可触发的既有缺陷**，见下文证伪记录。
+> 🟡 **执行点缺失，非正在冒烟的洞**：9 个生产库 `team-shareable AND
+> human_confirmed=1` 合计 **0**，本机无任何 `.repo_memory/` 目录。
+> 测试 248 → **256 / 0 fail**。**无 schema 改动。**
+> **第二轮**：代码审查与 QA 独立打回同一个阻断项（**投影写失败会让 `forget`
+> 抛错且不可恢复**——本轮自己引入的回归），并证伪了「零行分支是死分支」这条注释
+> 断言。两项均已修：**投影失败的处理收敛为「一条规则一个实现」**
+> （`refreshProjection` 内单一 `try/catch`，`forget` 吞、`share` 抛）。
+> **每次工作结束时更新本页**，它是新会话的唯一入口。
+>
+> ⬇️ 以下 v0.4.12 一节及更早各节仍然有效。
+
+## 🆕 本轮：D5 点名的四个读取面，`forget` 只关了三个（**投影面无执行点**）
+
+**本轮不结项任何已登记待办**——选题是逐面实测发现的**未登记**缺口。
+
+### 判据：规范逐字列举了四个面，实测其中一个没有执行点
+
+`plugin-architecture.md:99` 写的是：
+
+```
+D5  forget 立即关闭全部读取面（recall/context/派生/投影），
+```
+
+逐面实测：
+
+| 面 | 执行点 | 状态 |
+|---|---|---|
+| recall | 查询谓词 | closed |
+| context | 查询谓词 | closed |
+| 派生 | schema 触发器（D9） | closed |
+| **投影** | **无** | **NOT closed** |
+
+`projectStore` 全仓**唯一**调用点是 `service.share()`（实测
+`grep -rn "projectStore(" src/` → 1 处）。故 `service.forget()` 之后：
+**库里 title/body 已清空，同样的字节仍完整躺在
+`<workspace>/.repo_memory/memories.md`**，而 forget 的 note 对用户宣称
+`it will not be recalled, injected, or re-learned`——**一句不实陈述**。
+
+> ⚠️ **严重性照实定级：🟡 执行点缺失，不是正在冒烟的洞。** 实测 9 个生产库
+> `team-shareable AND human_confirmed = 1` **合计 0**，本机 `find` 不到任何
+> `.repo_memory/` 目录——**即今天无人分享过任何东西**。且存在自愈路径：同仓
+> 任意后续 `share` 会整表重投影冲掉陈旧行。**修它是因为 D5 明文列举了这个面、
+> 且 note 做了不实陈述——不是因为有数据正在泄漏。**
+> （本仓有「待办 q 因严重性论证夸大而作废」的前科，不重蹈。）
+
+### 做了什么：一个执行点 + 三道 guard
+
+`.repo_memory/memories.md` 是 `projectStore` 那条 SELECT 的**物化视图**，
+住在库外、任何事务都盖不住的文件系统里。新增私有方法
+`MemoryService.refreshProjection(store, agent, create): number`——
+**投影的唯一写入点**。三道 guard，任一不满足返回 0：
+
+1. `store !== this.storeFor(agent, false)` → 0
+2. `deriveWorkspaceRoot(cwd)` 为 `undefined` → 0
+3. `!create && !existsSync(join(workspace, PROJECTION_DIR, PROJECTION_FILE))` → 0
+
+`share` 收敛到它（`create = true`），`forget` **在 `commitL1Mutation` 之后**
+调用它（`create = false`）。
+
+**条件 1 为什么写 `=== this.storeFor(agent, false)` 而不是 `store.kind === 'repo'`：
+不是因为今天更严——今天两者恒等。** `forget` 的 store 来自
+`readableStores(agent, true)`，该函数字面上就是
+`[storeFor(agent,…), globalStore(…)]`，穷举 6 种输入两个谓词取值全同。
+选它是为了**对齐 `readableStores` 上方那段已有的警告**——那段注释警告未来的
+「统一 store 列表」式整理会把读能力变成跨仓写能力。若 group member 真被并入，
+member store 的 `kind` **同样是 `'repo'`**，`kind === 'repo'` 会放行一次
+**向别人仓库 checkout 的投影写入**，而 `=== storeFor(agent, false)` 不会。
+
+**条件 3 承担的是一个不可解问题。** `deriveRepoIdentity` 按 **remote URL** 哈希，
+而投影住在**本地 checkout**，所以**一个 store ↔ N 个 checkout**。实测两个 clone
+同一 origin：
+
+```
+A {key:'6aaf67f4291534525c3f8df8', source:'remote:example.invalid/team/proj'}
+B {key:'6aaf67f4291534525c3f8df8', source:'remote:example.invalid/team/proj'}
+same key: true
+```
+
+**没有任何 guard 能从 store 反推出「哪个 checkout 持有投影文件」。** 条件 3
+不去回答那个无解的全局问题，只回答一个本地永远有确定答案的问题：
+*我这里有没有一份归我维护的物化视图*。**`existsSync` 在这里不是把文件变成输入**
+（ADR 0001 禁止的是那个）——分支两侧写出的内容完全由库决定，**文件内容对结果零影响**，
+只有它的「在不在」在选择「刷新」还是「什么都不做」。
+
+**跨 checkout 陈旧是继承来的局限，不是本轮引入的代价。** 实测**未修改的 HEAD** 上，
+从 checkout B 执行 `share`，A 的投影文件一直陈旧：
+
+```
+after share#1 in A:  A exists = true  B exists = false
+after share#2 in B:  A exists = true  B exists = true
+  A has alpha: true | A has gamma: false
+=> A is STALE on UNMODIFIED HEAD (missing gamma): true
+```
+
+条件 3 使 `forget` 与 `share` 的跨 checkout 行为**首次一致**（都只作用于本
+checkout）——**这是收敛，不是新增例外**。
+
+### 另一处必改：`rmSync` 的爆炸半径（~~本方案会第一次激活那条死分支~~ → **修 HEAD 既有缺陷**）
+
+`projection.ts` 在 0 行时执行 `rmSync(dir, {recursive:true, force:true})`。
+实测递归删除的后果：
+
+```
+before: dir contains [ 'NOTES.md', 'memories.md', 'sub' ]
+reproject written = 0 (0 => rmSync branch)
+dir still exists: false
+NOTES.md survives: false
+sub/more.md survives: false      <-- 连子目录树一起删
+```
+
+`.repo_memory/` 是**签入版本库的目录**，团队可能在里面放 `NOTES.md`/`README.md`/
+子目录。改为：0 行时 `rmSync(path, { force: true })` **只删自己写的那个文件**；
+随后 `if (existsSync(dir) && readdirSync(dir).length === 0) rmdirSync(dir)`
+——目录非空就留着。函数 doc 里那句已经不实的
+"Removes the directory when nothing qualifies" 一并更正。
+
+> 🔴 **本轮被代码审查证伪的断言（按本仓惯例保留原判断并标注，不悄悄改掉）。**
+> 原文写的是：**「实测该分支在 HEAD 上是死分支」「`share` 结构性走不到它——它先
+> `looksSecret` 预扫再提升该行，故 `safe.length >= 1` 恒成立」「本轮的 `forget`
+> 是第一个能真正走到 0 行的调用方」**。**这三句都是错的。**
+>
+> **证伪路径**：推理**跨过了一个 `await`**。`share` 在状态检查与 UPDATE 之间
+> `await approval.request(...)`（人类审批，可长达数分钟），而那条 UPDATE 带
+> `AND status = 'active'`；`runDecayJob` 挂在 `ctx.interval` 上**并发**跑，会把
+> 闲置行置为 `dormant`。**审批窗口内睡着的行永远不会被提升**，于是 `share` 自己
+> 就投影出 0 行。我用**生产写者原样调用链**（`enqueueJob`/`claimNextJob`/
+> `runDecayJob`，非手写 SQL）在**未修改的 HEAD** 上独立复现：
+>
+> ```
+> decay during approval window: {"slept":61,"revived":0}
+> share note: Shared. 0 memory/memories now sit in .repo_memory/memories.md; ...
+> >>> zero-row branch reached by share on HEAD: true
+> >>> .repo_memory dir survived: false
+> >>> checked-in NOTES.md survived: false
+> ```
+>
+> **定性因此改变，且对本轮有利**：递归删除**不是本轮才激活的风险，而是 HEAD 上
+> 已经存在、会删掉签入版本库文件的缺陷**。`rmSync` 收窄的价值**比原先宣称的更高**
+> ——它**修的是既有缺陷**，而不是「预防本方案自己引入的风险」。
+>
+> **教训**：判定「死分支」时只检查了调用方的**同步**前后条件，没检查
+> **`await` 期间并发写者能否改变那些前条件**。凡是跨 `await` 的
+> 「检查—使用」序列，其前条件在恢复执行时都必须重新成立才算数——这与本仓
+> `immediateTx` 处理 TOCTOU 是同一族问题，只是那次在事务层、这次在 `await` 层。
+
+### 范围判据是「该能力有没有对投影作出陈述」，**不是**「够不够得着 workspace」
+
+后者会被 `propose({replaces})` **正面驳倒**——它确实够得着。明确不改：
+
+| 不改 | 理由 |
+|---|---|
+| `propose({replaces})` | **它不对投影作任何陈述**；且刷新会**删掉人类批准过的内容而不发布替代品**——替换行是 `visibility='repo-local', human_confirmed=0`，**结构性不可投影**，重投影后 `written=0`，团队文件里那条被批准过的记忆凭空消失。属产品策略问题，需自己的判据（见待办 M） |
+| `runDecayJob`（sleep 与 revive 双向） | **结构性够不到 workspace**：实测 `src/pipeline/*.ts` **8 个文件 `cwd` 出现次数全部为 0**。与 D9 同类、却是唯一无法用同一手法解决的实例——D9 用 schema 触发器解决，而 **SQLite 触发器写不了文件**（见待办 N） |
+| `runReconcileJob`（supersede→archived） | 同上 |
+| `projectStore` 的 SELECT / 三道闸 / 秘密扫描 | 本轮不触碰 |
+| `deriveRepoIdentity` 按 remote 哈希 | §2.1 既定设计，不是本轮缺陷（见待办 O） |
+
+### 测试：新增 4 条，改造 1 条被自己掩盖的既有测试
+
+既有测试 `'an approved share promotes, projects the file, and revoking removes it'`
+在 forget 后**自己手动调了一次 `projectStore`** 再断言文件没了，注释写着
+"Forgetting the shared memory rewrites the projection away"——**那句话描述的是
+测试自己做的事，不是产品做的事**。删掉那两行手动调用后，**HEAD 上该测试立刻转红
+（247/1）——这正是找到 D5 投影面缺口的那次测量**。按本仓惯例**保留错误并标注证伪**。
+
+- **T1** `forget` 关闭 D5 点名的投影面：分享 alpha+beta，**只调 `service.forget`，
+  全程不碰 `projectStore`**，断言 alpha 字节消失**且 beta 仍在**（证明是*刷新*
+  不是*删除*）。**并追加一条回滚断言**：对已 tombstone 的 id 再 forget 一次必须
+  被拒且**磁盘一字不变**。
+- **T2** 两个 clone 同一 origin。先断言
+  `storeFor(pA,false) === storeFor(pB,false)`（把「一个 store ↔ N 个 checkout」
+  钉成测试里的显式事实），再在 B 里 forget，断言
+  `existsSync(join(B, PROJECTION_DIR)) === false`。
+- **T3** forget 一条 personal 记忆（global 库）不得触碰 repo 投影（ADR 0001）。
+- **T4** `.repo_memory/` 里先放一个手写 `NOTES.md`，再 forget 最后一条已分享记忆：
+  `memories.md` 必须消失，`NOTES.md` 必须存活。
+
+**第二轮新增 3 条**（阻断项 1 与建议项，详见下文「第二轮」小节）：
+
+- **T5** `memories.md` 只读（0o400）时 forget 必须**正常返回**（EACCES 走重写路径）。
+- **T6** `memories.md` 是**目录**时 forget 必须**正常返回**（EISDIR 走零行 `rmSync` 路径）。
+- **T7** 同样写不下去时 `share` 必须**抛错**（发布语义），且**可重试并真的发布**。
+- 另加 **B5 结构测试**：`projectStore` 全 `src/` 只允许**一个调用点**，且必须位于
+  `refreshProjection` 内。
+
+### 变异矩阵（第二轮重跑：**16/16 全杀**，另 2 条已证等价故不补测试）
+
+每个变异都改**产品代码**、在 `/tmp` 副本里重新 `npm run build`、跑**全量**。
+
+| 变异 | 改什么 | 结果 | 杀死它的测试 |
+|---|---|---|---|
+| **M0 CONTROL** | — | ✅ 256/0 | — |
+| **M1** | 删掉 forget 里的 `refreshProjection` 调用（＝回到 HEAD） | 🔴 252/4 | T1 + T4 + T5 + 既有那条 |
+| **M2** | 删掉 store guard（条件 1） | 🔴 255/1 | **T3 单点** |
+| **M3** | 删掉 `existsSync` guard（条件 3） | 🔴 255/1 | **T2 单点** |
+| **M4** | forget 传 `create = true` | 🔴 255/1 | **T2 单点** |
+| **M5** | 恢复递归 `rmSync(dir,{recursive:true})` | 🔴 255/1 | **T4 单点** |
+| **M6** | 零行分支整个变 no-op | 🔴 253/3 | T4 + T5 + 既有那条 |
+| **M7** | 刷新提前到 `commitL1Mutation` **之前** | 🔴 252/4 | T1 + T4 + T5 + 既有那条 |
+| **M8** 🆕 | **删掉 `refreshProjection` 的 `try/catch`**（＝本轮被打回的回归） | 🔴 253/3 | T5 + T6 + T7 |
+| **M9** 🆕 | `share` **也吞掉**写失败（发布不诚实） | 🔴 255/1 | **T7 单点** |
+| **M10** 🆕 | 恢复「只保护一半」的局部 catch（原实现） | 🔴 253/3 | T5 + T6 + T7 |
+| **M11** 🆕 | **B5**：`share` 退回内联调用 `projectStore` | 🔴 254/2 | **B5** + T7 |
+| **M12** 🆕 | **B15**：`written` 硬编码为 `1` | 🔴 255/1 | **T1 单点** |
+| **M13** 🆕 | **B4**：忽略 `projectStore` 返回值，`written` 恒 0 | 🔴 255/1 | **T1 单点** |
+| **M14** 🆕 | **B2**：guard 3 检查**目录**而非文件 | 🔴 255/1 | **T2 单点** |
+| **M15** 🆕 | **B1**：guard 1 换成 `store.kind === 'repo'` | ⚪ 256/0 **等价** | 不补测试（见下） |
+| **M16** 🆕 | **B10**：`storeFor(agent, false)` → `true` | ⚪ 256/0 **等价** | 不补测试（见下） |
+
+> **「改哪一行会让它红」**（逐条自查，非推断）：
+> T5/T6 钉的是 `service.ts` 里 `refreshProjection` 的那个 `try { … } catch`——
+> 删掉它（M8）或换回 `projection.ts` 的半包 catch（M10）立刻红；
+> T7 钉的是 `share` 里的 `if (!projection.ok) throw`——删掉即红（M9）；
+> B5 钉的是 `projectStore(` 在 `src/` 内的调用点计数与所在方法——
+> 任何第二个调用点即红（M11）。
+
+> 🔴 **必须记的一次自查失败：按方案原文写出的 T2 让 M3 与 M4 双双存活（252 全绿）。**
+> 原因是**方案给的 fixture 退化**：T2 原设计只分享**一条**记忆，于是 forget 掉它
+> 之后**剩余可投影行数为 0**，而**零行分支本来就什么都不写**——一个 guard 被删光的
+> 构建照样让 B 保持干净，测试绿得毫无意义。**修法是让 T2 分享两条、只 forget 一条**：
+> 有一条幸存行，缺失的 guard 才会真的**在 B 里创建**投影文件。改后 M3/M4 各由 T2 单点杀死。
+> **这与 v0.4.12「`LIMIT+1` 因 fixture 恰好卡在边界而存活」是同一种 fixture 退化**——
+> 本仓第三次被同一族问题咬中：**一条测试若造不出「差异真的会显形」的那个状态，
+> 它钉住的就只是自己的 fixture。**
+
+> **M7 的杀手做过单独隔离验证，不是顺带被杀。** 把 T1 前面的内容断言全部剥掉、
+> **只留回滚那两行**重跑 M7，仍然红：
+> `AssertionError: a refused forget writes nothing to disk`，
+> diff 显示被拒的 forget 把 beta 那行重新写进了文件。**文件系统不在事务里**，
+> 「刷新必须严格在 `commitL1Mutation` 之后」这条只能由回滚路径来钉。
+
+### 🔴 第二轮打回（代码审查与 QA 独立指向同一处；按本仓惯例，打回与错误都留档）
+
+#### 阻断项 1：`forget` 因投影写失败而抛错，且不可恢复（**第一轮自己引入的回归**）
+
+第一轮的 `try/catch` **只包住了 `readdirSync`/`rmdirSync`**，而 `rmSync(path)`、
+`mkdirSync`、`writeFileSync` **全在保护之外**；而 `refreshProjection` 在
+`commitL1Mutation` **之后**调用，于是异常发生时 tombstone 已经落库。独立复现
+（`memories.md` 是**目录**时 `rmSync(path,{force:true})` 抛 EISDIR，
+`force` 只压 ENOENT，**无需特殊权限**）：
+
+```
+forget outcome: THREW: EISDIR: illegal operation on a directory
+DB row: {"status":"tombstone","title":"","body":""}
+retry outcome: THREW: memory 90b8a707-... is already forgotten
+=> SPLIT BRAIN + UNRECOVERABLE
+```
+
+死胡同链条：模型被告知失败 → 重试 → 被 `already forgotten` 拒绝 →
+**被遗忘的字节永久留在签入文件里，且再无任何路径能触发刷新**——恰好复活本轮
+要修的那个洞，还附送一条**不实的失败报告**。已确认 HEAD 不抛错，**确系本轮引入**。
+
+> 💡 **本轮最该记住的教训：注释写对了原则，实现只兑现了一半。**
+> `projection.ts` 的注释当时已经写着
+> **"a forget must not fail because tidying up did"**——**原则完全正确**，
+> 但那个 `try` 只套住了目录清理这一个调用，四个文件系统调用里保护了一个。
+> **一句正确的注释会让下一个读者（包括作者自己）以为规则已经生效**，
+> 从而比没有注释更危险。**判据：当注释声明了一条不变量，必须去数它覆盖了几个
+> 执行点**——这与本仓 D7–D9「一条规则两个实现」是同一族，只是这次的第二个
+> 「实现」是**注释本身**。
+>
+> **修法（收敛为「一条规则一个实现」）**：`projection.ts` 里那个只保护一半的
+> 局部 catch **整个收掉**（该函数现在**允许抛**），改由 `refreshProjection`
+> 内**单一** `try/catch` 兜住 `projectStore(...)` 整体。
+
+**`share` 的语义单独判定，结论是「不吞」**——它与 `forget` 走同一个方法，但
+`share` 是**发布**语义。判据不是「发布比删除重要」，而是
+**调用方只有在自己那份持久化工作已经成功时，吞掉错误才算诚实**：
+
+| | `forget` | `share` |
+|---|---|---|
+| 刷新前已落库的事 | tombstone **已提交**（删除**真的发生了**） | 只改了行的 `visibility`；**文件本身就是交付物** |
+| 若抛错 | 为**已完成**的工作报告失败，且重试被 `already forgotten` 拒 → **死胡同** | 可重试 |
+| 若吞掉 | 诚实：删除确实生效，投影是滞后的物化视图 | **不诚实**：人类批准了「提交给团队」，却报 "Shared." 而无字节落盘 |
+| 恢复路径 | 后续任意 `share`/`forget` 整表重投影自愈 | 实测：行保持 `team-shareable, human_confirmed=1`，**再 `share` 一次即整表重投影**（且**不会重复打扰人类审批**） |
+
+实现上**没有把 catch 复制两遍**：`refreshProjection` 返回
+`{ written, ok }`，`forget` **丢弃**返回值，`share` 在 `!ok` 时抛
+`MemoryAccessError`。**这个区分刻意不搭在 `create` 上**——`create` 回答的是
+「我可不可以创建文件」，`ok` 回答的是「失败要不要上报」，绑在一起会让两个
+无关问题互相牵制。三条测试钉住（T5/T6/T7，见矩阵 M8/M9/M10）。
+
+#### 阻断项 2：「零行分支是死分支」被证伪
+
+已在上文 `rmSync` 一节**保留原判断并标注证伪**，此处不重复。三处表述
+（`projection.ts` 函数 doc、`service.ts`、本页该小节）均已改为
+「**HEAD 上已可触发的缺陷，本轮顺带修掉**」。
+
+#### 绕过变异的处置判据（22 条里有实质意义的 6 条）
+
+| 编号 | 结论 | 判据 |
+|---|---|---|
+| **B5** 内联 `projectStore` | ✅ **补测试**（结构测试） | 「`refreshProjection` 是投影唯一写入点」是**整个设计的核心不变量**，而它**结构上不可被行为测试观察**——内联版在 happy path 上输出逐字节相同，差异只在 guard 与错误处理，恰恰是未来「这层间接没用」式整理会删掉的东西。故按本包 `guidance.test.mjs` 的既有先例**对 `src/` 断言**。**只断言调用点数量与所在方法，不断言调用行的写法**（第一版断言了整行文本，结果 M12 是被「行文本恰好变了」误杀的，属假阳性，已改） |
+| **B10** `storeFor(…, true)` | ❌ **不补测试**，注释声明 | **审查判错了，此项为等价变异**（详见下文「我认为审查判错的地方」） |
+| **B1** `store.kind === 'repo'` | ❌ **不补测试**，注释声明 | 注释自己已诚实声明「今天两者恒等」，**恒等的东西不可能有测试能区分**；能区分它的输入（group member 的 store）今天没有任何调用方造得出来。为它写测试等于**把实现拼写钉进测试** |
+| **B2** guard 3 检查目录 | ✅ **补测试**（并入 T2） | 实测**非等价且是真实泄漏**：给 checkout B 一个只含团队自有文件（`NOTES.md`）的签入 `.repo_memory/`——这正是新 clone 的常态——目录版会在 B 里**凭空生成 `memories.md`**，把已批准记忆发布进没人要求发布的 checkout。实测 `B got a fabricated memories.md: true`（目录版）vs `false`（文件版） |
+| **B4/B15** 返回值被忽略 / `written` 硬编码 | ✅ **补测试**（并入 T1） | `written` 是**对用户的陈述**（"N memory/memories now sit in …"），必须来自投影结果而非「刚刚分享了一条」这个事实。T1 本就连续分享两条，断言 note 依次为 `1` 与 `2`——**单条分享时「写了一行」与「永远说一行」不可区分**，两条才让差异显形（与 T2 的 fixture 退化同一族） |
+
+> 🔴 **第二轮自己又踩了一次「测试没造出差异显形状态」**（本仓第四次）。
+> T5 第一版用 `chmodSync(dir, 0o500)` 把**目录**设为只读，结果**所有变异体全部存活**。
+> 原因：**POSIX 下目录的写权限管的是「增删目录项」，不管「改写一个已存在的文件」**
+> ——实测 `writeFileSync` 写入 0o500 目录里**已存在**的文件**成功**。
+> 于是那条测试之所以绿，和「完全没有错误处理的构建」之所以绿是同一个原因：
+> **什么都没抛过**。改为 `chmodSync(file, 0o400)`（EACCES）后 M8/M10 立刻被它杀死。
+> **判据重申：一条测试必须先证明它设置的障碍真的会挡住东西。**
+
+### 我认为审查判错的地方（按要求直说）
+
+**B10「`storeFor(agent,false)` 改成 `true` 非等价，会凭空创建一个 repo 库」——
+这条不成立，它是等价变异。** 审查观察到的「forget 一条 personal 记忆后
+`repos/` 从无到有」是真的，但**归因错了**：那个目录**不是 `refreshProjection`
+创建的**。`forget` 的**第一行**就是
+`this.readableStores(agent, true)`（`true` 是既有代码，不是本轮改的），而
+`readableStores` 字面上是 `[storeFor(agent, openIfMissing), globalStore(…)]`
+——所以**控制流到达 `refreshProjection` 之前，repo 库就已经被打开了**。实测：
+
+```
+repos/ before: false
+repos/ after readableStores(agent,true) [forget 第一行]: true
+=> repo store 在 refreshProjection 之前就已打开: true
+=> storeFor(p,false) === storeFor(p,true): true
+```
+
+并且在**未修改的 HEAD** 上跑同一场景，`repos/` 同样从无到有
+（`[HEAD] repos/ after forget: ['284aba84…']`）——**这个副作用与本轮改动无关**。
+`openIfMissing` 到这一行时**已经无事可做**，两种写法返回**同一个对象**。
+故 M16 存活**不是覆盖缺口，而是逻辑必然**，与 B1 同类。保留 `false` 的理由只是
+**表达意图**（本方法读取 store，不负责创造 store），已写进注释；**不为它补测试**，
+因为那会把一个可证明不可观察的拼写钉死。
+
+> 顺带确认审查的另一条**是对的**：**guard 2 非冗余**。`deriveRepoIdentity` 有
+> memo 而 `deriveWorkspaceRoot` 没有，会话中途删除 checkout 即可让两者分叉——
+> 实测 identity 仍返回旧值（memo 命中）、workspace 返回 `undefined`。已在
+> `refreshProjection` 注释里补了这一行说明。
+
+### 方案评审第一轮自己犯的错（按本仓惯例留档）
+
+**它提出的替代 guard 与它否决的 guard，在 `forget` 的整个定义域上恒等**——
+穷举 6 种输入 **6/6 全同**——**却被当成两条不同的规则**。
+「换一种拼写」被误认为「换一条规则」，**是 D7–D9 那条失效模式的镜像**。
+真正的理由不是「今天更严」（今天不更严），而是「明天 group member 被并入时
+只有一种拼写还成立」——这条理由已写进 `refreshProjection` 的注释。
+
+### 取数陷阱（本轮第三次咬人，与 v0.4.11/v0.4.12 同型）
+
+**测试从 `lib/` 导入，而 `npm run verify` 编译 `src/`。** 改了 `src/` 必须
+`npm run build` 后测试才看得到。**做变异时 `git checkout` 还原 `src/` 并不还原
+`lib/`**——本轮的做法是先 `cp -r src /tmp/srcbak`，每个变异从副本重建 `src/`
+再 `npm run build`，收尾时同样从副本还原并重新 build。
+
+> 另一个本轮踩到的坑：`node --test test/` 在本仓不展开（报
+> `Cannot find module .../test`），必须用 `npm test`（其脚本是
+> `node --test "test/*.test.mjs"`）。变异矩阵若因此「零失败」，那是**没跑测试**，
+> 不是**测试全绿**——第一次跑出的 `tests 1 / fail 1` 就是这个。
+
+### 📋 本轮登记的待办（未排期）
+
+| # | 事项 | 现状（本轮实测） | 处置判据 |
+|---|---|---|---|
+| M | 🟡 **`propose({replaces})` 替换已分享记忆时投影保留旧版** | 替换行是 `visibility='repo-local', human_confirmed=0`，**结构性不可投影**；若顺手刷新，`written=0`，团队文件里那条**人类批准过的**记忆凭空消失，而**没有任何替代品被发布** | 判据**不是**「够不够得着 workspace」（**够得着**——这正是本轮范围判据必须写成「有没有对投影作出陈述」的原因），而是**替换的正确语义是什么**：静默撤回一条人类批准过的分享与投影三道闸的精神冲突，**正确答案可能是提示重新审批**而非自动刷新。属产品策略，需自己的判据 |
+| N | 🟡 **decay（双向）/ reconcile（supersede）使投影陈旧，结构性不可修** | 实测 `src/pipeline/*.ts` **8 个文件全文 `cwd` 出现 0 次**——管线**根本够不到 workspace** | **与 D9 同类、却是唯一无法下沉到同一手法的实例**：D9 用 schema 触发器解决，而 **SQLite 触发器写不了文件**。若将来要修，**必须先决定「job 是否有权知道 workspace」**——属架构级问题，不可顺手做 |
+| O | 🟢 **跨 checkout 投影陈旧（`forget` 与 `share` 同型）** | **已知局限而非缺陷**：实测未修改的 HEAD 上 `share` 就已如此（见上文 A/B 实测）。任意后续 `share` **自愈** | 修它需要「一个 store 记住 N 个 checkout」的机制，**已评估否决**：最后写者赢 / meta 里的本地路径不可信 / 把读判据升级成写权限来源**违反 D1**。**登记以免后来者误以为是本轮引入的** |
+
+> **上一轮（v0.4.12）的页首摘要，原样保留：** `runReconcileJob` 把**生成的派生层
 > 摘要当成「已存下的记忆」**交给模型查重——全仓 8 个消费方里唯一漏掉 `derived`
 > 过滤的一处。**会静默且永久地丢掉写入**（模型判 `drop`，摘要随后被 D9 触发器
 > 删光），并能造出**两条互相矛盾的 active 行**。修法是**删掉手写 SQL、复用
 > `queryAllMemories`**。**这一轮不是行为零变化**：9 个生产库中 5 个窗口改变，
 > 但**只有 `5ed2b4d2` 一个库真正跑过这条路径**。测试 245 → **248 / 0 fail**。
 > **无 schema 改动。** 这是本页少见的**修数据丢失**而非「行为零变化」的一轮。
-> **每次工作结束时更新本页**，它是新会话的唯一入口。
 >
 > 版本序（**取数时刻 2026-09-03 12:03**）：装机 **0.4.11**，插件落盘
 > **2026-09-03 09:11:50**，进程启动 **2026-09-03 09:12:05**（PID 1147946）——

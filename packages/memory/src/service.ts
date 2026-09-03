@@ -4,6 +4,8 @@
  * @module @strataloom/dsh-memory/service
  */
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { isLineagePrincipal, isLiveAgent } from './identity.ts'
@@ -163,6 +165,179 @@ export class MemoryService extends Service {
     return [this.storeFor(agent, openIfMissing), this.globalStore(openIfMissing)].filter(
       (store) => store !== undefined,
     )
+  }
+
+  /**
+   * The ONLY writer of the workspace projection. Returns rows written.
+   *
+   * `<workspace>/.repo_memory/memories.md` is a materialized view of the one
+   * SELECT in `projectStore`, living outside the database on a filesystem that
+   * no transaction covers. Every capability that changes what that SELECT
+   * would return has to come back through here, or the file states something
+   * the store no longer says. D5 names the projection as one of the four read
+   * surfaces `forget` must close; before this method existed the only caller
+   * of `projectStore` was `share`, so `forget` cleared title/body in the
+   * database and left the same bytes sitting in the checked-in file.
+   *
+   * Three guards; any one of them failing means "not mine to write", 0.
+   *
+   * 1. `store === this.storeFor(agent, false)` — NOT `store.kind === 'repo'`.
+   *    Today the two are indistinguishable: `forget` picks its store from
+   *    `readableStores`, which is literally `[storeFor(agent, …),
+   *    globalStore(…)]`, so over that domain the two predicates agree on every
+   *    input. The identity form is chosen for the future the comment above
+   *    `readableStores` warns about: a "let's use one store list everywhere"
+   *    tidy-up that folds group members in. A group member's store is also
+   *    `kind === 'repo'`, so the kind test would authorise a projection write
+   *    into SOMEONE ELSE'S checkout; identity against this session's own store
+   *    cannot. Same answer today, different answer on the day that matters.
+   *
+   *    UNTESTED ON PURPOSE, and this comment is the guarantee instead. Both
+   *    `store.kind === 'repo'` and `storeFor(agent, true)` were mutated in and
+   *    survived all 256 tests. Neither survival is a coverage gap:
+   *      - `kind === 'repo'` is the equality this paragraph already declares.
+   *        A test that could tell the two apart would need a group member's
+   *        store to reach here, which is precisely the future this spelling
+   *        exists to be ready for and which no call site can produce today.
+   *      - `storeFor(agent, true)` is EQUIVALENT here, not merely
+   *        indistinguishable. `forget`'s first act is
+   *        `readableStores(agent, true)`, which has already opened this
+   *        session's repo store before control ever reaches this line, so the
+   *        `openIfMissing` flag has nothing left to create and both calls
+   *        return the same object (measured). The reviewer's report that
+   *        `true` would "conjure a repo store when forgetting a personal
+   *        memory" was checked and does not hold: `repos/<key>/` appears
+   *        during a personal `forget` on UNMODIFIED HEAD too, created by that
+   *        first `readableStores` call and not by anything this method does.
+   *        `false` is kept because it states the intent — this method reads a
+   *        store, it does not bring one into being — not because it changes
+   *        an outcome.
+   *    Writing tests for either would pin an implementation spelling that is
+   *    provably unobservable, which this repository treats as a cost.
+   *
+   * 2. A workspace root must exist. No git work tree ⇒ nowhere a projection
+   *    belongs. NOT redundant against guard 1, though it looks it: guard 1
+   *    passing means `deriveRepoIdentity` found a repo, and one might assume
+   *    `deriveWorkspaceRoot` must then find a root too. They can diverge,
+   *    because only `deriveRepoIdentity` is memoised. Delete the checkout
+   *    mid-session and the memo keeps answering with the old identity while
+   *    `deriveWorkspaceRoot` re-runs `git rev-parse` and returns `undefined`
+   *    (measured). Guard 1 passes, guard 2 stops us joining a path onto
+   *    nothing.
+   *
+   * 3. `create === false` requires the projection file to already exist here.
+   *    This guard answers a smaller question than the one it looks like it is
+   *    answering, because the larger one has no answer: `deriveRepoIdentity`
+   *    hashes the REMOTE URL while the projection lives in a LOCAL checkout,
+   *    so one store maps to N checkouts (two clones of the same origin share a
+   *    store key exactly). Nothing reachable from a store can tell us which
+   *    checkout holds a projection file. So this does not ask the global
+   *    question "where are all the projections?" — it asks the local one that
+   *    always has a definite answer: "is there a materialized view HERE that
+   *    is mine to maintain?" `share` passes `create = true` because it is
+   *    publishing; `forget` passes `false` because it is only refreshing what
+   *    already exists, and must never conjure a projection file into a
+   *    checkout that had none.
+   *
+   *    This `existsSync` does NOT make the file an input (ADR 0001 forbids
+   *    that): both branches write content determined solely by the store, and
+   *    the file's CONTENT has zero influence on the result. Only its presence
+   *    selects between "refresh" and "do nothing".
+   *
+   * The cross-checkout staleness that survives guard 3 is INHERITED, not
+   * introduced: on unmodified HEAD, a `share` performed in checkout B already
+   * left checkout A's file stale. Guard 3 makes `forget` behave exactly like
+   * `share` across checkouts for the first time — a convergence, not a new
+   * exception. Any later `share` in a given checkout reprojects the whole
+   * table there and heals it.
+   *
+   * DELIBERATELY NOT routed through here — and the test is "does the
+   * capability make a STATEMENT about the projection?", not "can it reach a
+   * workspace?". The reach test is refuted head-on by the first entry, which
+   * reaches one perfectly well:
+   *
+   *   - `propose({ replaces })` supersedes a row that may already be shared,
+   *     so the file keeps the old wording. It promises nothing about the
+   *     projection, and refreshing it would be WORSE than leaving it: the
+   *     replacement row is `visibility = 'repo-local', human_confirmed = 0` —
+   *     structurally unprojectable — so the refresh writes 0 rows and silently
+   *     retracts a share a human approved, publishing nothing in its place.
+   *     Silently un-sharing approved content contradicts the three gates. What
+   *     the right semantics are (probably: ask for re-approval) is a product
+   *     question needing its own criterion, not a call site.
+   *   - `runDecayJob` (sleep AND revive) and `runReconcileJob` (supersede →
+   *     archived) both change the projected set and cannot reach a workspace
+   *     at all: `src/pipeline/*.ts` never sees a `cwd`. They are the same
+   *     species as the derived-invalidation gap D9 solved with a schema
+   *     trigger, and the one instance where that technique does not transfer,
+   *     because a SQLite trigger cannot write a file.
+   *
+   *     `runDecayJob` is also the concurrent writer that refuted this change's
+   *     original claim that `projection.ts`'s zero-row branch was dead until
+   *     `forget` arrived. It runs off `ctx.interval` while `share` is parked
+   *     on `await approval.request(...)`, and `share`'s UPDATE is guarded by
+   *     `AND status = 'active'` — so a row that falls asleep inside the
+   *     approval window is never promoted, and `share` itself projects zero
+   *     rows. Recorded here because it makes the same point from the other
+   *     side: this method is not the only thing that changes what the
+   *     projection should say, merely the only thing that WRITES it.
+   *
+   * THE SINGLE HANDLER FOR "the projection write failed". `projectStore`
+   * touches a filesystem no transaction covers and can throw for reasons the
+   * store knows nothing about: a read-only `memories.md`, a `memories.md`
+   * that is a directory (EISDIR, which `force: true` does NOT suppress), a
+   * full disk, a revoked permission. It is caught HERE, once, rather than
+   * inside `projectStore`, because whether such a failure is fatal is the
+   * CALLER'S question and not the writer's.
+   *
+   * `ok` is what lets both callers answer it honestly without a second
+   * try/catch anywhere:
+   *
+   *   - `forget` must NOT fail. Its refresh runs after `commitL1Mutation`, so
+   *     the tombstone is already durable; throwing from here would report a
+   *     failure for work that is permanently done. Measured, before this
+   *     handler existed: `forget` threw EISDIR, the row was already
+   *     `{status: tombstone, title: '', body: ''}`, the forgotten bytes stayed
+   *     in the checked-in file, and the retry the error invites was refused
+   *     with "already forgotten" — a split brain with no path back, which
+   *     re-opened the very D5 hole this change exists to close and attached a
+   *     false failure report to it. Swallowing is the honest answer only
+   *     because the deletion genuinely happened.
+   *
+   *   - `share` must NOT swallow. It is a PUBLISH: a human was asked "commit
+   *     this so your team sees it" and said yes. Reporting "Shared." when no
+   *     bytes reached the disk is its own dishonesty, and unlike `forget` it
+   *     is recoverable — the row stays `team-shareable, human_confirmed = 1`
+   *     and re-running `share` re-projects the whole table (measured: a second
+   *     `share` of an already-shared row returns `shared: true` and rewrites
+   *     the file), so an error the model can retry is actionable rather than a
+   *     dead end.
+   *
+   * The asymmetry is therefore NOT "publish matters more than delete". It is
+   * that the caller can only be truthful when the durable half of its work
+   * already succeeded. `forget`'s had; `share`'s file IS the deliverable.
+   * The distinction rides on `ok`, not on a duplicated catch, and not on the
+   * `create` flag — those two answer different questions and conflating them
+   * would tie "may I create the file?" to "may I hide an error?".
+   */
+  private refreshProjection(
+    store: OpenStore,
+    agent: Agent,
+    create: boolean,
+  ): { written: number; ok: boolean } {
+    if (store !== this.storeFor(agent, false)) return { written: 0, ok: true }
+    const workspace = deriveWorkspaceRoot(agent.session.header.cwd ?? '')
+    if (workspace === undefined) return { written: 0, ok: true }
+    if (!create && !existsSync(join(workspace, PROJECTION_DIR, PROJECTION_FILE))) {
+      return { written: 0, ok: true }
+    }
+    try {
+      return { written: projectStore(store, workspace).written, ok: true }
+    } catch (error) {
+      // Operators get the real cause; the caller gets a fact it can act on.
+      this.ctx.logger.warn('strataloom: projection refresh failed:', error)
+      return { written: 0, ok: false }
+    }
   }
 
   /**
@@ -817,10 +992,24 @@ export class MemoryService extends Service {
         )
         .run(Date.now(), id)
     })
-    // cwd is present: `storeFor` already required a repo to reach this point.
-    const workspace = deriveWorkspaceRoot(agent.session.header.cwd ?? '')
-    const written =
-      workspace === undefined ? 0 : projectStore(store, workspace).written
+    // Publishing: `create = true`, because this is the call that is allowed to
+    // bring the projection into existence. cwd is present — `storeFor` already
+    // required a repo to reach this point.
+    //
+    // A failed write is RAISED here, unlike in `forget`. The file is what a
+    // human just approved into existence; "Shared." over an unwritten file
+    // would be a false statement about the deliverable itself. The row keeps
+    // `team-shareable, human_confirmed = 1`, so retrying `share` re-projects
+    // and heals — the model is handed something it can actually do.
+    const projection = this.refreshProjection(store, agent, true)
+    if (!projection.ok) {
+      throw new MemoryAccessError(
+        `${id} was approved and marked shareable, but ${PROJECTION_DIR}/${PROJECTION_FILE} ` +
+          'could not be written, so nothing is shared with your team yet. Fix the path ' +
+          '(it may be read-only, a directory, or on a full disk) and share again.',
+      )
+    }
+    const written = projection.written
     return {
       id,
       shared: true,
@@ -918,6 +1107,30 @@ export class MemoryService extends Service {
         .get(id) as { n: number }
       return count.n
     })
+    // D5's fourth read surface. The other three close inside the database —
+    // recall and context by query predicate, the derived layer by the schema
+    // trigger — but the projection is a materialized view on disk, and a
+    // cleared row changes what it should say without changing the file.
+    //
+    // STRICTLY AFTER `commitL1Mutation`, never inside or before it. The file
+    // system is not in the transaction: a refresh that ran first would rewrite
+    // the checked-in file, and any rollback below it (an already-forgotten id,
+    // a derived row, a failed statement) would leave the repository asserting
+    // a deletion that never happened. The store is the truth; the projection
+    // may only ever follow a truth that is already committed.
+    //
+    // `create = false`: refresh a projection that exists here, never create
+    // one. Personal memories live in the global store and are filtered out by
+    // guard 1 (ADR 0001: Personal is never projected).
+    //
+    // The return value is deliberately DISCARDED, and this is the one place
+    // where a failed projection is not allowed to become a failed call: the
+    // tombstone above is already committed, so throwing would report a failure
+    // for work that is permanently done and push the model into a retry that
+    // `already forgotten` refuses. `refreshProjection` has logged the cause
+    // for whoever can fix the path. Any later `share` or `forget` in this
+    // checkout re-projects the whole table and heals the file.
+    this.refreshProjection(store, agent, false)
     return {
       id,
       suppressedRefs,
