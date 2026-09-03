@@ -1,6 +1,232 @@
 # 当前状态
 
-> 最后更新：2026-09-03 · **v0.4.14 已发布**：`schema.ts` 的注释写着
+> 最后更新：2026-09-04 · **v0.4.15 已发布**：`queryAllMemories`
+> （`service.list()` 背后那条读，即「你都记住了我什么？」这个面）的谓词
+> `status = 'active' AND derived = ${LAYER.RAW}` **在自己域内零测试覆盖**——
+> 全部保护来自 **reconcile 侧一条测试**，而它的 fixture **只造 L2**。
+> 于是「挡住 L2、放行 L1/L3」的变异**全量全绿**：`!= SCENARIO` 与
+> `<= SUMMARY` 双双 **265/265/0 存活**。
+> 🔴 **今天真实可达，不是理论缺口**：`list()` 读 **global 库**，而 L3 画像正住在那，
+> 生产 global 库**今天就有 1 条**。泄漏后 `command.ts` 在它旁边印
+> `Remove one with /memory forget <id>`，而 `forget` 对派生 id **明确拒绝**——
+> **用户被展示一条唯一可用操作必然失败的行**。
+> **产品行为零变化**（`git diff -- src/` 为空）：HEAD 的谓词是对的，缺的是钉子。
+> 测试 265 → **271 / 0 fail**。结项 **待办 K**。
+> ⛔ **本轮证伪了待办 K 自己的判据**（「`!= SCENARIO` 今天不可达」）：那条推理
+> **只清点了 reconcile 一个消费方**，漏掉了 `list()`——而 `list()` 正是读 global 库的那个。
+> 按本仓惯例**保留原判断＋标注证伪**，见下节。
+>
+> 🔴 **代码审查打回 4 项、QA 通过但查出 1 条存活变异，均已补**：其中最重的是
+> **测试把一个已知错误行为固化了**（装上正当修复后该断言转红，即测试会**阻挡修复**）、
+> 以及 helper 的 `provenance = 'human'` 是**抄来的结论**（换成非 injectable 值后
+> 变异 P 的杀手从 1 变 4）。**QA 用「按调用点逐个单独削弱」找到第三个执行点零覆盖**
+> （暴露面是已钉住那个的 **19 倍**），**本轮一并补掉而非登记**——理由见下节。
+> **每次工作结束时更新本页**，它是新会话的唯一入口。
+>
+> ⬇️ 以下 v0.4.14 一节及更早各节仍然有效（v11 库不可被 0.4.13 及更早打开的警告同样仍有效）。
+
+## 🆕 v0.4.15：一条谓词三个轴、三个执行点，全部零覆盖（**只补测试，产品零改动**）
+
+**本轮结项 v0.4.12 登记的待办 K。**
+
+### 判据：变异存活，且存活的那一半正好是生产上有数据的那一半
+
+`src/store/fts.ts` 的 `queryAllMemories`：
+
+```sql
+WHERE status = 'active' AND derived = ${LAYER.RAW}
+ORDER BY updated_at DESC LIMIT ?
+```
+
+改动前实测（每次改 `src` → `npm run build` → 跑**全量**）：
+
+| # | 变异 | 改动前 | 改动后 |
+|---|---|---|---|
+| **K** | `derived != ${LAYER.SCENARIO}`（放行 L1+L3） | **265/265/0 存活** | 271/268/**3** |
+| **K2** | `derived <= ${LAYER.SUMMARY}`（只放行 L1） | **265/265/0 存活** | 271/270/**1** |
+| K3 | `derived != ${LAYER.PERSONA}`（放行 L1+L2） | 265/262/3 | — |
+| **S** | 删掉 `status = 'active' AND` | **存活** | 271/267/**4** |
+| **P** | 加上 `AND provenance IN (${INJECTABLE_LIST})` | **存活** | 271/266/**5** |
+| **R** | 只把 `service.ts:474` repo 分支换成绕过本函数的裸 SQL | **270/270/0 存活** | 271/270/**1** |
+
+**规律很干净**：只要变异**放过 L2** 就被 reconcile 侧抓到，只要**挡住 L2 而放行 L1/L3**
+就全量全绿——因为 reconcile 的全部 fixture 只造 `SCENARIO`。**今天的保护不是「谓词被钉住了」，
+而是「reconcile 的 fixture 恰好造了那一层」。**
+
+### 危害今天可达，且被钉住的是小的、没钉住的是大的
+
+`queryAllMemories` 有**四个**消费方，本轮之前只有第一个被钉：
+
+| 调用点 | 读哪个库 | 改动前覆盖 |
+|---|---|---|
+| `reconcile.ts:131` | repo 库 | ✅ 唯一的钉子 |
+| `service.ts:474` `list()` repo scope | repo 库 | ❌ 零 |
+| `service.ts:477` `list()` personal scope | **global 库** | ❌ 零 |
+| `service.ts:488` `list()` group member | 别人的 repo 库 | ❌ 零 |
+
+9 个生产库只读副本实测（用**生产函数**，非手写 SQL）：
+
+```
+active / derived=0   425      superseded / derived=0  74
+active / derived=2    19      archived   / derived=0   9
+active / derived=3     1      tombstone  / derived=0   2
+```
+
+用生产函数打真实 global 库副本：
+
+```
+HEAD:   queryAllMemories -> 22 rows;  leaked derived: 0
+MUTANT: queryAllMemories -> 23 rows;  leaked derived: 1  -> [preference] How to work with this user
+```
+
+用**完整生产调用链 `service.list()`** 复现（真 git 仓、真 registry、画像按生产形状写）：
+
+```
+=== HEAD ===   scope=personal rows=1 -> ["speaks Chinese"]
+=== MUTANT === scope=personal rows=2 -> ["speaks Chinese","How to work with this user"]
+               ...but forget REFUSES it: "portrait is a generated summary, not a stored memory"
+```
+
+**后果不是「多一行」**：`command.ts:92` 调 `list()`，`command.ts:110` 印
+`Remove one with /memory forget <id>`，而 `service.ts:1096` 对派生 id 抛错。
+**唯一被提供的操作，对被展示的那一行必然失败。**
+
+### 为什么是补测试，不是下沉到 schema
+
+本仓既定原则「读路径过滤只让行不可见、不让它不可达，故应下沉到 schema」（待办 p / v0.4.14）
+**在这里不适用**，而且有**反证**：`schema.ts` 的 `guard_derived_status_insert`
+**要求**派生行必须是 `active`。若把「list 不该看见它」下沉进 schema，就得让派生行非 active
+——**与 v11 触发器直接冲突**。
+
+区别在于：那条原则管的是**哪些数据可以存在**；而这里派生行**本就合法且必须 active**，
+争议只在**某个读取面该不该返回它**——那是一个正当的查询谓词，不是该下沉的不变量。
+故**不加任何产品机器**，`git diff -- packages/memory/src/` **为空**。
+
+### ⛔ 本轮证伪的前提（保留原判断 ＋ 标注证伪）
+
+**待办 K 的判据栏写「`!= SCENARIO` 那个变异**今天不可达**」，理由是
+「repo 库的 rebuild 只写 SCENARIO，PERSONA 由 D2 限死在 global 库，而 reconcile
+够不着 global 库」——❌ 证伪。**
+
+**这条推理链每一步都是真的，结论却是假的**：它默认了「reconcile 是唯一消费方」。
+而 `service.ts:477` 正是拿 `queryAllMemories` 去读 **global 库**，且生产 global 库
+**今天就有一条 L3 行**。**这是清点错误，不是推理错误**——值得单独记一类，
+因为下一次还会以同样形式复发：**论证「不可达」时必须先枚举全部消费方**。
+
+### 三个轴，不是一个
+
+代码审查指出：`queryAllMemories` 是同族三个查询里**唯一不带 `provenance IN (...)` 的**
+（`fts.ts:61` 与 `fts.ts:116` 都带）。「`list()` 故意不看 provenance」是本查询一条
+**真实且脆弱**的性质——`list()` 是**评审面**，用户最需要复核的恰恰是流水线自动写入的
+`tool-output`/`subagent` 行，它们永远进不了注入包。故本轮钉的是**三个轴**：
+
+| 轴 | 钉法 | 变异验收 |
+|---|---|---|
+| 层 | 对 `DERIVED_LAYERS` **三个独立 `test()`**（不是一个 test 里的循环） | K 让 **L1 红、L3 红、L2 独绿**——「哪一层漏了」可读出来 |
+| 状态 | **全部 5 个**非 active 状态各一行（不取代表值） | 退化成单一 `dormant` 后 `ARCH` 变异即漏网 |
+| provenance | 存活行里**至少一条 `tool-output`**（非 injectable） | 换回 `human` 后 P 的杀手**从 4 掉到 1** |
+
+**状态那一轴刻意不取代表值**，因为 v0.4.14 本轮刚修过「5 个状态只挡 1 个」——
+**本轮的尺子必须量到自己身上**。两个轴不能交叉在同一行上：
+`guard_derived_status_insert` 禁止非 active 的派生行。
+
+### 🔴 代码审查打回的 4 项（全部已修）
+
+#### 1（最重）：测试把一个**已知错误行为**固化了，且实测会**阻挡修复**
+
+`group.test.mjs` 原先断言 member 派生行的 `forget` 报错文案为
+`/belongs to group member repository/`。审查**真的把修复实现了一遍**（在 foreign 分支前
+判 `derived !== LAYER.RAW`，让它拿到正确的 "generated summary" 理由），lead **独立复核**：
+**268/267/1，唯一挂掉的就是这条**。
+
+即该断言钉的是**当前实现的偶然形状**而非不变量——它自称
+"a member row cannot reach the derived-id refusal at all"，修好后这句直接变假，
+而测试会以**红**的方式**拒绝**把它变真。且它**不是**该测试的杀伤力来源
+（删掉后仍独占杀死 member 调用点变异）。**已删除。** 验收：装上修复后 **271/0 全绿**。
+
+> **判据：钉「当前行为」与钉「不变量」是两件事。**「抽掉它，杀伤力是否下降」
+> 是区分二者的方法——不下降，它就是纯负担，而负担会在将来变成阻力。
+
+#### 2：helper 的 `provenance = 'human'` 是**抄来的结论**（待办 l 同型）
+
+`'human'` 恰好是 injectable 成员，**三个候选里最没鉴别力的一个**。实测：改成
+`tool-output` 而其余不动，变异 P 的杀手**从 1 变 4**——即那个默认值当时**不承载任何东西**。
+修法不是「换一个默认值」而是**取消默认值**：默认值就是「没说明理由就被继承的值」，
+改成必填后每行 fixture 必须自报它要验哪个 provenance。另配前提断言
+`!INJECTABLE_PROVENANCE.includes('tool-output')`——§2.3 哪天放宽了 injectable 集合，
+鉴别力会静默蒸发，这条会先红。
+
+#### 3：注释「L2/L3 保持绿」**没有执行点**（v0.4.13 同型）
+
+三层原是**一个 `test()` 里的 `for` 循环**，首层一抛后面**根本不执行**，node:test 只报一条结果
+——所谓「L2/L3 保持绿」**不可观测**。**已拆成三个独立 `test()`**（265→268→270 的 +2 来自这里）。
+验收：K 现在实测 **L1 红 / L2 绿 / L3 红**，注释承诺的诊断对比**真的可读出来**。
+
+#### 4：`deepEqual` + `LIMIT` 的**排序引信**
+
+派生行 `updated_at` 原写死 `9000`，而 `propose` 写 `Date.now()`（约 1.7e12），
+故派生行在 `ORDER BY updated_at DESC` 下**永远排最后**——恰是 `LIMIT` 最先切掉的位置。
+审查实测：把 `list(principal, 200)` 改成 `list(principal, 1)`，变异 K **变绿**。
+**已改为 `9_000_000_000_000`（排最前）**：`LIMIT` 只会先切 raw 行，**方向是安全的**。
+
+### 🟠 QA 通过，但用一个没人做过的实验查出**存活变异 R**
+
+QA 按 `list()` 的**三个调用点逐个单独削弱**（本仓判例：凡同一规则有多个执行点，
+变异必须**分别只改一个**——两个一起改是最弱的变异）：
+
+| 只削弱哪个调用点 | 唯一杀手 |
+|---|---|
+| `service.ts:477` personal | service 的 L3 那条 |
+| `service.ts:488` member | group 3b |
+| **`service.ts:474` repo** | **0 条，270/270/0 存活** |
+
+根因：**全仓没有任何测试断言 repo scope 列表的内容**（`grep "scope.kind === 'repo'" test/` 零命中）。
+
+**本轮补掉而非登记**，判据是**暴露面**与**自洽性**：
+
+```
+repo scope   (当时未钉住): 19 条 active 派生行，分散在 4 个生产库
+personal scope (已钉住)  :  1 条
+```
+
+`rebuild.ts:352` 对非 global 库写 `LAYER.SCENARIO`，故 **repo 库才是 L2 的常态归宿**——
+**被钉住的是小的，没钉住的是大的（19 倍）**。且本轮既然已决定「三个执行点要各自钉住」
+（方案评审必须项 3），**留下第三个不钉**就正是 v0.4.13「四个读取面只关三个」、
+v0.4.14「5 个状态只挡 1 个」的同一形状。**本轮的尺子必须量到自己身上。**
+
+补后三个执行点**一一对应、互不兜底**（lead 独立复核）：
+
+```
+widened service.ts:474 -> 唯一红: list(): a repo-scope L2 scenario block ...
+widened service.ts:477 -> 唯一红: list(): the L3 portrait in the global store ...
+widened service.ts:488 -> 唯一红: 3b. a member store contributes its RAW rows only
+```
+
+### 取数陷阱（本轮再次咬人，且咬了四个 agent 里的三个）
+
+- **「还原 src」不等于「还原」。** 测试与探针都从 `lib/` 导入，`npm run build` 才把
+  `src/` 编译进去。**lead 本人在第一次探测时就栽了**：`cp` 还原了 `fts.ts` 却没 build，
+  于是读到 HEAD **有 3 行泄漏**这种不可能的读数；QA 也栽了一次（还原脚本没还原自己手改的
+  测试文件）。**还原 = 还原 src + 重新 build + 复跑确认读数回到基线**，三步缺一不可。
+- **🆕 变异 `queryAllMemories` 时会误伤 `queryPersonaSources`。** `fts.ts:115` 与
+  `fts.ts:143` 的谓词 `WHERE status = 'active' AND derived = ${LAYER.RAW}`
+  **逐字节相同**，粗心的 `sed` 会一起改掉，读数随即失去意义。**变异器必须先断言替换目标唯一**
+  （QA 的脚本带三重保险，开工即救了它一次）。
+- **🆕 抽前提要抽的是「顺序」，不只是「有没有」。** D9 有 INSERT/UPDATE/DELETE **三个**触发器，
+  故 fixture 的失效方式有两种：**漏插**派生行，或**在派生行之后**还有任何 raw 写。
+  两者都会让「只回来 raw 行」**自动为真**。**一条在查询同刻采样的前提断言同时堵住两个洞**
+  ——本轮三条（后为四条）测试各配一条，实测两种抽法都能转红。
+
+### 本轮登记的待办
+
+| # | 事项 | 现状（实测 2026-09-04） | 处置判据 |
+|---|---|---|---|
+| 1 | 🟡 **`list()` 三个执行点钉的都是「派生层不泄漏」，`status = 'active'` 那一半在 `list()` 侧仍零覆盖** | 变异 S 的杀手全在 store 域与 reconcile 侧，**无一条 service/group 测试**。生产上非 active raw 行合计 **85**（superseded 74、archived 9、tombstone 2） | 与本轮补 R 同型，但**暴露面性质不同**：泄漏一条 superseded 行给评审面，其 `forget` 是**可用**的（它是 raw 行），故不构成「唯一操作必然失败」那条危害。登记而不修——判据是**下一次动 `list()` 的 scope 组装时一并补**，或有人真的报出「列表里出现了已被取代的记忆」 |
+| 2 | 🟢 **`fts.ts` 内部谓词拼写不一致，且与 `types.ts` 的书写约定相反** | `fts.ts:60` 用字面量 `derived = 0`，而 `fts.ts:115/143/223` 用 `${LAYER.RAW}`。**而 `types.ts:67` 明文写着**「every query that asks "is this an original memory?" is written `derived = 0`」 | **本轮明确不改**。方案原提议把 `fts.ts:60` 改成 `${LAYER.RAW}`（运行期 SQL 哈希实测**逐字节相同**，`d6064ea9…`，等价变异），但评审指出**方向反了**：字面量 `0` 才是 `types.ts` 登记的约定，只改 `fts.ts` 而不改 `types.ts` 会**把局部不一致升级成文档谎言**。要动就**两处一起动**，属独立选题。同族执行点还有 `decay.ts:44/50`、`projection.ts:110` |
+| 3 | 🟢 **member 派生行的 `forget` 报错理由是错的** | `forget` 只搜 `readableStores`（`service.ts:1066`），member id 走 `service.ts:1079` 的「属于其他仓库」分支，被告知「去那个 checkout 里删」——**而它根本不是可删的行**，任何会话都删不掉 | **本轮刻意不修也不断言**（原先那条断言正因固化此错误而被删）。修法已由审查与 lead 各自实测验证可行（foreign 分支前判 `derived !== LAYER.RAW`），**且现在装上它全量全绿**——即本轮的测试**不再阻挡**这次修复。留待独立一轮 |
+
+---
+
 > 「任何派生层都是**整层重建，从不逐行老化**」，而触发器只挡了 `dormant`
 > **一个**状态。实测 v10 库：`candidate`/`superseded`/`archived`/`tombstone`
 > 在派生行上**全部被接受且持久**——**5 个状态只兑现 1 个**，与 v0.4.13
@@ -908,7 +1134,7 @@ rebuild 完成 14 次   派生层存活合计 5.7h
 
 | # | 事项 | 现状（本轮实测） | 处置判据 |
 |---|---|---|---|
-| K | 🟡 **`queryAllMemories` 自身的谓词只被**部分**钉住，且钉子全在 reconcile 侧** | `status='active'`：简报预计变异存活（「继承来的空洞」），**实测被 R3 杀死**（泄漏进窗口的是 `candidate` 行）。但 `derived` 那一半**只钉住了一部分**——QA 实测 `derived = LAYER.RAW` 改成 `>=` 被杀，改成 **`!= LAYER.SCENARIO`（放行 L1/L3、只挡 L2）则 248 全绿存活**，因为全部 fixture 只造 `SCENARIO` 层。**本轮不改该函数** | 登记而非修。两点必须写清：（1）**该函数是与 `service.list()` 共用的**，将来为 `list()` 放宽谓词会**静默改变 reconcile 查重的集合**，而 `fts.ts` 自己的测试里**无任何直接守卫**——今天的保护全部来自 reconcile 侧的 R3，R3 一旦被改写或删除，保护随之消失；（2）`!= SCENARIO` 那个变异**今天不可达**（repo 库的 rebuild 只写 `SCENARIO`，`PERSONA` 由 D2 visibility 触发器限死在 global 库，而 reconcile 够不着 global 库），**但它是为下一个派生层准备的陷阱**。**判据是 `fts.ts` 域内是否需要一条本地测试** |
+| K | ~~🟡 **`queryAllMemories` 自身的谓词只被**部分**钉住，且钉子全在 reconcile 侧**~~ → **✅ 已结项**（v0.4.15，见本页顶部），**但本条的「今天不可达」被证伪** | `status='active'`：简报预计变异存活（「继承来的空洞」），**实测被 R3 杀死**（泄漏进窗口的是 `candidate` 行）。但 `derived` 那一半**只钉住了一部分**——QA 实测 `derived = LAYER.RAW` 改成 `>=` 被杀，改成 **`!= LAYER.SCENARIO`（放行 L1/L3、只挡 L2）则 248 全绿存活**，因为全部 fixture 只造 `SCENARIO` 层。**本轮不改该函数**（v0.4.14 上复测仍 **265/265/0 存活**，零覆盖持续到 v0.4.15） | ⛔ **本条现状栏为真、判据栏（2）为假，原文保留以便复核**。（1）**已按本条登记的判据实施**：`fts.ts` 域内确实需要本地测试，已补，并按**三个轴**（层／状态／provenance）各自钉住；（2）**「`!= SCENARIO` 今天不可达」错**——该推理**只清点了 reconcile 一个消费方**，漏掉 `service.list()`，而 `list()` 正是读 **global 库**的那个，生产 global 库**今天就有 1 条 L3 行**。用生产函数实测：HEAD 泄漏 0、变异体泄漏 1，且完整 `list()` 调用链复现。**这是清点错误而非推理错误——论证「不可达」必须先枚举全部消费方**；（3）**漏了执行点数**：本条只说「fts.ts 域内需不需要测试」，实际 `list()` 有**三个**调用点，QA 用「逐个单独削弱」查出 `service.ts:474` repo 分支零覆盖且**暴露面是已钉住那个的 19 倍**（19 行 L2 分散在 4 个库 vs 1 行 L3） |
 | L | 🟡 **`RECONCILE_EXISTING_LIMIT = 30` 才是 `5ed2b4d2` 上的主要限制** | 该库 **198 条 active raw 行**，HEAD 下窗口里只有 **26 条**真记忆（**13.1%**），修复后 30 条（**15.2%**）。**行数上限的影响远大于派生层泄漏** | **本轮明确不修**：调大 limit 会改变每一次 reconcile 的提示词与成本，属独立选题，需要自己的判据与实测。**登记以免后来者误以为本轮已解决查重覆盖率问题** |
 
 ## 🆕 v0.4.11：一条规则被 50 行注释论证，却没有一行测试守着（**行为零变化**）

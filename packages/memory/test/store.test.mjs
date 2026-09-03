@@ -9,10 +9,11 @@ import { migrate, MigrationError } from '../lib/store/schema.js'
 import { immediateTx } from '../lib/store/tx.js'
 import { APPLICATION_ID, TARGET_USER_VERSION } from '../lib/constants.js'
 import { StoreRegistry } from '../lib/store/store.js'
-import { toFtsPhrase } from '../lib/store/fts.js'
+import { queryAllMemories, toFtsPhrase } from '../lib/store/fts.js'
 import {
   DERIVED_LAYERS,
   DERIVED_PROVENANCE,
+  INJECTABLE_PROVENANCE,
   LAYER,
   MEMORY_STATUSES,
   PROVENANCES,
@@ -884,6 +885,173 @@ test('the stored bigrams and the query bigrams are the same rule', () => {
   db.close()
   cleanup(root)
 })
+
+/**
+ * One row of `memories`, with every column this domain varies exposed as an
+ * option. Written as one helper rather than three (`insertActive` /
+ * `insertDormant` / `insertDerived`) on purpose: the whole point below is that
+ * layer, status and provenance are three INDEPENDENT axes of one predicate, and
+ * per-shape helpers would hide which axis a fixture row is exercising.
+ *
+ * `provenance` carries NO default. A default is a value every row inherits
+ * without stating a reason, and provenance is precisely the axis this domain
+ * got wrong once already: `queryAllMemories` is the ONE member of its family
+ * that omits `provenance IN (INJECTABLE_LIST)` — `queryInjectableSet` and
+ * `queryPersonaSources` both carry it — so a fixture that never varies
+ * provenance cannot tell the omission from an oversight. Requiring the column
+ * forces every row below to name the provenance it exists to exercise.
+ */
+const insertMemory = (store, { id, title, at, provenance, status = 'active', derived = LAYER.RAW }) =>
+  store.db
+    .prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+       VALUES (?, 'fact', 'repo-local', ?, ?, 'body', ?, 0, ?, ?)`,
+    )
+    .run(id, status, title, provenance, at, derived)
+
+/**
+ * Human-readable layer names, so a failing case names the layer that escaped.
+ *
+ * Taken from `types.ts`'s own wording on each `LAYER` member, not invented.
+ * `SUMMARY` is deliberately NOT called "L1": that number belongs to `RAW` ("L1
+ * — an original memory"), and `types.ts` pointedly withholds an L-number from
+ * `SUMMARY`, describing it only as "the pre-L2 rollup". A display name that
+ * numbers it anyway would teach a reader of a FAILING test the wrong map of the
+ * very layers the failure is about.
+ */
+const LAYER_NAMES = {
+  [LAYER.SUMMARY]: 'pre-L2 rollup',
+  [LAYER.SCENARIO]: 'L2 scenario',
+  [LAYER.PERSONA]: 'L3 portrait',
+}
+
+/** Every lifecycle state `status = 'active'` is there to exclude — all five. */
+const NON_ACTIVE_STATUSES = MEMORY_STATUSES.filter((status) => status !== 'active')
+
+/**
+ * `queryAllMemories` is the read behind `service.list()` — the "what have you
+ * been remembering about me?" surface. All three properties of its WHERE clause
+ * (`status = 'active'`, `derived = LAYER.RAW`, and the absence of a provenance
+ * filter) had NO test in this domain; the only thing holding any of it was a
+ * single reconcile-side case whose fixtures build L2 and nothing else. Measured
+ * under exactly that regime, widening the layer conjunct to `derived !=
+ * LAYER.SCENARIO` — which lets an L1 rollup and the L3 portrait straight
+ * through — left the whole suite green at 265/265/0, and so did `derived <=
+ * LAYER.SUMMARY`. Deleting `status = 'active' AND` outright survived too.
+ *
+ * The gap is reachable today, not theoretical. `list()` reads the GLOBAL store,
+ * which is exactly where the L3 portrait lives, and the live global store
+ * carries one. Leaked, that row is displayed beside `command.ts`'s "Remove one
+ * with /memory forget <id>" while `forget` refuses every derived id — a user
+ * shown a row whose only offered action cannot succeed.
+ *
+ * ONE TEST PER LAYER, each with its own clean store, never one store carrying
+ * all three and never one `test()` looping over them. A loop is not three
+ * execution points: the first failing layer throws and node:test reports one
+ * result, so "L2 and L3 stayed green" — the part that says WHICH layer escaped —
+ * would be unobservable. Registered as three separate `test()` calls,
+ * `derived <= LAYER.SUMMARY` reds the L1 case alone and leaves L2/L3 green, and
+ * that contrast IS the diagnosis. Which layer leaks is the whole subject here.
+ */
+for (const layer of DERIVED_LAYERS) {
+  test(`queryAllMemories excludes derived layer ${layer} (${LAYER_NAMES[layer]}), every non-active status, and no provenance`, () => {
+    const { root, registry } = openRegistry()
+    const store = registry.open('k1')
+
+    // The provenance axis, stated as a premise rather than trusted. This
+    // fixture's surviving rows lean on `tool-output` being OUTSIDE the
+    // injectable set; if §2.3 ever widened that set, the discrimination would
+    // evaporate silently and this case would go on passing while testing less.
+    assert.ok(
+      !INJECTABLE_PROVENANCE.includes('tool-output'),
+      'tool-output must be non-injectable, or this case no longer separates the ' +
+        'review surface from the injection packet',
+    )
+
+    // D9's `invalidate_derived_insert/update/delete` delete the WHOLE derived
+    // layer on any raw INSERT, UPDATE or DELETE, so every raw write in this
+    // fixture comes first. The rule is not "the derived row is inserted last"
+    // but "no raw write follows it".
+    //
+    // `updated_at` is assigned against `ORDER BY updated_at DESC` on purpose:
+    // every row that must be EXCLUDED is given a HIGHER timestamp than every
+    // row that must survive. Under `LIMIT` that is the only safe direction —
+    // rows sorted last are the ones a shrinking limit silently drops, so
+    // parking the excluded rows there would let `LIMIT` mask a real leak and
+    // hand back a green test. Here a leak always lands at the head of the
+    // result and no limit can hide it.
+    //
+    // Two surviving rows, not one, and their provenances differ deliberately.
+    // `tool-output` is exactly what §2.3 keeps OUT of the injection packet, and
+    // it is the case for this query not filtering by provenance at all: the
+    // memories a user most needs to review are the ones the pipeline wrote
+    // without being asked. A fixture whose only survivor were `human` would be
+    // satisfied by `queryInjectableSet`'s predicate too, and so could not tell
+    // the review surface from the injection surface.
+    insertMemory(store, {
+      id: 'raw-pipeline',
+      title: 'learned from a tool result',
+      at: 3000,
+      provenance: 'tool-output',
+    })
+    insertMemory(store, { id: 'raw-human', title: 'a real memory', at: 2000, provenance: 'human' })
+    // The status conjunct's own witnesses — ALL FIVE non-active states, not one
+    // representative. `status = 'active'` excludes five states, and this repo
+    // has already shipped the failure of testing one of five and calling the
+    // set covered. The live global store alone holds `superseded` and
+    // `tombstone` rows, neither of which a single `dormant` row speaks for.
+    // These are RAW rows: `guard_derived_status_insert` forbids a non-active
+    // derived row outright, which is why the two axes must be varied on
+    // separate rows and can never be crossed on one.
+    NON_ACTIVE_STATUSES.forEach((status, index) =>
+      insertMemory(store, {
+        id: `raw-${status}`,
+        title: `a ${status} memory`,
+        at: 8000 + index,
+        provenance: 'human',
+        status,
+      }),
+    )
+    insertMemory(store, {
+      id: `derived-${layer}`,
+      title: `generated rollup at layer ${layer}`,
+      at: 9000,
+      provenance: DERIVED_PROVENANCE,
+      derived: layer,
+    })
+
+    // The PREMISE, sampled where the query runs rather than assumed — the
+    // lesson `derivedAtCommit` records in pipeline.test.mjs. Without it this
+    // case is inert in two directions at once: drop the derived INSERT and
+    // "only the raw active rows come back" is vacuously true, or misorder the
+    // fixture so a raw write lands after it and D9 has silently emptied the
+    // very layer under exclusion. One count closes both holes.
+    assert.equal(
+      store.db.prepare(`SELECT count(*) AS n FROM memories WHERE derived != ${LAYER.RAW}`).get().n,
+      1,
+      `the layer-${layer} row must REALLY be stored when the query runs — if D9 ` +
+        'took it away, or it was never written, this case excludes nothing',
+    )
+    assert.equal(
+      store.db.prepare(`SELECT count(*) AS n FROM memories WHERE status != 'active'`).get().n,
+      NON_ACTIVE_STATUSES.length,
+      `all ${NON_ACTIVE_STATUSES.length} non-active rows must really be stored too (layer ${layer})`,
+    )
+
+    assert.deepEqual(
+      queryAllMemories(store, 50).map((row) => row.id),
+      ['raw-pipeline', 'raw-human'],
+      `the review surface must show both raw active rows and nothing else at layer ` +
+        `${layer}: not the derived row (forget refuses every derived id, so listing ` +
+        'it offers an action that must fail), and not the non-active ones (leaving ' +
+        'every read surface IS what decay and supersession did to them) — while the ' +
+        'pipeline-written row IS shown, because reviewing what was recorded ' +
+        'unasked is the point of this surface',
+    )
+    registry.dispose()
+    cleanup(root)
+  })
+}
 
 test('foreign application_id is refused', () => {
   const root = tempRoot()

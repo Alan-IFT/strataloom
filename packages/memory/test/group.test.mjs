@@ -46,6 +46,7 @@ import {
   truncatedToBudget,
   SOURCE_LABEL_MAX_CHARS,
 } from '../lib/recall/render.js'
+import { DERIVED_PROVENANCE, LAYER } from '../lib/types.js'
 import { openRegistry, cleanup, fakeAgent, fakeCtx, tempRoot } from './helpers.mjs'
 
 /** A real git repo with a real remote — repo-key derivation shells out to git. */
@@ -284,6 +285,70 @@ test('3. after approval, foreign memories are recallable and their evidence is d
   const listings = await s.service.list(s.principal, 200)
   const group = listings.filter((l) => l.scope.kind === 'group')
   assert.deepEqual(group.map((l) => l.scope.source), [s.sources.backend, s.sources.frontend])
+  s.registry.dispose()
+  cleanup(s.root)
+})
+
+/**
+ * The THIRD consumer of `queryAllMemories` (service.ts's member-store branch),
+ * and the one whose failure mode is worst. Cases 2 and 3 above assert which
+ * BUCKETS the group contributes; neither says anything about which ROWS come
+ * out of a member store, so a widened layer predicate passed them both.
+ *
+ * Why this is the worst of the three: a leaked derived row from THIS store is
+ * the one a user has no way to act on. `forget` searches `readableStores` only,
+ * so a member id never reaches the derived-id branch at all and lands in the
+ * foreign-repository branch instead — advice about starting a session in that
+ * checkout, which cannot help with a row no session anywhere may forget.
+ *
+ * That misrouting is deliberately NOT asserted here. It is a defect in
+ * `forget`, not an invariant, and pinning it would make this test refuse the
+ * fix: measured, teaching `forget` to check `derived !== LAYER.RAW` before the
+ * foreign branch turns the whole suite green except an assertion demanding the
+ * OLD message. `forget`'s reasons belong to `forget`'s own cases (test 6
+ * already pins the foreign message for a raw member row); this case owns one
+ * claim only — which rows a member store contributes — and that claim is what
+ * kills the member-branch mutant.
+ */
+test('3b. a member store contributes its RAW rows only', async () => {
+  const s = setup({ declaration: GROUP_OF({ backend: '', frontend: '' }) })
+  writeFileSync(join(s.ws, GROUP_FILE), JSON.stringify(GROUP_OF(s.sources)), 'utf8')
+  // Every raw write first. D9's triggers retire the whole derived layer on any
+  // raw insert/update/delete, so `seed` must run before the rollup is planted
+  // or the fixture would quietly hold nothing to exclude.
+  seed(s.stores.parent, [{ title: 'parent deploy', body: 'p' }])
+  seed(s.stores.backend, [{ title: 'backend deploy', body: 'b' }])
+  seed(s.stores.frontend, [{ title: 'frontend deploy', body: 'f' }])
+  // `updated_at` is NEWER than every raw row here, and that direction is the
+  // load-bearing part. `queryAllMemories` orders `updated_at DESC` then applies
+  // `LIMIT`, so the oldest rows are the ones a cap drops: an excluded row given
+  // an old timestamp sits exactly where `LIMIT` would hide a leak and hand back
+  // a false green. Newest, a leak always surfaces at the head of the result.
+  s.stores.backend.db
+    .prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+       VALUES ('backend-rollup', 'fact', 'repo-local', 'active', 'backend deploy rollup', 'generated', ?, 0, 9000000000000, ?)`,
+    )
+    .run(DERIVED_PROVENANCE, LAYER.SCENARIO)
+
+  assert.equal(
+    s.stores.backend.db
+      .prepare(`SELECT count(*) AS n FROM memories WHERE derived != ${LAYER.RAW}`)
+      .get().n,
+    1,
+    'the rollup must really be in the member store when list() runs',
+  )
+
+  const listings = await s.service.list(s.principal, 200)
+  const backend = listings.find(
+    (l) => l.scope.kind === 'group' && l.scope.source === s.sources.backend,
+  )
+  assert.ok(backend, 'the backend member is listed')
+  assert.deepEqual(
+    backend.memories.map((m) => m.title),
+    ['backend deploy'],
+    'a member store contributes its raw active rows and nothing generated',
+  )
   s.registry.dispose()
   cleanup(s.root)
 })
