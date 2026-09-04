@@ -17,7 +17,7 @@ import { execFileSync } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { GUIDANCE_SECTION } from '../lib/tools.js'
+import { GUIDANCE_SECTION, registerTools } from '../lib/tools.js'
 import { GUIDANCE_BUDGET_TOKENS } from '../lib/constants.js'
 import { estimateTokens } from '../lib/recall/render.js'
 import { kindGuidance } from '../lib/types.js'
@@ -124,6 +124,74 @@ test('5. the kind criteria still reach the model through both schemas', () => {
   const uses = built.split('KIND_DESCRIPTION').length - 1
   assert.ok(uses >= 3, `expected a definition plus two schema uses, saw ${uses}`)
   assert.ok(kindGuidance().includes('true of THIS repo'), 'criteria text itself intact')
+})
+
+test("memory_forget's description is true of BOTH kinds of member row", () => {
+  // A tool description is prompt text the model reads BEFORE it acts, so a
+  // false clause in one is a false instruction, not a documentation nit. This
+  // one promised, unconditionally, that a refused member entry comes back
+  // "with the repository to run it in named in the refusal". That held while
+  // every member row got the ownership reason. It went FALSE the moment
+  // `forget` started answering a member's DERIVED row honestly: that refusal
+  // names no runnable destination, and must not, because none exists — no
+  // session anywhere can forget a generated summary.
+  //
+  // The assertion is on the TEXT, deliberately, and group.test.mjs 6c-6e
+  // already cover the behaviour. Behaviour-only assertions would let this
+  // sentence be deleted outright and stay green, which is the same gap test
+  // 17 closed for the approval prompt ("Nothing is ever written to them").
+  let forgetTool
+  registerTools(
+    { tools: { register: (tool) => { if (tool.name === 'memory_forget') forgetTool = tool } } },
+    {},
+  )
+  assert.ok(forgetTool, 'memory_forget must be registered')
+  const text = forgetTool.description
+
+  // Case 1 — a member RAW row: the repository named IS where the action can be
+  // taken, so the destination promise must survive for this kind.
+  assert.match(
+    text,
+    /stored entry recalled from a repo-group member is refused, naming the repository to run it in/,
+    'a member RAW row is refused with a runnable destination; the description must still say so',
+  )
+  // Case 2 — a member DERIVED row: no destination exists, and the description
+  // must say THAT rather than promise one.
+  assert.match(
+    text,
+    /generated summary/,
+    'the description must distinguish a generated summary from a stored entry',
+  )
+  assert.match(
+    text,
+    /no session/i,
+    'and must say a member summary is forgettable by no session, not merely elsewhere',
+  )
+  // And the REASON, which must be the true one. This assertion previously
+  // demanded /rebuilt|regenerated/ — i.e. it demanded the FALSE word, and so
+  // would have refused the correct wording. D9 runs `DELETE FROM memories
+  // WHERE derived != RAW` and enqueues nothing; a rebuild is queued only while
+  // `packetOverflows(store)` holds, so a dropped layer may never come back.
+  // Measured: after an unrelated raw write, derived goes 1 -> 0 and `jobs`
+  // stays 0.
+  assert.match(
+    text,
+    /dropped whenever that repository is written/i,
+    'the reason must be that the layer is DROPPED on any write to that repository',
+  )
+  assert.doesNotMatch(
+    text,
+    /rebuilt|regenerated/i,
+    'D9 deletes and enqueues nothing, so "rebuilt" promises the model an assurance the ' +
+      'system does not make',
+  )
+  // The old unconditional promise must be gone, not merely supplemented: left
+  // in place beside the new clause it is still a false sentence the model reads.
+  assert.doesNotMatch(
+    text,
+    /an entry recalled from a repo-group member is refused, with the repository to run it in named/,
+    'the unconditional destination promise is false for a member summary and must not return',
+  )
 })
 
 test('6. the production entry point executes the guard', () => {

@@ -1071,11 +1071,83 @@ export class MemoryService extends Service {
       // Before the generic "no such id", check whether it is a group member's
       // row: a caller who just recalled it needs to know it EXISTS and why it
       // cannot be forgotten here, not to be told it does not exist.
-      const foreign = (await this.groupMembers(agent)).find(
-        (member) =>
-          member.store.db.prepare(`SELECT 1 FROM memories WHERE id = ?`).get(id) !== undefined,
-      )
+      //
+      // The projection is `derived`, not `1`, so the LAYER of the matched row
+      // arrives with the match itself. This is deliberately not a second
+      // `.prepare` inside the branch below: "does this member hold the id" and
+      // "what layer is that row" are one question about one row, and asking
+      // them as two statements would be two implementations of it, free to
+      // disagree the moment either one moves.
+      //
+      // WHY THIS IS STILL A PURE READ, and why the warning above is untouched
+      // by it. `SELECT derived` reads the row `SELECT 1` already read and
+      // returns one more column of it: it opens no store the probe did not
+      // already open, and no statement here can write. It also sits OUTSIDE
+      // `commitL1Mutation` deliberately — a member store must never be handed
+      // a transaction, because a transaction is the shape a write takes, and
+      // the approval prompt's "nothing is ever written to them" is a promise
+      // about these very stores. Every exit below is a `throw`, so nothing
+      // reaches a member store on this path but this one SELECT.
+      let foreignRow: { derived: number } | undefined
+      const foreign = (await this.groupMembers(agent)).find((member) => {
+        foreignRow = member.store.db
+          .prepare(`SELECT derived FROM memories WHERE id = ?`)
+          .get(id) as { derived: number } | undefined
+        return foreignRow !== undefined
+      })
       if (foreign !== undefined) {
+        if (foreignRow !== undefined && foreignRow.derived !== LAYER.RAW) {
+          // A member's DERIVED row needs its OWN sentence, and this is why it
+          // cannot borrow either of the two that already exist. Both are true
+          // of the store this session owns and FALSE here, and a sentence
+          // whose truth value flips with the input domain is not shared, it is
+          // simply wrong in one of them:
+          //   - "start a session inside that checkout and retry" is advice
+          //     that DOES NOT WORK. Measured end to end: a session there
+          //     reaches the home derived branch below and is told to forget
+          //     the underlying memory instead. The caller follows the
+          //     instruction and arrives nowhere.
+          //   - "cannot be removed until a checkout exists again" promises a
+          //     future in which a checkout helps. For a derived row no
+          //     checkout, present or future, ever helps.
+          //   - "forget the underlying memory instead (recall it to get its
+          //     id)" is actionable at HOME, where the raw rows are in this
+          //     session's own hands. Across the group boundary those rows are
+          //     equally unforgettable from here, and the schema keeps no
+          //     derived→source mapping, so `recall` cannot even say which
+          //     memories to go after.
+          // Strike the false halves and what remains is the only honest
+          // answer: this row is never deleted row by row, because the whole
+          // derived LAYER is dropped the moment ANY raw row in that repository
+          // is written.
+          //
+          // Two words this sentence must NOT use. Both were in its first
+          // draft, and both are false — measured, not reasoned:
+          //   - NOT "rebuilt". D9's triggers run `DELETE FROM memories WHERE
+          //     derived != RAW` and bump `store_revision`. They enqueue
+          //     NOTHING. A rebuild is a separate job that
+          //     `enqueueRebuildIfOverflowing` queues only while
+          //     `packetOverflows(store)` holds, so once the raw set no longer
+          //     overflows, the layer never comes back at all. Measured: after
+          //     an unrelated raw INSERT/UPDATE/DELETE the derived count goes
+          //     1 -> 0 while `jobs` stays 0 throughout. Promising a rebuild
+          //     would be exactly the defect this branch exists to remove — an
+          //     assurance the system does not actually make.
+          //   - NOT "the memories it summarizes". D9 keys on ANY raw write in
+          //     that store, related or not; the measurement above used a row
+          //     this rollup does not summarize. That qualifier understates
+          //     when this happens, and is simply the wrong set.
+          throw new MemoryInputError(
+            `${id} is a generated summary in group member repository ${foreign.source}, not a ` +
+              'stored memory. No session can forget it directly — not this one, and not one ' +
+              'started inside that repository. It is dropped as a whole layer the moment any ' +
+              'memory in that repository is written, changed or removed, so it is never ' +
+              'deleted row by row.',
+          )
+        }
+        // A RAW member row keeps the ownership reason unchanged: for it the
+        // repository named here really is the one that can act, and the
+        // `archived` split really does describe two different situations.
         throw new MemoryInputError(
           `${id} belongs to group member repository ${foreign.source}, not to this session's ` +
             'repository. forget only acts on the repository this session is in. ' +

@@ -568,15 +568,34 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
   ctx.tools.register(
     defineTool({
       name: 'memory_forget',
+      // The last sentence is stated per KIND of member row, not once for both,
+      // and that is load-bearing rather than pedantic. It used to promise
+      // unconditionally that a member refusal "names the repository to run it
+      // in" — true of a member's raw row, and false the moment `forget`
+      // started answering a member's DERIVED row honestly, because that
+      // refusal names no runnable destination and must not, since none exists.
+      // A tool description is read by the model before it acts; a description
+      // that promises an actionable destination the refusal will not supply
+      // sends the model looking for one. Same defect shape as the v0.4.13
+      // "forget's note is an untrue statement" round, one layer further out.
+      //
+      // "dropped ... whenever that repository is written" and NOT "rebuilt":
+      // D9 deletes the derived layer and enqueues nothing, and a rebuild is
+      // queued only while the raw set still overflows its packet — so a
+      // summary may simply never return. The first draft of this clause said
+      // "rebuilt rather than deleted", which is precisely backwards. Measured
+      // in service.ts's derived branch comment.
       description:
         'Act on one stored memory by id (from memory_recall). By default it is ' +
         'permanently tombstoned; pass share:true to instead request the user\'s ' +
         'permission to share it with the team through the repository. Its ' +
         'content is cleared, it stops being recalled or injected, and the same ' +
         'source will not be auto-learned again. Only the top-level principal agent ' +
-        'may forget; subagent calls are refused. Acts on THIS repository only: an ' +
-        'entry recalled from a repo-group member is refused, with the repository to ' +
-        'run it in named in the refusal.',
+        'may forget; subagent calls are refused. Acts on THIS repository only: a ' +
+        'stored entry recalled from a repo-group member is refused, naming the ' +
+        'repository to run it in; a generated summary recalled from one is refused ' +
+        'as forgettable by no session at all, since the whole derived layer is ' +
+        'dropped whenever that repository is written rather than deleted row by row.',
       parameters: {
         id: { type: 'string', required: true, description: 'The memory id to act on.' },
         share: {

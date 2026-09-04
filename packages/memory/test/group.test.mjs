@@ -46,7 +46,7 @@ import {
   truncatedToBudget,
   SOURCE_LABEL_MAX_CHARS,
 } from '../lib/recall/render.js'
-import { DERIVED_PROVENANCE, LAYER } from '../lib/types.js'
+import { DERIVED_LAYERS, DERIVED_PROVENANCE, LAYER } from '../lib/types.js'
 import { openRegistry, cleanup, fakeAgent, fakeCtx, tempRoot } from './helpers.mjs'
 
 /** A real git repo with a real remote — repo-key derivation shells out to git. */
@@ -556,6 +556,450 @@ test('6b. an archived member says plainly that the entry cannot be forgotten at 
     s.stores.archived.db.prepare(`SELECT status FROM memories WHERE id = ?`).get(id).status,
     'active',
   )
+  s.registry.dispose()
+  cleanup(s.root)
+})
+
+/**
+ * 6c-6g: the refusal a member's DERIVED row gets.
+ *
+ * The defect these exist for, reproduced end to end before they were written.
+ * `recall` hands the user a member's derived row WITH its id (test 3b's
+ * comment already names the misrouting and deliberately declines to pin it),
+ * and `forget` then answered with the ownership reason: "start a session
+ * inside <member> and retry there". Measured: doing exactly that reaches the
+ * home derived branch and answers "forget the underlying memory instead". The
+ * first instruction is therefore FALSE — not vague, not incomplete, but a
+ * concrete action that provably does not work. For an archived member the
+ * answer was worse: "cannot be removed until a checkout of it exists again"
+ * promises that a returning checkout would help, and for a derived row no
+ * checkout ever helps.
+ *
+ * Why a member's derived row cannot simply reuse the HOME derived sentence
+ * (service.ts's `row.derived !== LAYER.RAW` branch), which is the obvious
+ * cheap fix and is what 6c's negative assertions exist to refuse: at home
+ * "forget the underlying memory instead (recall it to get its id)" is
+ * ACTIONABLE — the raw rows are in this session's hands. Across the group
+ * boundary they are as unforgettable as the summary, and no derived→source
+ * mapping exists in the schema, so `recall` cannot even name them. Same words,
+ * opposite truth value, two input domains: not shareable.
+ *
+ * These cases assert the sentence, positively AND negatively. Positive-only
+ * assertions would stay green if any of the three false statements came back
+ * alongside the true one, which is precisely how a regression would arrive.
+ */
+
+/** RegExp-escape a source string: `.` in a host name would otherwise match anything. */
+const escapeRe = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/**
+ * Plant an active derived row of a GIVEN layer in a member store.
+ *
+ * `layer` is REQUIRED and has no default, deliberately. The first version of
+ * this helper hardcoded `LAYER.SCENARIO` inside its `.run()` and did not even
+ * accept the layer as a parameter, so every case below planted L2 and only L2.
+ * Measured consequence: a mutant narrowing the production check from
+ * `!== LAYER.RAW` to `=== LAYER.SCENARIO` survived the entire suite at 277/0,
+ * and under it a member's L1 and L3 rows get the OWNERSHIP reason back — the
+ * two sentences this round exists to delete ("Start a session inside …",
+ * "cannot be removed until a checkout …") return verbatim, unobserved.
+ *
+ * A DEFAULT would not fix this. It would let a call site stay silent about the
+ * layer and quietly re-concentrate the suite on one value, which is the same
+ * failure in a new costume. Following the todo-l precedent, the fix is to
+ * REMOVE the default rather than change it: every caller now states the layer
+ * it is testing, and a new caller cannot forget to.
+ *
+ * The ordering is load-bearing: D9's triggers retire the entire derived layer
+ * on any raw insert/update/delete, so every `seed` call must already have run.
+ * A fixture that plants the rollup first holds nothing by the time the
+ * assertion runs, and the case passes for the wrong reason.
+ */
+const plantDerived = (store, id, title, layer) => {
+  assert.ok(
+    DERIVED_LAYERS.includes(layer),
+    `plantDerived needs an explicit derived layer, got ${layer}`,
+  )
+  store.db
+    .prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+       VALUES (?, 'fact', 'repo-local', 'active', ?, 'generated', ?, 0, 9000000000000, ?)`,
+    )
+    .run(id, title, DERIVED_PROVENANCE, layer)
+  return id
+}
+
+/**
+ * Sampled at the moment of the forget call, not at insert time.
+ *
+ * The layer is checked EXACTLY. `notEqual(row.derived, LAYER.RAW)` was the
+ * original assertion, and it collapses all three derived layers into one
+ * value: it cannot tell an L1 fixture from an L3 one, so against the
+ * layer-coverage gap these cases now exist for it asserts nothing at all.
+ */
+const assertDerivedPresent = (store, id, layer) => {
+  const row = store.db
+    .prepare(`SELECT status, derived FROM memories WHERE id = ?`)
+    .get(id)
+  assert.ok(row, `the derived row ${id} must be in the member store when forget runs`)
+  assert.equal(row.status, 'active', 'and active')
+  assert.equal(
+    row.derived,
+    layer,
+    `and sitting on layer ${layer} — a case that plants one layer while asserting only ` +
+      '"not RAW" cannot detect a production check that covers a different layer',
+  )
+}
+
+/**
+ * The refusal must be true of EVERY derived layer, so there is one case per
+ * layer — three independent `test()` calls, generated by this loop.
+ *
+ * WHY THREE TESTS AND NOT ONE TEST WITH A LOOP INSIDE. Measured, not stylistic:
+ * a single case looping over the layers stops at its first failing assertion,
+ * so it reports "layer 1 failed" and says NOTHING about layer 3 — whether the
+ * third layer is also unguarded is unobservable from the result. Generating a
+ * test per layer makes each layer its own execution point, and a mutant that
+ * misses exactly one layer names that layer in the output.
+ *
+ * WHAT THIS EXISTS FOR. `forget`'s member branch asks `derived !== LAYER.RAW`,
+ * so its declared domain is ALL THREE derived layers. Before these cases the
+ * suite planted L2 and only L2, and a mutant narrowing that check to
+ * `=== LAYER.SCENARIO` passed the whole suite 277/0. Probed under that mutant,
+ * a member's L1 and L3 rows were answered with the OWNERSHIP reason — i.e.
+ * "Start a session inside <repo> and retry there", the exact false advice this
+ * round removed, resurrected on two thirds of the domain with every test green.
+ *
+ * That is not a neighbouring gap; it is THIS round's defect, in the round that
+ * exists to fix it — the same shape as v0.4.15 (fixture only ever built
+ * SCENARIO), v0.4.14 (5 states, 1 guarded) and v0.4.13 (4 read surfaces, 3
+ * closed). "Unreachable today" is not a defence here (todo p), and the
+ * unreachability is thin anyway: the schema's CHECK on `derived` does not
+ * consult `store_kind`, so nothing at the data layer stops an L1 or L3 row
+ * from sitting in a repo store — measured, all three layers INSERT fine.
+ */
+const LAYER_NAMES = { [LAYER.SUMMARY]: 'L1 rollup', [LAYER.SCENARIO]: 'L2 scenario', [LAYER.PERSONA]: 'L3 portrait' }
+
+for (const layer of DERIVED_LAYERS) {
+  test(`6c-${layer}. forget on a member ${LAYER_NAMES[layer]} states what is true of it, not where to go`, async () => {
+    const s = setup({ declaration: GROUP_OF({ backend: '', frontend: '' }) })
+    writeFileSync(join(s.ws, GROUP_FILE), JSON.stringify(GROUP_OF(s.sources)), 'utf8')
+    // Every RAW write first (D9), then the rollup.
+    seed(s.stores.parent, [{ title: 'parent deploy', body: 'p' }])
+    seed(s.stores.backend, [{ title: 'backend deploy', body: 'b' }])
+    seed(s.stores.frontend, [{ title: 'frontend deploy', body: 'f' }])
+    plantDerived(s.stores.backend, 'backend-rollup', 'backend deploy rollup', layer)
+
+    assertDerivedPresent(s.stores.backend, 'backend-rollup', layer)
+
+    await assert.rejects(
+      s.service.forget('backend-rollup', s.principal),
+      (error) => {
+        assert.ok(error instanceof MemoryInputError)
+        // 1. It is a generated summary — the one property true of every store.
+        assert.match(error.message, /generated summary/)
+        // 2. Which repository, in the SAME spelling recall's `(from X)` used, so
+        //    the user can match the refusal to the line they read it on. Read
+        //    from the fixture, never hardcoded: a hardcoded source would keep
+        //    passing if the message stopped interpolating the real one.
+        assert.match(error.message, new RegExp(escapeRe(s.sources.backend)))
+        // 3. No session anywhere can forget it. This is the half that kills BOTH
+        //    false promises at once — "go run it there" and "wait for a
+        //    checkout" are both claims that some session could.
+        assert.match(error.message, /no session can forget it directly/i)
+        // 4. WHY, which is the only honest reason: the whole LAYER is dropped on
+        //    ANY write to that repository, so there is no row-by-row deletion to
+        //    perform. Two regexes, because the sentence has two load-bearing
+        //    parts and one regex would let either rot:
+        //      - the UNIT is the layer, not this row;
+        //      - the TRIGGER is any memory in that repository, not the set this
+        //        rollup summarizes (D9 keys on any raw write, related or not).
+        assert.match(error.message, /dropped as a whole layer/i)
+        assert.match(error.message, /any memory in that repository/i)
+        return true
+      },
+    )
+
+    await assert.rejects(s.service.forget('backend-rollup', s.principal), (error) => {
+      // The five statements that must NOT come back — asserted for THIS layer.
+      // Without them, any could return BESIDE the true sentence and this case
+      // would stay green (see M9': every positive assertion satisfied, all four
+      // old falsehoods appended). The first two are also exactly what the
+      // L2-only mutant put back on L1 and L3.
+      assert.doesNotMatch(error.message, /Start a session inside/)
+      assert.doesNotMatch(error.message, /cannot be removed until a checkout/)
+      assert.doesNotMatch(error.message, /Forget the underlying memory instead/)
+      assert.doesNotMatch(error.message, /recall it to get its id/)
+      // The fifth is this round's own correction: "rebuilt"/"regenerated" was in
+      // the first draft of the sentence and is FALSE. D9 runs a DELETE and
+      // enqueues nothing; a rebuild is queued only while the packet still
+      // overflows, so the layer may never return. Measured (derived 1 -> 0 while
+      // `jobs` stays 0). Without this line the false word could come back.
+      assert.doesNotMatch(
+        error.message,
+        /rebuil|regenerat/i,
+        'D9 deletes the layer and queues nothing — promising a rebuild is an assurance the ' +
+          'system does not make',
+      )
+      return true
+    })
+
+    assertDerivedPresent(s.stores.backend, 'backend-rollup', layer)
+    s.registry.dispose()
+    cleanup(s.root)
+  })
+}
+
+test("6d. an ARCHIVED member's derived row does not promise a future checkout will help", async () => {
+  // The archived case is the sharper one: `foreign.archived` used to select a
+  // sentence saying the entry "cannot be removed until a checkout of it exists
+  // again". For a RAW row that is true and useful. For a DERIVED row both
+  // halves are false — it is not awaiting a checkout, and a checkout would
+  // change nothing. So the derived branch must not consult `archived` at all:
+  // the answer is identical either way, which is itself the finding.
+  const s = setup({ declaration: { version: 1, group: 'acme', members: [] } })
+  writeFileSync(
+    join(s.ws, GROUP_FILE),
+    JSON.stringify({
+      version: 1,
+      group: 'acme',
+      members: [{ source: s.sources.archived, archived: true }],
+    }),
+    'utf8',
+  )
+  seed(s.stores.archived, [{ title: 'archived deploy', body: 'a' }])
+  plantDerived(s.stores.archived, 'archived-rollup', 'archived deploy rollup', LAYER.SCENARIO)
+
+  assertDerivedPresent(s.stores.archived, 'archived-rollup', LAYER.SCENARIO)
+
+  await assert.rejects(
+    s.service.forget('archived-rollup', s.principal),
+    (error) => {
+      assert.ok(error instanceof MemoryInputError)
+      assert.match(error.message, /generated summary/)
+      assert.match(error.message, new RegExp(escapeRe(s.sources.archived)))
+      assert.match(error.message, /no session can forget it directly/i)
+      assert.match(error.message, /dropped as a whole layer/i)
+      assert.match(error.message, /any memory in that repository/i)
+      assert.doesNotMatch(error.message, /Start a session inside/)
+      // The one this case exists for.
+      assert.doesNotMatch(
+        error.message,
+        /cannot be removed until a checkout/,
+        'an archived derived row is not waiting for a checkout — no checkout can ever forget it',
+      )
+      assert.doesNotMatch(error.message, /Forget the underlying memory instead/)
+      assert.doesNotMatch(error.message, /recall it to get its id/)
+      assert.doesNotMatch(error.message, /rebuil|regenerat/i)
+      return true
+    },
+  )
+  assertDerivedPresent(s.stores.archived, 'archived-rollup', LAYER.SCENARIO)
+  s.registry.dispose()
+  cleanup(s.root)
+})
+
+test('6e. REGRESSION: a member RAW row still gets the ownership reason', async () => {
+  // The other side of the ruler. Making the derived sentence true must not
+  // cost the raw sentence its truth: for a RAW member row the named repository
+  // really is where the action can be taken, and test 6 pins that. This case
+  // pins it again in the DISCRIMINATING configuration — a raw row and a derived
+  // row in the SAME member store, which is where a too-eager branch swallows
+  // both and a too-narrow one swallows neither.
+  //
+  // The derived row is load-bearing here and is now MADE so. Previously it was
+  // merely planted: deleting that line left the whole suite at 277/0, i.e. the
+  // configuration this case advertises never entered its judgement. So the two
+  // ids are now driven through `forget` together and their answers compared —
+  // one store, two rows, two different sentences, which is the actual claim.
+  const s = setup({ declaration: GROUP_OF({ backend: '', frontend: '' }) })
+  writeFileSync(join(s.ws, GROUP_FILE), JSON.stringify(GROUP_OF(s.sources)), 'utf8')
+  const [backendId] = seed(s.stores.backend, [{ title: 'backend deploy', body: 'b' }])
+  plantDerived(s.stores.backend, 'backend-rollup', 'backend deploy rollup', LAYER.SCENARIO)
+  // Sampled at forget time: D9 retires the derived layer on any raw write, so
+  // a fixture that plants it before `seed` would hold nothing by now.
+  assertDerivedPresent(s.stores.backend, 'backend-rollup', LAYER.SCENARIO)
+
+  await assert.rejects(
+    s.service.forget(backendId, s.principal),
+    (error) => {
+      assert.ok(error instanceof MemoryInputError)
+      assert.match(error.message, /belongs to group member repository/)
+      assert.match(error.message, new RegExp(escapeRe(s.sources.backend)))
+      assert.match(error.message, /Start a session inside/)
+      // And it must NOT have drifted onto the derived sentence.
+      assert.doesNotMatch(error.message, /no session can forget it directly/i)
+      return true
+    },
+  )
+  // The derived row in the SAME store must get the OTHER sentence. This is what
+  // makes the planted row participate: the case now fails if the two rows are
+  // answered alike, which is exactly what a branch covering the wrong set does.
+  await assert.rejects(
+    s.service.forget('backend-rollup', s.principal),
+    (error) => {
+      assert.match(error.message, /generated summary in group member repository/)
+      assert.doesNotMatch(error.message, /Start a session inside/)
+      return true
+    },
+  )
+  assert.equal(
+    s.stores.backend.db.prepare(`SELECT status FROM memories WHERE id = ?`).get(backendId).status,
+    'active',
+  )
+  assertDerivedPresent(s.stores.backend, 'backend-rollup', LAYER.SCENARIO)
+  s.registry.dispose()
+  cleanup(s.root)
+})
+
+test('6f. the derived refusal writes NOTHING to the member store', async () => {
+  // Test 17's discipline, applied to the new branch. The branch reads a member
+  // store to decide WHICH sentence to say, and a read that decides something
+  // is exactly where a write sneaks in (17 exists because `touchUsage` did
+  // precisely that on the recall path). "We did not call a writer" is not the
+  // assertion — it is unobservable and re-encodes the implementation. The
+  // assertion is the promise a human approved: the FILE bytes must not move.
+  const s = setup({ declaration: GROUP_OF({ backend: '', frontend: '' }) })
+  writeFileSync(join(s.ws, GROUP_FILE), JSON.stringify(GROUP_OF(s.sources)), 'utf8')
+  seed(s.stores.parent, [{ title: 'parent deploy', body: 'p' }])
+  const [backendId] = seed(s.stores.backend, [{ title: 'backend deploy', body: 'b' }])
+  const [frontendId] = seed(s.stores.frontend, [{ title: 'frontend deploy', body: 'f' }])
+  plantDerived(s.stores.backend, 'backend-rollup', 'backend deploy rollup', LAYER.SCENARIO)
+  plantDerived(s.stores.frontend, 'frontend-rollup', 'frontend deploy rollup', LAYER.SCENARIO)
+
+  const memberFiles = {
+    backend: join(s.root, 'repos', repoKeyFor(s.sources.backend), 'memory.sqlite'),
+    frontend: join(s.root, 'repos', repoKeyFor(s.sources.frontend), 'memory.sqlite'),
+  }
+  // WAL: the changed bytes can sit in `-wal` rather than the main file, so a
+  // naive digest of `memory.sqlite` alone would pass over a real write. Both
+  // files are digested, after a TRUNCATE checkpoint.
+  const digest = () => {
+    const out = {}
+    for (const [name, file] of Object.entries(memberFiles)) {
+      s.stores[name].db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+      out[name] = createHash('md5').update(readFileSync(file)).digest('hex')
+      const wal = `${file}-wal`
+      out[`${name}-wal`] = existsSync(wal)
+        ? createHash('md5').update(readFileSync(wal)).digest('hex')
+        : 'absent'
+    }
+    return out
+  }
+  // Row-level snapshots too: a digest says THAT something moved, these say WHAT.
+  const rows = () => {
+    const out = {}
+    for (const name of Object.keys(memberFiles)) {
+      out[name] = {
+        memories: s.stores[name].db
+          .prepare(`SELECT id, status, title, body, derived, updated_at FROM memories ORDER BY id`)
+          .all(),
+        usage: s.stores[name].db
+          .prepare(`SELECT memory_id, retrieved, last_hit_at FROM usage ORDER BY memory_id`)
+          .all(),
+        revision: s.stores[name].db
+          .prepare(`SELECT v FROM meta WHERE k = 'store_revision'`)
+          .get() ?? null,
+      }
+    }
+    return out
+  }
+
+  const beforeDigest = digest()
+  const beforeRows = rows()
+
+  // All four refusal shapes, both kinds of row, both members.
+  //
+  // The refusals are CAPTURED and classified, not merely awaited. `await
+  // assert.rejects(..., MemoryInputError)` was the first version of this loop
+  // and it was VACUOUS: the fail-closed `no memory with id X` is also a
+  // MemoryInputError, so that assertion could not tell whether the member
+  // branch had been reached at all. Two probes proved it — deleting the loop
+  // outright, and pointing it at four ids that exist nowhere, BOTH left this
+  // case green. A byte-comparison test whose subject never runs compares a
+  // store against itself and always passes.
+  const seen = []
+  for (const id of ['backend-rollup', 'frontend-rollup', backendId, frontendId]) {
+    await assert.rejects(s.service.forget(id, s.principal), (error) => {
+      seen.push(error.message)
+      return error instanceof MemoryInputError
+    })
+  }
+  assert.equal(
+    seen.filter((m) => /generated summary in group member repository/.test(m)).length,
+    2,
+    'both member DERIVED rows must have been refused by the derived branch',
+  )
+  assert.equal(
+    seen.filter((m) => /belongs to group member repository/.test(m)).length,
+    2,
+    'both member RAW rows must have been refused by the ownership branch',
+  )
+  assert.equal(
+    seen.filter((m) => /^no memory with id/.test(m)).length,
+    0,
+    'no refusal may come from the fail-closed path — that would mean the ids never reached ' +
+      'a member store, and the byte comparison below would be measuring nothing',
+  )
+
+  const afterDigest = digest()
+  const afterRows = rows()
+
+  assert.deepEqual(
+    afterDigest,
+    beforeDigest,
+    'a refusal read a member store to choose its wording and changed its bytes; the approval ' +
+      'prompt promises "Nothing is ever written to them"',
+  )
+  for (const name of Object.keys(memberFiles)) {
+    assert.deepEqual(afterRows[name].memories, beforeRows[name].memories, `${name}: memories moved`)
+    assert.deepEqual(afterRows[name].usage, beforeRows[name].usage, `${name}: usage rows moved`)
+    assert.deepEqual(
+      afterRows[name].revision,
+      beforeRows[name].revision,
+      `${name}: meta.store_revision moved, so a trigger fired on a read-only path`,
+    )
+  }
+  s.registry.dispose()
+  cleanup(s.root)
+})
+
+test('6g. memory_forget share:true on a member derived row is refused too', async () => {
+  // `memory_forget` offers TWO actions, not one: `share: true` bypasses
+  // forget() entirely and calls share() directly (tools.ts). It is the same
+  // tool, the same id parameter, and the same id a user just read out of
+  // recall — so it is a second door onto this row and belongs in this round's
+  // evidence even though it needs no change. share() resolves through
+  // storeFor(), which never sees members, so the member row is invisible to it
+  // and the refusal is the generic fail-closed one. Recorded as measured, not
+  // assumed: what matters is that it refuses and touches nothing.
+  const s = setup({ declaration: GROUP_OF({ backend: '', frontend: '' }) })
+  writeFileSync(join(s.ws, GROUP_FILE), JSON.stringify(GROUP_OF(s.sources)), 'utf8')
+  seed(s.stores.backend, [{ title: 'backend deploy', body: 'b' }])
+  plantDerived(s.stores.backend, 'backend-rollup', 'backend deploy rollup', LAYER.SCENARIO)
+
+  let forgetTool
+  registerTools(
+    { tools: { register: (tool) => { if (tool.name === 'memory_forget') forgetTool = tool } } },
+    s.service,
+  )
+  assert.ok(forgetTool, 'memory_forget must be registered')
+
+  await assert.rejects(
+    forgetTool.execute(
+      { id: 'backend-rollup', share: true },
+      { agent: s.principal, signal: new AbortController().signal },
+    ),
+    (error) => {
+      assert.ok(error instanceof MemoryInputError)
+      assert.match(error.message, /no memory with id backend-rollup in this repository/)
+      return true
+    },
+  )
+  // Fail closed: no approval was even requested for a row this session cannot
+  // act on, and the member row is untouched.
+  assert.equal(s.asked.length, 0, 'no human was prompted about a row this session cannot reach')
+  assertDerivedPresent(s.stores.backend, 'backend-rollup', LAYER.SCENARIO)
   s.registry.dispose()
   cleanup(s.root)
 })

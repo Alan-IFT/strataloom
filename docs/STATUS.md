@@ -1,6 +1,382 @@
 # 当前状态
 
-> 最后更新：2026-09-04 · **v0.4.15 已发布**：`queryAllMemories`
+> 最后更新：2026-09-04 · **v0.4.16 已发布**：`forget` 对 group member 库中
+> **派生行**给出的拒绝理由**是错的**，而且是一条**可证伪的假建议**——
+> 它说「去那个 checkout 里删」，照做之后得到的是「这是生成的摘要，删不掉」。
+> 即：产品把用户支使到一个**注定失败的目的地**。archived member 更糟，
+> 承诺「等 checkout 回来就能删」，而派生行**任何 checkout 都删不掉**，**两个半句都假**。
+> 修法**不是调换判断顺序**，而是 **member 分支必须有自己的文案**：
+> 同一句话在 home 域为真、在 member 域为假，**真值随输入域翻转的句子不可共用**。
+> **零新增查询**（把既有 `SELECT 1` 的投影列换成 `SELECT derived`，复用同一次 `.find()`）。
+> 🟡 **今天真实可达，但克制**：生产 3 个 member 库派生行 **15 条**（Backend 4／Frontend 5／
+> Ops(archived) 6），**FTS 15/15 可达**、全部为 L2；`recall` 确实把它们**连同 id** 交给用户。
+> 但**不定 🔴**，因为：①**无数据泄漏**（内容本就允许被 recall 读到，本轮只改拒绝文案）；
+> ②**无跨仓写**（新分支是纯读，事务外，实测 member 库字节/行/`store_revision` 全不变）；
+> ③**无权限失守**（`forget` 仍只搜 `readableStores`）；④**派生行短命**——D9 触发器在
+> 任何 raw 行增/改/删时**整层删除且不入队重建**（实测 `jobs` 恒 0），故这 15 条随时会消失、
+> 且**未必回来**（重建只在 raw 集仍溢出时才排队）。危害是**一条假建议**，不是数据事故。
+> 顺带修掉**第四个执行点** `tools.ts` 的工具描述——它无条件承诺「拒绝里会指名去哪个仓库跑」，
+> 装上修复后**当场变假**（与 v0.4.13「forget 的 note 是一句不实陈述」同型）。
+> 测试 271 → **280 / 0 fail**。结项 **v0.4.15 待办 3**，并**顺带补掉本轮登记的待办 2**
+> （`share` 派生守卫零覆盖——QA 实测其后果是「人被请求批准发布、被告知已发布、实际零写入」，
+> 属自洽性破裂，不够格只登记）。
+> ⛔ **QA 第三次打回的是本轮自己**：把 `!== LAYER.RAW` 收窄成 `=== LAYER.SCENARIO` 后
+> **全量 277/0 存活**——**本轮专门删掉的那两句假话在 L1/L3 上原样复活**，而 fixture 只造 L2。
+> 即：**在专门修「只守一个切片」的这一轮里，我自己也只守了一个切片**（同形状第四次）。详见下节。
+> ⛔ **本轮 lead 的 5 条判断被评审证伪/修正**（含「该理由对一切库都为真」四重为假、
+> 「三个执行点」实为四个、「顺序问题」实为文案问题）。按本仓惯例**保留原判断＋标注证伪**，见下节。
+> ⛔ 另证伪 **`STATUS.md:594` 待办 2 现状栏**「9 个生产库全部还在 v10」——实测 **9/9 均为 v11**。
+> **本轮明令不做**该待办，仅记录（详见下节）。
+> **每次工作结束时更新本页**，它是新会话的唯一入口。
+>
+> ⬇️ 以下 v0.4.15 一节及更早各节仍然有效（v11 库不可被 0.4.13 及更早打开的警告同样仍有效）。
+
+## 🆕 v0.4.16：一句话在两个输入域真值不同，却被共用（**假建议，非数据事故**）
+
+**本轮结项 v0.4.15 待办 3。**
+
+### 判据：不是「措辞不够好」，是**照做会失败**
+
+三次复现，全部走**未修改的 HEAD** ＋ **完整生产调用链**（真实渲染器、真实 `forget`）：
+
+**复现 A**——`recall` 把 member 派生行连同 id 交给用户：
+
+```
+- [fact] (id member-rollup) (from remote:github.com/acme/Backend) ...
+```
+
+而 `forget(member-rollup)` 回答：
+
+```
+member-rollup belongs to group member repository remote:github.com/acme/Backend, not to this
+session's repository. forget only acts on the repository this session is in.
+Start a session inside the remote:github.com/acme/Backend checkout and retry there.
+```
+
+**复现 B**——照该建议做（会话 cwd 换成 Backend checkout 本身）：
+
+```
+member-rollup is a generated summary, not a stored memory. Forget the underlying memory
+instead (recall it to get its id).
+```
+
+⇒ **第一条建议是假的**。它不是含糊，是一个**具体动作**，而该动作**可证明不成立**。
+
+**复现 C**（archived member）：`... this entry cannot be removed until a checkout of it exists again.`
+⇒ 承诺「等 checkout 回来就能删」，而派生行**任何 checkout 都删不掉**——**两个半句都假**。
+
+### 为什么不能「复用 `service.ts:1096` 那句现有文案」（本轮的核心判据）
+
+这是最省事的修法，也是本轮**反向断言存在的唯一理由**。probe7 真值对照：
+
+| 那句话 | 在 **home 库** | 在 **member 库** |
+|---|---|---|
+| `Forget the underlying memory instead (recall it to get its id).` | ✅ **真**：underlying raw 行就在本会话手里，删得掉，D9 连带清掉 rollup | ❌ **假**：underlying 行在别人仓库，本会话**同样删不掉** |
+
+**同一句话在两个输入域真值不同 ⇒ 不可共用 ⇒ member 分支必须有自己的文案。**
+补充第二条独立理由：schema **无派生→源映射**，故即使用户想照做，`recall` 也**无从定位**该去删哪几条。
+
+变异 **M9** 就是这条判据本身的变异（把 member 分支文案换成 home 原文），实测**转红**，
+且**正是被 A2-c 第 3、4 条反向断言杀死**（逐条归因见变异矩阵下方）。
+
+### 生产暴露面（**本轮重测**，不引用方案里的旧数）
+
+派生行短命（D9 在任意 raw 写入时**整层删除**，且**不入队重建**），故此数有时效性，施工时重测：
+
+```
+Backend   (edf7a6862ddebb5db809dfae)  derived=4  ftsReachable=4  evidenceRows=0
+Frontend  (ec2636fc223e3fbb5f783b0b)  derived=5  ftsReachable=5  evidenceRows=0
+Ops       (3e857510e62829e8dc350904)  derived=6  ftsReachable=6  evidenceRows=0   ← archived
+TOTAL derived= 15 ftsReachable= 15 evidenceRows= 0
+```
+
+15 条**全部 L2**，`recall` **15/15 可达**并发出 id。**严重性 🟡 而非 🔴**，克制事实见页首摘要。
+
+### 修法：零新增查询，且 member 分支不使用 `archived` 三元
+
+`src/service.ts` foreign 分支原本已经在跑一次 `SELECT 1 FROM memories WHERE id = ?`
+来找**哪个 member 持有该 id**。本轮**只换投影列**：
+
+```ts
+SELECT 1        →  SELECT derived
+```
+
+「这个 member 有没有这行」与「这行是哪一层」是**关于同一行的同一个问题**；
+拆成两条 `.prepare` 就是**一条规则两个实现**，随时可以互相打架。**foreign 分支内不新增任何针对
+`memories` 的第二条 `.prepare`**（`git diff` 可验，见验收证据）。
+
+派生分支**不使用 `foreign.archived` 三元**：对派生行两者真值相同（都是「谁也删不掉」），
+**分不分支都说同一句**，本身就是发现。**实测**确认 test 6b 不受影响——其 fixture 用 `seed()`，
+`INSERT` **不写 `derived` 列**，落库 `derived=0`（schema `DEFAULT ${LAYER.RAW}`），故走 RAW 分支：
+
+```
+6b fixture row as stored : {"id":"87ea25c8-0","derived":0,"status":"active"}
+is RAW?                  : true
+=> takes branch          : RAW / ownership reason
+--- matches /cannot be removed until a checkout/ : true
+```
+
+### 完整消费方清单（**本轮自己重跑确认**，非引用）
+
+基底：`grep -nE "^  (async )?[a-zA-Z]+\(" src/service.ts` 全部公开方法 ＋ 全部注册工具 ＋ `command.ts`。
+下表「行为」栏**全部实测**（同一条 member 派生行 `member-rollup`，走生产调用链）：
+
+| 消费方 | member 派生行行为（实测） | 是否同型缺陷 |
+|---|---|---|
+| `recall` | 命中并发出 id（带 `(from remote:github.com/acme/Backend)`） | 缺陷**来源**，非缺陷本身，按 §2.3 设计**不应改** |
+| `list` | 正确排除（`group:...=[b-0]`，无 rollup） | 无（v0.4.15 test 3b 已钉） |
+| `forget` | **归属理由（假）** | **本轮选题** |
+| `share` | `no memory with id member-rollup in this repository` | 无，fail-closed |
+| `source` | `no memory with id member-rollup, or it was forgotten` | 非 member 专属（home 同样），**登记为新待办 1** |
+| `propose({replaces})` | `cannot replace member-rollup: no active memory with that id in this scope` | 无 |
+| `buildContextProvider`（注入包） | 不泄漏（`contains "member-rollup"=false`） | 无（`MemoryHit` 无 source 字段，结构性够不到） |
+| `memory_forget` 的 `share:true` | 绕过 `forget()` 直调 `share()`，同上 fail-closed，**未提示人类审批** | 无，但是**同一工具第二入口**（B6 钉住） |
+| `/memory` slash command | 走 `list()`，已排除 | 无 |
+
+### 变异矩阵（每条**只改一个执行点** → `npm run build` → 跑**全量** → 还原并复跑确认回基线）
+
+还原一律三步：**还原 src ＋ `npm run build` ＋ 复跑**，`md5sum -c` 校验，
+全部在 `/tmp/mutwork` 副本上做（工作树零污染，`git status` 只有本轮 4 个文件）。
+
+| # | 单点改法 | 读数 | 被杀测试 | 判定 |
+|---|---|---|---|---|
+基线 **280 / 0**（QA 打回后新增 3 条分层测试 ＋ 1 条 share 测试）。
+
+| # | 单点改法 | 读数 | 被杀测试 | 判定 |
+|---|---|---|---|---|
+| **M1** | 新增派生判断**整段删掉**（回 HEAD 行为） | 280/274/**6** | 6c-1、6c-2、6c-3、6d、6e、6f | ✅ 三层各自转红 |
+| **M2** | 条件反相 `=== LAYER.RAW` | 280/273/**7** | 6b、6c-1/2/3、6d、6e、17 | ✅ 钉的是「派生」这个性质 |
+| **M3** | 删 RAW 分支的 archived 三元 | 280/278/**2** | **6b**、17 | ✅ 由 test 6b 转红 |
+| **M4** | 只删 `service.ts:1096`（**home** 派生判断） | 280/277/**3** | `forget refuses a generated summary…`、`list(): a repo-scope L2…`、`list(): the L3 portrait…` | ✅ 即 A2-d 保护的三处 |
+| **M5** | 只删 `service.ts:978`（share 派生判断） | 280/279/**1** | `share refuses a generated summary BEFORE prompting a human` | ✅ **由登记改为本轮补**（理由见下） |
+| **M6** | 只删 `service.ts:932` 的 `AND derived = ${LAYER.RAW}` | 280/280/**0** | —— | ⚠️ **存活 → 维持登记（待办 3）** |
+| **M7** | 改掉 `tools.ts` 那句工具描述 | 280/279/**1** | `memory_forget's description is true of BOTH kinds of member row` | ✅ 由 B5 转红 |
+| **M8** | 新分支抛错**前**对 member 库写一次 | 280/279/**1** | `6f. the derived refusal writes NOTHING…` | ✅ 证明 B4 非空转 |
+| **M9** | member 派生分支文案**替换成 `1096` 原文** | 280/274/**6** | 6c-1/2/3、6d、6e、6f | ✅ 归因见下（**曾写错**） |
+
+**分层覆盖验收矩阵**（本轮最重要的一组：证明三条分层测试是**三个独立执行点**，
+而不是互相兜底的复制品——每个变异**分别**打红了哪几条，逐条列出）：
+
+| 变异 | 读数 | 打红 | 仍绿 | 判定 |
+|---|---|---|---|---|
+| `=== LAYER.SCENARIO`（只认 L2） | 280/278/**2** | `6c-1` **和** `6c-3`（**两条分别红**） | `6c-2` | ✅ 修复前此变异 **277/0 存活** |
+| `>= LAYER.SCENARIO`（漏 L1） | 280/279/**1** | **仅** `6c-1` | `6c-2`、`6c-3` | ✅ 修复前 **277/0 存活** |
+| `<= LAYER.SCENARIO`（漏 L3） | 280/275/**5** | `6c-3` ＋ 6b/6e/6f/17 | `6c-1`、`6c-2` | ⚠️ 见下注 |
+| `!== RAW && !== PERSONA`（**只**漏 L3，RAW 侧不动） | 280/279/**1** | **仅** `6c-3` | `6c-1`、`6c-2` | ✅ 干净隔离 |
+
+⚠️ **`<=` 这一行的读数需要说明，不能直接当作「L3 被守住」的证据**：`<= LAYER.SCENARIO`
+**同时把 RAW（0）也纳入了该分支**，所以它额外打红的 6b/6e/6f/17 全部来自 **RAW 侧误判**——
+这正是 QA 指出的污染。为得到只针对 L3 的干净读数，本轮**另做了第四个变异**
+（`!== RAW && !== PERSONA`，保持 RAW 在分支外），结果**仅 `6c-3` 转红**。
+两个变异合起来才构成 L3 被独立守护的证据。
+
+**其他两项返工验收**：
+
+| 探针 | 构造 | 修复**前** | 修复**后** |
+|---|---|---|---|
+| `M5` | 删掉 `service.ts:978` 的 share 派生守卫 | 277/277/**0 存活** | 280/279/**1**（新测试转红） |
+| `P_6E` | 抽掉 6e 的 `plantDerived` 前提 | **277/0 全绿**（前提未参与判定） | 280/279/**1**（6e 转红） |
+
+**M9 归因（⛔ 本节曾写错，v0.4.16 返工时更正；原错误结论见文末「本轮自身的证伪」）**
+
+M9 的**首条失败是正向断言 #2（source 插值）**，实测：
+
+```
+✖ 6c. forget on a member DERIVED row states what is true of it, not where to go
+  AssertionError: The input did not match the regular expression /remote:github\.com\/acme\/Backend/. Input:
+  'backend-rollup is a generated summary, not a stored memory. Forget the underlying memory instead (recall it to get its id).'
+      at .../test/group.test.mjs:644:14      ← 这一行是正向 #2
+```
+
+**决定性对照 `M9_NONEGS`**：把 6c/6d 的**反向断言全部删光**后重跑 M9——
+
+```
+##################### M9_NONEGS #####################
+  ✖ 6c. ...   ✖ 6d. ...   ✖ 6f. ...
+  ℹ tests 277  ℹ pass 274  ℹ fail 3
+```
+
+⇒ **杀死 M9 的是正向 #2，不是反向断言**（home 原文根本不含 source，正向 #2 先炸）。
+
+**那么反向断言在防什么？** 它们的存在理由**不是**"杀 M9"，而是杀掉那类
+**同时说真话又说假话**的回归——正向断言全满足、假话附在后面。这类变异**只有反向断言杀得掉**：
+
+| 变异 | 构造 | 读数 | 被杀 |
+|---|---|---|---|
+| **M9'** | 正向断言**全部满足** ＋ 四条假话**全部塞回** | 277/275/**2** | 6c、6d |
+| **NEG1** | 只塞回 `Start a session inside …` | 277/275/**2** | 6c、6d |
+| **NEG2** | 只塞回 `cannot be removed until a checkout …` | 277/275/**2** | 6c、6d |
+| **NEG3** | 只塞回 `Forget the underlying memory instead` | 277/275/**2** | 6c、6d |
+| **NEG4** | 只塞回 `recall it to get its id` | 277/275/**2** | 6c、6d |
+
+**四条假话逐条都能单独杀**——这才是反向断言不可省的实证理由。
+
+### ⛔ 本轮被证伪／修正的 5 条 lead 判断（**保留原判断＋标注证伪**）
+
+| # | lead 原判断（原文保留） | 结论 |
+|---|---|---|
+| 1 | 「走 `service.ts:1096` 那条既有理由，**该理由对一切库都为真**」 | ❌ **证伪，四重为假**：①跨仓**不可执行**；②schema **无派生→源映射**，故 `recall` 无从定位；③archived 上**死路**；④**over-delete**（本轮独立复测，输出见下） |
+
+第 ④ 条**不引用评审结论，本轮在真实 store（D9 触发器 live）上自己复测**：
+
+```
+BEFORE
+   raw active     : [r-1, r-2, r-3]
+   derived active : [roll-a, roll-b]
+
+User is told: "forget the underlying memory instead". They forget ONE raw row (r-3, unrelated to roll-a):
+AFTER forgetting exactly 1 raw row
+   raw active     : [r-1, r-2]
+   derived active : []
+
+=> cost: 1 intended raw row + ALL derived rows (D9 deletes the LAYER, not the summarizing row)
+```
+
+即：用户为删掉**一条** rollup，被指使去删一条 raw 行，**代价是整个派生层（2 条）＋ 一条真实记忆**，
+而且被删的 raw 行**与目标 rollup 无关也照样生效**——因为 D9 删的是**层**，不是「汇总它的那一行」。
+| 2 | 「已有三个同族执行点（978/932/1096），本轮不新增机器」 | ⚠️ **修正**：是**四个**，漏掉 `tools.ts:577-579`；且装上修复后它**当场变假**（与 v0.4.13「forget 的 note 是一句不实陈述」同型）。本轮一并修（A3），并由 **B5 + M7** 钉住 |
+| 3 | 「在 foreign 分支内**新增**一次 `SELECT derived`」 | ⚠️ **修正**：存在**零新增查询**实现——改既有 `.find()` 的**投影列**即可 |
+| 4 | 「修法 = 把派生判断**排到**归属判断之前（**顺序问题**）」 | ⚠️ **修正**：**不是顺序问题**，是 **member 分支必须有自己的文案**（probe7 真值对照）。仅调顺序会让 member 派生行落到 home 那句上，即 **M9**，实测转红 |
+| 5 | 消费方清点 **6 项** | ⚠️ **修正两点**：(a) 方法**不完整**，漏 `buildContextProvider`／`share:true` 路径／`command.ts`，三者实测**均不泄漏**故**结论未被推翻**；(b)「forget 是唯一被提供的动作」**不准确**，`memory_forget` 同时提供 `share:true`，是**两个**动作 |
+
+### ⛔ 另证伪一条：`STATUS.md:594` 待办 2 的现状栏
+
+原文（保留）：「v11 后新库不可能有该类行；但 9 个生产库**全部还在 v10**」。
+**❌ 已证伪**——本轮实测 **9/9 均为 `user_version = 11`**（8 个 repo 库 ＋ global 库）。
+
+值得注意的是它**判据栏**的原文写着：「等到全部库都到 v11 之后，删它才是安全的，
+且届时应由**一次实测**（全部库 `user_version = 11`）而非推断来决定」。
+**本次实测恰好满足了它自己写的解锁条件**，使其从「今天够不到」转为**可执行的独立选题**。
+
+⚠️ **本轮明令不做**（诱惑真实，但越界即违反选题边界），仅记录。下一轮可直接选它。
+
+### 本轮登记的待办
+
+| # | 事项 | 现状（实测 2026-09-04） | 处置判据 |
+|---|---|---|---|
+| 1 | 🟢 **`source()` 对一切派生行返回「不存在」，而该行确实存在** | home 与 member **同样**返回 `no memory with id X, or it was forgotten`。根因是派生行**无 evidence 行**（生产 15/15 实测 `evidenceRows=0`） | **统一缺陷**（非 member 专属），**方向 fail-closed**（说少了，不是说错了），故危害远低于本轮选题。**非本轮范围**。修法须先决定「派生行的 source 应该是它汇总的那些 raw 行的 source，还是干脆声明它没有」——是设计问题不是措辞问题 |
+| 2 | ~~🟡 **`service.ts:978`（`share` 的派生判断）零覆盖**~~ **⛔ 已作废：本轮补掉，见下** | **变异 M5 实测存活：删掉整行后 277/277/0 全绿** | ~~与本轮 `forget` 侧同族，但**暴露面小得多**：`share` 只走 `storeFor()`，member 库根本进不来，故只能在 **home 派生行**上触发；且 `share` 后续还有 `looksSecret` 与投影两道，失守后果是「把一条生成摘要投影进 `.repo_memory/`」而非数据丢失。**登记而不修**——判据是下一次动 `share` 时一并补~~ |
+| 3 | 🟢 **`service.ts:932` 的 `AND derived = ${LAYER.RAW}` 零覆盖** | **变异 M6 实测存活：删掉后 280/280/0 全绿** | **维持登记**。该处源码注释自己已写明「今天 UNREACHABLE，且是刻意保留」（D9 的 INSERT 先落地已整层删除派生层）。故这不是「没人发现」，是**已登记的纵深防御**。要补测试须先造出一个能绕过 D9 排序的场景——**属独立选题**，且与「待办 p 判例」**不冲突**：那条注释正是按判例写的 |
+| 4 | 🟢 **工具层 `memory_forget` 的 `share: false`（默认 forget）路径无覆盖** | 6g 只测了 `share: true` 那一半；`share: false` 分支只在 service 层被测，未经工具层 | 两条路径在 `tools.ts` 是同一 `execute` 的两个分支，默认路径由 e2e 的 `memory_forget` 调用间接覆盖。**登记**，判据是下次动该工具的参数或分派时一并补齐两半 |
+| 5 | 🟢 **`/memory forget` 是 forget 的第三个执行点** | `command.ts:51` 原样透传 `memory.forget(id, agent)`，无自己的文案，故与 service 层**同真**；本轮实测其对 member 派生行行为一致 | **无缺陷**，登记以备来日：一旦有人在 command 层加自己的措辞，它就变成第四处需要各自为真的文案 |
+
+**⛔ 待办 2 的处置变更（第 5 步 QA 打回，按本仓惯例保留原文并标注作废）**：
+原判断「暴露面小得多，登记而不修」**被实测推翻**。QA 实测删掉该守卫后 `share()` 对 home 派生行会：
+**发出人类审批 → 把行改成 `team-shareable`/`human_confirmed=1` → 回报 `shared: true`，
+而投影实际写出 0 条**（`projectStore` 只选 raw 行）。即**人被请求批准发布某物，被告知已发布，而实际什么都没发布**。
+这不是「多说一句」，而是**自洽性破裂 ＋ 审批承诺破裂**，与本轮选题**同一缺陷类**
+（一句系统并不兑现的真陈述）。故**本轮补测试**，不再登记；新测试断言
+`asked.length === 0`（**根本不该惊动人类**，依 `share` 自己的 "Scan BEFORE asking" 规则），
+并断言该行**未被标记** `team-shareable`/`human_confirmed`。变异 M5 由**存活**转为**转红**。
+
+### ⛔ 本轮**自身**被证伪的三条（第 4 步代码审查打回，**保留原判断＋标注证伪**）
+
+本仓工程原则第 5 条「本轮的尺子必须量到自己身上」——这一轮的尺子量到了自己，**三条都没通过**。
+
+| # | 我（第 3 步）的原判断（原文保留） | 结论 |
+|---|---|---|
+| 1 | 「**M9 由 A2-c 第 3、4 条反向断言杀死**，正向断言在 M9 下通过」，并附一张 PASS/KILL 表 | ❌ **证伪，且是假证据**。M9 的**首条失败是正向 #2**（`group.test.mjs:644`）。`assert.rejects` 只报首条失败，**后面几条根本不可能被观察到**——那张表来自我一个**单独逐条施加**的探针，它回答的是「每条断言单独作用于该消息会怎样」，而我把它当成了「什么杀死了 M9」。**两个问题不同，我发表了错的那个。** 决定性对照 `M9_NONEGS`（删光反向断言后 M9 仍 274/**3**）已补入正文 |
+| 2 | 「**test 6f 按 test 17 口径断言文件字节**」（自评时我还宣称它非空转） | ❌ **证伪，6f 当时是空转断言**。`await assert.rejects(..., MemoryInputError)` 分辨不出 member 派生分支与 fail-closed 的 `no memory with id X`（**两者同为 `MemoryInputError`**）。两个探针实测：**把四次 forget 调用整段删掉 → 全绿**；**把 4 个 id 换成不存在的 → 全绿**。M8 被它杀死是**巧合覆盖**。已按审查形状改为**捕获并分类每条拒绝消息**，两个探针现在**都转红**（读数见返工记录） |
+| 3 | 新文案 `It is rebuilt as a whole layer whenever the memories it summarizes change` | ❌ **证伪，两处为假**——**本轮修的就是"假陈述"，我自己又写了一条**。①**不是 "rebuilt" 而是 "deleted"**：D9 执行 `DELETE FROM memories WHERE derived != RAW` 并 bump `store_revision`，**不入队任何 job**；重建由 `enqueueRebuildIfOverflowing` 仅在 `packetOverflows(store)` 为真时排队，**raw 集不再溢出则该层永不回来**。②**"the memories it summarizes" 是错的定语**：D9 由**任意** raw 行增/改/删触发，**与该 rollup 是否汇总它无关**。讽刺的是我在本页 over-delete 一节**自己写对了②**，文案里却写回了错的 |
+
+第 ③ 条的实测（真 store、live D9 触发器，用**与该 rollup 无关**的 raw 行）：
+
+```
+after plant:                 {"derived":1,"jobs":0,"store_revision":1}
+after UNRELATED raw INSERT:  {"derived":0,"jobs":0,"store_revision":2}
+after UNRELATED raw UPDATE:  {"derived":0,"jobs":0,"store_revision":3}
+after UNRELATED raw DELETE:  {"derived":0,"jobs":0,"store_revision":5}
+
+>>> jobs stays 0 => D9 DELETES the layer; it does not enqueue a rebuild.
+>>> and an UNRELATED raw write is sufficient => "the memories it summarizes" is the wrong qualifier.
+```
+
+**改后文案**（四项语义逐句实测为真）：
+
+```
+<id> is a generated summary in group member repository <source>, not a stored memory.
+No session can forget it directly — not this one, and not one started inside that
+repository. It is dropped as a whole layer the moment any memory in that repository is
+written, changed or removed, so it is never deleted row by row.
+```
+
+对应地，测试里语义 4 的正则**由 `/summariz|regenerat|rebuil/i` 换成两条**：
+`/dropped as a whole layer/i`（钉**单位**是层不是行）＋ `/any memory in that repository/i`
+（钉**触发条件**是任意写入，不是被汇总的那些行）；并**新增一条反向断言**
+`doesNotMatch(/rebuil|regenerat/i)`——**旧正则会接受假文案，等于要求写假话**，
+这是「测试固化错误行为」在本轮的第二次出现（第一次是 v0.4.15 记录的那条）。
+
+第 ② 条的空转判定与修复后复验（**修好的判据是两个探针都必须转红**）：
+
+| 探针 | 构造 | 修复**前** | 修复**后** |
+|---|---|---|---|
+| `P_6F` | 把 6f 里四次 `forget()` 调用**整段删掉** | ✔ **全绿**（1/1 pass） | ✖ **转红**（0/1 pass） |
+| `P_6F2` | 4 个 id 换成 `nope-1..nope-4`（哪儿都不存在） | ✔ **全绿**（1/1 pass） | ✖ **转红**（0/1 pass） |
+
+修法：不再只断言"抛的是 `MemoryInputError`"，而是**捕获每条拒绝消息并分类计数**——
+派生分支 2 条、归属分支 2 条、fail-closed 路径**必须 0 条**。最后这条是关键：
+它保证四个 id **真的走到了 member 库**，否则后面的字节比对就是拿一个没被碰过的库和它自己比。
+
+**教训（可迁移）**：`assert.rejects(p, ErrorClass)` 对**同类不同因**的错误**没有分辨力**。
+凡是"该走 A 分支"的断言，必须断言**消息内容或分支特征**，否则 fail-closed 路径会冒充成功。
+判定方法仍是本仓那条：**抽掉前提仍然绿 ⇒ 空转断言**。
+
+### ⛔ 本轮**自身**被证伪的第四条（第 5 步 QA 打回）：**在专门修「只守一个切片」的这一轮里，我自己也只守了一个切片**
+
+这是本页最该被后人读到的一条。本轮开题写的是「一句话在两个输入域真值不同 ⇒ 不可共用」，
+而我**自己选择用 `derived !== LAYER.RAW` 来表达这条规则**——那么它的**声明域就是三层**
+（L1 SUMMARY / L2 SCENARIO / L3 PERSONA）。**而我写的测试只造 L2。**
+
+| 我（第 3 步）的原判断（原文保留） | 结论 |
+|---|---|
+| 「B1-B6 全绿，变异矩阵 M1–M9 全部跑完，本轮判据被守住」 | ❌ **证伪**。把 `!== LAYER.RAW` 收窄成 `=== LAYER.SCENARIO`，**全量 277/0 存活**。探针打出该变异下每层的真实文案：**L1 与 L3 上，本轮专门删掉的那两句假话原封不动地复活**，而 277 条测试**一条都没红** |
+
+```
+MUTANT: !== LAYER.RAW  ->  === LAYER.SCENARIO      ℹ tests 277  ℹ pass 277  ℹ fail 0
+
+[L1 SUMMARY]  *** FALSE ADVICE RESURRECTED ***
+    roll belongs to group member repository remote:github.com/acme/Backend, ... Start a session
+    inside the remote:github.com/acme/Backend checkout and retry there.
+[L2 SCENARIO] derived branch (correct)
+[L3 PERSONA]  *** FALSE ADVICE RESURRECTED ***
+    roll belongs to group member repository remote:github.com/acme/Backend, ... Start a session
+    inside the remote:github.com/acme/Backend checkout and retry there.
+```
+
+**定性**：这不是「新分支覆盖不全」这种邻近缺口，而是**本轮开题所定义的那个缺陷本身**，
+在三分之二的输入域上完好无损。根因是 `plantDerived` 把 `LAYER.SCENARIO`
+**写死在函数体的 `.run()` 里**（形参里连 layer 都没有），本轮新增的五条测试**全部只造 L2**。
+
+**这是同一形状的第四次出现**：v0.4.13「四个读取面只关三个」→ v0.4.14「5 个状态只挡 1 个」
+→ v0.4.15「fixture 只造 SCENARIO，`!= SCENARIO` 变异 265/265/0 存活」→ **本轮**。
+前三次都是我们在别处发现它；**这一次它出现在专门修它的那一轮里，且页首就写着
+「本轮的尺子必须量到自己身上」**。
+
+**为什么不能用「今天生产上 L1/L3 是 0 行」免责**（三条，任一充分）：
+1. **暴露面不能只算行数**，要算**规则被破坏后系统说的话**——而它说的正是本轮判定为假的那两句；
+2. **自洽性**（决定性）：实现自己声明的域是三层，测试只量一层，**今天就已不自洽**，与未来可达性无关；
+3. **「今天够不到」在本仓不是免罪理由**（待办 p 判例）。且此处不可达性**尤其薄**：
+   schema 的 `derived` CHECK **不看 `store_kind`**（对照 D2 对 `private` 是数据驱动拦截），
+   实测把 L1/L3 直接 INSERT 进 member repo 库**全部成功**，全部依据只是 `rebuild.ts:318` 一个 `if`。
+
+**修法**（三条，缺一不可）：
+- `plantDerived(store, id, title, layer)`——**layer 必填、无默认值**。按**待办 l 判例**：
+  修法是**取消默认值**而非换一个默认值，否则调用点可以继续对 layer 保持沉默，
+  等于把同一个缺陷换套衣服。函数内 `assert` 校验 layer 合法。
+- `assertDerivedPresent(store, id, layer)` 改为**精确校验 `row.derived === layer`**。
+  原来的 `notEqual(RAW)` 把三层视作一个值，**对本缺口完全空转**。
+- **三个独立 `test()`**（用 `for (const layer of DERIVED_LAYERS) test(...)` **生成**），
+  而不是一个 test 内部 for 循环。**这一点是实测判定的**：一个 test 内 for 循环遇首条失败即停，
+  只报 layer 1、**layer 3 是否也漏完全不可观测**；生成式三个 test 则直接读出是哪一层漏了。
+
+**教训（可迁移，比上一条更重要）**：**当实现用某个"层级/枚举/集合"来表达规则时，
+该枚举的每个取值都是一个独立执行点**，fixture 只造其中一个值＝只测了 1/N。
+判定方法：**把实现的判断收窄到 fixture 恰好使用的那个值，若全量仍绿，则覆盖率就是 1/N**。
+这条对 `status`、`kind`、`visibility`、`provenance` 同样适用——本仓已在四个不同规则上栽过。
+
+---
+
+
 > （`service.list()` 背后那条读，即「你都记住了我什么？」这个面）的谓词
 > `status = 'active' AND derived = ${LAYER.RAW}` **在自己域内零测试覆盖**——
 > 全部保护来自 **reconcile 侧一条测试**，而它的 fixture **只造 L2**。

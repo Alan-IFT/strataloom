@@ -2974,6 +2974,65 @@ test('forget refuses a generated summary and points at the real source', async (
   cleanup(root)
 })
 
+test('share refuses a generated summary BEFORE prompting a human', async () => {
+  // The sibling execution point of the refusal above, and nothing was guarding
+  // it: deleting `share`'s `derived !== LAYER.RAW` line left the suite fully
+  // green. It was first registered as a todo on the argument that the blast
+  // radius was small; measuring what actually happens overturned that, so it is
+  // fixed here rather than filed.
+  //
+  // Without the guard, sharing a ROLLUP prompts a human for approval, marks the
+  // row `team-shareable, human_confirmed = 1`, and reports `shared: true` —
+  // while the projection writes ZERO rows, because it selects raw rows only. A
+  // human is asked to approve publishing something, told it was published, and
+  // nothing was. That is this round's own defect class: a true-sounding
+  // statement the system does not honour.
+  //
+  // The strongest assertion is `asked.length === 0`. Checking only the error
+  // would still pass in a world where the human is prompted first and refused
+  // afterwards — and being asked to approve something unpublishable IS the
+  // defect, by `share`'s own "Scan BEFORE asking" rule.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await overflow(service, principal)
+  ctx.get = (name) => (name === 'llm' ? rollupReply('summary') : undefined)
+  const rev = readRevision(store)
+  enqueueJob(store, 'rebuild', 'rb1', { expectedRevision: rev, provider: 'p', model: 'm' }, 0)
+  await runRebuildJob(
+    ctx, store, claimNextJob(store, Date.now(), Date.now() + 60_000),
+    { expectedRevision: rev, provider: 'p', model: 'm' }, new AbortController().signal,
+  )
+  const derived = store.db.prepare(`SELECT id FROM memories WHERE derived != 0`).get()
+  assert.ok(derived, 'the rebuild must really have produced a derived row')
+
+  const asked = []
+  service.ctx = {
+    ...ctx,
+    get: (name) =>
+      name === 'approval'
+        ? { request: async (req) => (asked.push(req), 'allowed-once') }
+        : ctx.get?.(name),
+  }
+
+  await assert.rejects(service.share(derived.id, principal), /is a generated summary/)
+  assert.equal(
+    asked.length,
+    0,
+    'a human must never be prompted to approve publishing a generated summary — the ' +
+      'projection would write nothing and the "Shared." report would be false',
+  )
+  // And the row must not have been marked on the strength of an approval that
+  // was never granted: a "prompt, mark, then fail" ordering would leave it
+  // shareable forever.
+  const after = store.db
+    .prepare(`SELECT visibility, human_confirmed FROM memories WHERE id = ?`)
+    .get(derived.id)
+  assert.notEqual(after.visibility, 'team-shareable', 'the summary must not be marked shareable')
+  assert.notEqual(after.human_confirmed, 1, 'and must not carry a human confirmation')
+  registry.dispose()
+  cleanup(root)
+})
+
 // ---------------------------------------------------- projection ---------
 
 const approvalCtx = (base, outcome) => ({
