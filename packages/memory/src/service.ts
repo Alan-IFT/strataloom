@@ -800,18 +800,124 @@ export class MemoryService extends Service {
     // cannot open is a claim without provenance, which D3 forbids. Widening
     // recall without widening this would have shipped exactly that.
     const stores = [...this.readableStores(agent, true), ...(await this.groupStores(agent))]
+    // The LAYER of a live row that was found but carries no session evidence.
+    // Held across the loop rather than thrown from inside it, so the store
+    // search stays byte-for-byte what it was: the old query `continue`d when a
+    // store produced no joined row, and this one still does. Only the FINAL
+    // sentence changes, which is exactly the defect.
+    //
+    // ⚠️ THE PRECEDENCE RULE IS FIRST-WINS — see `??=` below, which is
+    // load-bearing rather than incidental. `stores` is ordered
+    // `[repo, global, ...members]`, and `readableStores` states that ordering
+    // as a rule: "nearest scope first … the more specific context wins".
+    //
+    // WHY IT HAD TO BE DECIDED AT ALL. A plain `=` makes the LAST uncited
+    // store win, and with the same id uncited in two readable stores at
+    // DIFFERENT layers the caller receives the OPPOSITE sentence. Measured on
+    // the build that carried `=`:
+    //   derived(repo) + raw(global) => "…is a stored memory, but no source
+    //                                   conversation was recorded…"
+    //   raw(repo) + derived(global) => "…is a generated summary, not a stored
+    //                                   memory…"
+    // In the first line the caller is told the row IS a stored memory while
+    // THIS SESSION'S OWN repo store holds it as a generated summary. The
+    // sentence may be true of some copy, but the code made no claim about
+    // WHICH copy it meant, so the caller could not tell. An answer whose
+    // subject is undefined is not an honest answer, which is this round's
+    // whole subject.
+    //
+    // WHY FIRST-WINS IS THE HONEST CHOICE, not merely a coin flip resolved:
+    //   1. THE CITABLE BRANCH BELOW IS ALREADY FIRST-WINS — it `return`s from
+    //      inside this same loop. Under `=` one loop ran TWO OPPOSITE
+    //      precedence rules, selected by whether evidence happened to exist: a
+    //      citable repo copy answered from the repo, an uncited repo copy
+    //      answered from the global one. `??=` makes both branches report on
+    //      the SAME row, so the answer's subject stops depending on a fact the
+    //      caller cannot see.
+    //   2. `forget` resolves the identical "which copy of this id" question
+    //      with `.find()` over the same list — first-wins. `source` now agrees
+    //      with it, so the row this sentence describes is the row `forget`
+    //      would act on. Two surfaces answering about different copies of one
+    //      id is the "one rule, two implementations" this repo forbids.
+    //   3. `readableStores` documents nearest-scope-first as the list's
+    //      meaning. `=` silently inverted it for this one branch.
+    //
+    // WHY A PRECEDENCE RULE AND NOT AN ASSERTION THAT THIS CANNOT ARISE.
+    // `forget` carries a comment asserting "Ids are unique across stores", and
+    // that claim was CHECKED here rather than inherited: NOTHING ENFORCES IT.
+    // All four id-minting sites are bare `randomUUID()` (`extract.ts:339`,
+    // `rebuild.ts:354`, `rebuild.ts:561`, and `propose` below), none probes
+    // another store first, and `memories.id`'s `UNIQUE` constraint is
+    // per-FILE — SQLite cannot express uniqueness across separate database
+    // files, and group members are other people's files entirely. Uniqueness
+    // is therefore probabilistic, not structural, and the state is directly
+    // representable: a plain `INSERT` reaches it, which is how the two
+    // readings above were produced. Asserting it away would crash a READ path
+    // on a state it can be handed; stating the precedence answers it instead.
+    let existsWithoutSource: number | undefined
     for (const store of stores) {
       // ONE query for both paths. The excerpt and the ref are two columns of
       // the same evidence row and the provenance is one join away, so a second
       // lookup would only create a window in which they could disagree.
+      //
+      // DRIVEN FROM `memories`, LEFT JOINed to `evidence` — that direction is
+      // this round's fix, not a tidy-up. As an INNER JOIN this statement
+      // answered "is there a session evidence row", and the only exit below it
+      // said `no memory with id <id>, or it was forgotten`: a row that is
+      // present, active, and whose id `recall` had just handed to the caller
+      // was told IT DOES NOT EXIST. Measured on the unmodified tree, four
+      // input classes were denied that way — a RAW row with no evidence, and
+      // L1/L2/L3 derived rows (which never have one: `rebuild.ts` writes zero
+      // `INSERT INTO evidence`). `derived` was never the discriminant — an
+      // L1/L2/L3 row WITH evidence answers fine — the ABSENCE OF EVIDENCE was,
+      // and raw rows reach it too. So the fix keys on EXISTENCE, not layer.
+      //
+      // Two clauses are load-bearing and must not migrate between ON and WHERE:
+      //   - `e.kind = 'session'` sits in the ON clause. Moved to WHERE it would
+      //     reject the null-extended row and silently restore the INNER JOIN —
+      //     the defect back, with the word LEFT still in the SQL. That is NOT
+      //     left as a claim the reader must trust: the tidy-up a careful person
+      //     would actually write (`WHERE ... AND (e.kind = 'session' OR e.kind
+      //     IS NULL)`) is killed by the NON-SESSION case. A row whose only
+      //     evidence is `commit`/`file`/`url` DOES join under that form, is
+      //     then rejected by the WHERE, produces no row, and falls to the
+      //     generic denial — the exact defect this round removes. `evidence.kind`
+      //     is a four-value enum (schema.ts CHECK), so this clause has four
+      //     execution points, not one. Pinned by T4b.
+      //   - `m.status != 'tombstone'` stays in WHERE, so a forgotten row
+      //     produces NO row here and falls through to the generic denial at the
+      //     bottom. That is D5: a forgotten memory and an id that never existed
+      //     must remain indistinguishable, or `forget` leaks that something
+      //     was there.
+      // `derived` widens the projection of a row this statement already visits
+      // — no second `.prepare`, following the v0.4.16 precedent (`SELECT 1` ->
+      // `SELECT derived`, reusing one `.find()`). Asking "does this row exist"
+      // with a SECOND lookup would be a second implementation of one question,
+      // free to disagree with the first the moment either moves.
       const cited = store.db
         .prepare(
-          `SELECT e.ref, e.excerpt, m.provenance FROM evidence e JOIN memories m ON m.id = e.memory_id
-           WHERE e.memory_id = ? AND e.kind = 'session' AND m.status != 'tombstone'
+          `SELECT e.ref, e.excerpt, m.provenance, m.derived FROM memories m
+             LEFT JOIN evidence e ON e.memory_id = m.id AND e.kind = 'session'
+           WHERE m.id = ? AND m.status != 'tombstone'
            LIMIT 1`,
         )
-        .get(id) as { ref: string; excerpt: string | null; provenance: Provenance } | undefined
+        .get(id) as
+        | { ref: string | null; excerpt: string | null; provenance: Provenance; derived: number }
+        | undefined
       if (cited === undefined) continue
+      if (cited.ref === null) {
+        // Live, here, and uncited. Record the layer and keep searching, exactly
+        // as the inner join used to when a store held no evidence row: no store
+        // that might hold a citable copy of this id may be skipped.
+        //
+        // `??=`, NOT `=` — the FIRST readable store holding an uncited copy is
+        // the one this method reports on, matching the citable branch below
+        // (which returns from inside this same loop) and `forget`'s `.find()`.
+        // The full argument, with the measured opposite-sentence readings, is
+        // in the declaration comment above the loop.
+        existsWithoutSource ??= cited.derived
+        continue
+      }
       // `trim() !== ''`, not merely `!== null`. A whitespace-only excerpt would
       // otherwise take the quotation branch and render as a `[quote]` entry
       // with a label, an id and no readable content — a claim to be showing
@@ -849,6 +955,145 @@ export class MemoryService extends Service {
       // and `tools.ts` therefore reports the disjunction rather than picking
       // a cause it cannot know.
       return []
+    }
+    if (existsWithoutSource !== undefined) {
+      // THE RULE: a live row this session can see is never told it does not
+      // exist. ADR 0012 established it for the render layer (`sourceOf` must
+      // not reuse `RECALL_NO_MATCH`, because reaching a render means the memory
+      // WAS found); `tools.ts` has honoured it since via `SOURCE_NOT_SHOWN`,
+      // and this method bypassed it. Its domain is EXISTENCE, not derivedness.
+      //
+      // WHY THIS THROWS INSTEAD OF ROUTING INTO `SOURCE_NOT_SHOWN`. That
+      // sentence asserts a four-cause disjunction — the quotation was too large
+      // to render, the conversation aged out of retention, or it belongs to a
+      // repository this session cannot read. For a row with NO source at all
+      // every disjunct is false, so it would replace a false DENIAL with a
+      // false CAUSE: ADR 0012 lesson 6, a fix whose new failure mode is worse
+      // than the defect. `SOURCE_NOT_SHOWN` stays exactly true of the case it
+      // was written for (evidence exists, the words cannot be produced), and
+      // untouched.
+      //
+      // RECORDED WART, so the next reader does not rediscover it: at the
+      // outermost ruler this arrives as an ERROR. `asToolFailure` re-throws
+      // `MemoryInputError` untouched, the platform prefixes `Error: ` and sets
+      // `isError: true`, so the model sees this sentence verbatim under an
+      // error flag rather than as a normal result. That is acceptable ONLY
+      // because `source()`'s contract is already error-shaped — every "cannot
+      // answer" exit here throws — and adding a second exit shape for this one
+      // case would be the second mechanism this repo forbids. It is a wart,
+      // not a design: written down rather than left to be discovered.
+      //
+      // TWO ANSWERS, because two different things are true, and neither
+      // sentence may overclaim:
+      //   - DERIVED: it is a generated summary, so it is not the kind of row a
+      //     conversation is recorded FOR. It must NOT promise the caller can go
+      //     find the sources. There is no derived->source mapping anywhere in
+      //     the schema — `memories` has no such column, `evidence` is keyed
+      //     only by `memory_id`, and `rebuild.ts` writes derived rows with NO
+      //     evidence row at all — so naming the underlying memories is not
+      //     something this code could do even if it wanted to.
+      //   - RAW: it exists and no source CONVERSATION was recorded for it.
+      //     Nothing more; in particular not a reason, which this code does not
+      //     know.
+      //
+      // ⛔ THE DERIVED SENTENCE IS ITSELF A REWORK, AND THE WORDING IT REPLACES
+      // WAS FALSE — the same defect this round had just diagnosed in the RAW
+      // sentence, committed a second time in the branch beside it. It read
+      // `… so it has no source passage of its own.` That clause asserts NOTHING
+      // WAS RECORDED, and `evidence.kind` is a four-value enum: a DERIVED row
+      // whose only evidence is `commit`/`file`/`url` is null-extended by the
+      // join above and lands HERE, while `evidence.excerpt` on that very row
+      // holds a real passage. Measured across the full 3x3 grid (L1/L2/L3 x
+      // commit/file/url), at home and in both member domains, through the real
+      // registered `memory_recall` — 9 of 9 cells FALSE:
+      //   fixture : {"status":"active","derived":2},
+      //             evidence=[{kind:"commit", excerpt:"THE REAL RECORDED PASSAGE"}]
+      //   BYTES   : `rollup-2-commit is a generated summary, not a stored
+      //              memory, so it has no source passage of its own. …`
+      // The suite CONVICTED ITSELF: T4b's own forbidden regex, written by this
+      // round against exactly this overclaim, is
+      //   /no source passage was recorded|nothing was recorded|has no source passage/i
+      // and it MATCHES the shipped derived sentence on `has no source passage`.
+      // Nobody had built the derived x non-session cell, so the regex was
+      // applied to one branch and not to the branch beside it.
+      //
+      // WHY THE RAW FIX'S WORDING DOES NOT TRANSFER. "No source CONVERSATION
+      // was recorded" is the RAW discriminant, and copying it here would be
+      // wrong in a subtler way: it presents the row as one that COULD have had
+      // a conversation recorded and merely did not, which is what a RAW row is.
+      // A derived row is categorically different — it is written by the rebuild
+      // job out of other rows, never extracted from a turn — so the honest
+      // derived claim is about WHAT KIND OF ROW IT IS, not about a recording
+      // that failed to happen. The two sentences state two different facts and
+      // must keep doing so.
+      //
+      // WHAT THE NEW DERIVED SENTENCE CLAIMS, AND WHY EACH CLAUSE IS CHECKABLE:
+      //   - `is a generated summary` — established by `m.derived != LAYER.RAW`,
+      //     the column this branch read.
+      //   - `not a memory recorded from a conversation` — established by the
+      //     layer itself: `rebuild.ts:354` and `rebuild.ts:561` are the writers
+      //     of derived rows and both mint them from stored memories
+      //     (`queryInjectableSet` / `queryPersonaSources`), never from a turn.
+      //   - `so there is no source conversation of its own to show` — true for
+      //     ALL FOUR `evidence.kind` values, because none of `commit`/`file`/
+      //     `url` is a conversation, and true on all three layers.
+      // It deliberately does NOT say what the summary was built FROM. That
+      // would be a claim this query never establishes, and inventing a new
+      // overclaim while removing one is precisely the loop this round is in.
+      //
+      // WHY "no source conversation was recorded" AND NOT "no source passage
+      // was recorded" — this wording is a rework, and the earlier one was
+      // FALSE. `evidence.kind` is a four-value enum (`session`/`commit`/`file`/
+      // `url`, schema.ts CHECK), and this statement joins only `session`. A row
+      // whose ONLY evidence row is `commit`, `file` or `url` is therefore
+      // null-extended and lands HERE — while `evidence.excerpt` on that very
+      // row may hold a real recorded passage. Measured against the build that
+      // carried the old wording, all three non-session kinds produced:
+      //   `<id> is a stored memory, but no source passage was recorded for it`
+      //   ^ evidence.kind=commit excerpt="THE REAL RECORDED PASSAGE" IS recorded
+      // i.e. the sentence asserted a fact the store CONTRADICTS. On HEAD this
+      // input got the generic denial — wrong, but only a false DENIAL; the
+      // first wording turned it into a false STATEMENT OF FACT, which is ADR
+      // 0012 lesson 6 (the fix's new failure mode worse than the defect), the
+      // very test this round applies to `SOURCE_NOT_SHOWN` and passes there.
+      // "No source CONVERSATION was recorded" is true for all four enum values:
+      // this drill-down answers out of a `session` row (the quotation is an
+      // excerpt OF that conversation), and for every other kind there is
+      // genuinely no conversation. It states the discriminant instead of
+      // denying that anything at all was stored.
+      //
+      // THE REJECTED ALTERNATIVE, recorded so it is not re-proposed: admit
+      // every `evidence.kind` into the join and return a non-session excerpt as
+      // a hit. It fails twice. (1) `ref` would no longer be a session id, so
+      // the fallback `readSessionTurns` finds nothing and the call returns `[]`
+      // — which `tools.ts` renders as `SOURCE_NOT_SHOWN`, whose four disjuncts
+      // are ALL false for such a row: a false CAUSE, the same lesson again.
+      // (2) Rendering a commit/file/url excerpt under `QUOTE_LABEL`/`QUOTE_SEQ`
+      // asserts "this is the passage cited FROM A SESSION", which ADR 0012
+      // §2.2 exists to keep honest. That is a second rule with a second
+      // implementation; this stays one rule, one query, one sentence.
+      //
+      // WHY EITHER SENTENCE IS SAFE TO SHARE BETWEEN THE HOME STORE AND A
+      // GROUP MEMBER'S — the exact point on which v0.4.16 went the other way.
+      // That round found a sentence whose truth value FLIPPED with the input
+      // domain ("start a session inside that checkout and retry" is true at
+      // home, false across the boundary) and split it in two. These sentences
+      // do not flip, and the reason is structural: they make NO claim about
+      // what a session can DO — no advice, no destination, no future — only
+      // about what the ROW IS. "X is a generated summary, not a memory recorded
+      // from a conversation" is equally true whichever store holds it, because
+      // being a summary is a property of the row, not of the reader's access to
+      // it. A sentence with no actionable half has no half that can be false in
+      // one domain. Measured in both member domains (live and archived), on all
+      // three layers and all four evidence kinds, by `group.test.mjs` 6h.
+      throw new MemoryInputError(
+        existsWithoutSource === LAYER.RAW
+          ? `${id} is a stored memory, but no source conversation was recorded for it, so ` +
+              'there is nothing to show. The memory itself is unaffected.'
+          : `${id} is a generated summary, not a memory recorded from a conversation, so ` +
+              'there is no source conversation of its own to show. The memory itself is ' +
+              'unaffected.',
+      )
     }
     throw new MemoryInputError(`no memory with id ${id}, or it was forgotten`)
   }

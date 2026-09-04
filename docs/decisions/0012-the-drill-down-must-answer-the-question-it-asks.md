@@ -254,6 +254,145 @@ retention`——对「L0 在别的库、`readableStores` 够不着」的情形**
 （实测 global 库有若干条属此类），而且因豁免子句的存在，**老化反而是较罕见的
 分支**。两者在该处不可区分，故改为如实报告析取。
 
+### 📌 追记（v0.4.17）：这条规矩的域是**存在性**，不是**派生性**
+
+**为什么补在这里，而不是新开一篇。** 上一节立的规矩是「在这个面上**否认记忆
+存在永远是假话**」，但它只在 `tools.ts` 的 render 层落地成了 `SOURCE_NOT_SHOWN`，
+**`service.ts` 绕过了它**：`source()` 的最后一句 `no memory with id ${id}, or it
+was forgotten`，在**内层 `JOIN` 取不到 `session` 证据行**时就会发出。
+下一个 agent 从本文重新推导时，把这条规矩读成了「**这是关于派生行的**」，
+于是方案只覆盖派生行——**同一份文档喂出了同一个错误框定**，故必须在文档里改口。
+
+**判别式实测（2×2，独立复现三次，全部走未修改的 HEAD ＋ 完整调用链）**：
+
+| 输入 | 有 `session` 证据行 | 无 `session` 证据行 |
+|---|---|---|
+| **raw 行** | `RETURNED 1 turn(s)` | ❌ `no memory with id B-raw-noev, or it was forgotten` |
+| **L1 派生行** | `RETURNED 1 turn(s)` | ❌ `no memory with id D-derived-1, or it was forgotten` |
+| **L2 派生行** | `RETURNED 1 turn(s)` | ❌ `no memory with id D-derived-2, or it was forgotten` |
+| **L3 派生行** | `RETURNED 1 turn(s)` | ❌ `no memory with id D-derived-3, or it was forgotten` |
+
+**左列整列为真**即证伪「派生 ⇒ 被否认」：带证据的派生行答得好好的。
+**右上格**是「派生行」这个框定漏掉的那一半：**raw 行同样撞上这句话**。
+再加一条静态实测：`source()` 方法体内 `derived`／`LAYER` 出现 **0 次**——
+它**从来没有读过这一列**，所以派生性**不可能**是判别式。
+
+**故本规矩的正式表述是：一条本会话看得见的活行，永远不被告知它不存在。**
+「活」由 `m.status != 'tombstone'` 界定，而这一条**必须留在 `WHERE`**：
+被遗忘的行要继续落到那句通用否认里，与**从不存在的 id 逐字相同**——这就是 D5，
+**不可分辨性本身是功能**，不是措辞。（同理，`e.kind = 'session'` 必须留在 `ON`：
+挪进 `WHERE` 会滤掉空扩展行，**SQL 里还写着 LEFT，语义已退回 INNER**。）
+
+**修法形态（登记，因为它与上一节的选择相反，而两者都对）**：这一情形**抛出**，
+**不复用 `SOURCE_NOT_SHOWN`**。上一节新增那句，是因为它要报告的两种成因**都为真**；
+而对一条**根本没有源**的行，`SOURCE_NOT_SHOWN` 的四个析取支（引文过大／老化／
+属于本会话读不到的仓库）**每一个都为假**——那是拿**假成因**换掉**假否认**，
+正是本文**教训 6**：修复引入的失败模式比它修的缺陷更坏。
+**同一条规矩在不同输入域上要求不同的落地形态**，这本身就是本文的主张：
+先问这一行**是什么**，再决定说什么。
+
+**顺带的禁令**：派生行的文案**不得**告诉调用方去哪里找到那些源。
+schema 里**没有派生→源映射**（`memories` 无该列，`evidence` 只以 `memory_id`
+为键，`rebuild.ts:348`／`rebuild.ts:557` 写派生行时**一条 evidence 都不写**——
+实测该文件 `INSERT INTO evidence` 出现 0 次），故任何这类指引**照做必失败**，
+与 v0.4.16 删掉的那句假建议同型。
+
+### ⛔ 追记之二（v0.4.17 返工）：raw 那句话曾经**自己犯了教训 6**
+
+上面这段追记写下「不可拿**假成因**换掉**假否认**」之后，**同一轮的 raw 文案就这么做了**。
+初版 raw 句为 `… no source passage was recorded for it …`，而 `evidence.kind` 是
+**四值枚举**（`session`/`commit`/`file`/`url`，schema.ts CHECK），本查询**只 join `session`**。
+于是**唯一证据是 `commit`/`file`/`url` 的行**被空扩展、落进 raw 分支，
+而它的 `evidence.excerpt` 里**确实存着一段被记录的原文**。实测（走已装修复的构建）：
+
+```
+only-commit: THREW <id> is a stored memory, but no source passage was recorded for it, …
+   ^ evidence.kind=commit excerpt="THE REAL RECORDED PASSAGE" IS recorded
+only-file / only-url : 同样
+```
+
+**在 HEAD 上这个输入得到的是通用否认**——错，但只是**假否认**；
+装上修复后它变成**一句假的事实陈述**，即**修复把缺陷换成了更坏的失效模式**，
+正是本文教训 6，也正是这一轮拿去检验 `SOURCE_NOT_SHOWN` 并通过了的那把尺子。
+
+**改法是收窄断言到查询真正确立的那件事**：`no source **conversation** was recorded`。
+该句对四个枚举值**全部为真**——本下钻是从 `session` 行作答的（引文即那次会话的摘录），
+其余三种 kind 则确实没有会话。**它陈述判别式，而不是否认「什么都没存」。**
+
+**被否决的替代（记下来以免重提）**：把所有 `evidence.kind` 都放进 join、直接返回非会话 excerpt。
+两处失败：①`ref` 不再是 session id，回退 `readSessionTurns` 取不到东西、返回 `[]`，
+被 `tools.ts` 渲染成 `SOURCE_NOT_SHOWN`——而它的四个析取支对这种行**全为假**，
+**又是一次假成因**；②把 commit/file/url 的 excerpt 挂在 `QUOTE_LABEL`/`QUOTE_SEQ` 下，
+等于断言「这是从**会话**里引的那段」，而 §2.2 的存在就是为了让这条标注为真。
+
+**教训的推论（新增，见教训 10）**：**规则一旦表达在枚举上，每一个枚举值都是执行点。**
+「今天没有写者产生非 session 的 kind」（生产直方图 `{session: 540}`）**不是理由**——
+那正是本轮用来论证「raw 无证据 0 条真实数据也要守」的**同一条「待办 p 判例」**。
+
+### ⛔ 追记之三（v0.4.17 第二次返工，3c）：**派生那句话犯了追记之二刚刚定罪的同一条罪**
+
+追记之二把 raw 句从 `no source **passage** was recorded` 收窄成
+`no source **conversation** was recorded`，写下判据「**它陈述判别式，而不是否认
+『什么都没存』**」，并让测试套件带上一条**禁止正则**：
+
+```
+/no source passage was recorded|nothing was recorded|has no source passage/i
+```
+
+**而派生句从头到尾没被收窄**，仍写着 `… so it has no source passage of its own.`——
+**这条正则逐字判它有罪**（命中 `has no source passage`）。
+原因一模一样：`evidence.kind` 是四值枚举，**派生行同样可以只带 `commit`/`file`/`url` 证据**，
+而它的 `evidence.excerpt` 里**确实存着一段被记录的原文**。
+实测 **L1/L2/L3 × commit/file/url 共 9 格，9/9 为假**（走真实注册的 `memory_recall`）：
+
+```
+fixture : {"status":"active","derived":2},
+          evidence=[{kind:"commit", excerpt:"THE REAL RECORDED PASSAGE"}]
+BYTES   : "rollup-2-commit is a generated summary, not a stored memory, so it
+           has no source passage of its own. …"
+```
+
+**没有人建过 `derived × 非 session kind` 这一格**——追记之二只建了 `raw × 非 session kind`。
+
+**raw 的修法不可照搬**，这是本次最重要的一条判断：`no source **conversation** was
+recorded` 用在派生行上**同样为假**，因为它把该行描述成「**本来可以记录一次会话、只是没记**」，
+而**那正是 raw 行的语义**。派生行由 rebuild 作业**从其他已存行**生成
+（`rebuild.ts:354` 取 `queryInjectableSet`，`rebuild.ts:561` 取 `queryPersonaSources`），
+**从来不是从某个 turn 提炼出来的**。故诚实的派生断言必须是关于**它是哪一类行**：
+
+```
+<id> is a generated summary, not a memory recorded from a conversation, so there is
+no source conversation of its own to show. The memory itself is unaffected.
+```
+
+**每个子句都由该分支已经读到的 `derived` 列确立**，对**四个 kind × 三层全部为真**，
+且**刻意不说这份摘要是从什么建出来的**——那是本查询从未确立的事实，
+**在删掉一条 overclaim 的同时发明另一条**，正是这份文档反复记录的那个循环。
+
+### ⛔ 追记之四（同轮）：**存储迭代顺序在无声地决定调用方收到哪一句**
+
+`existsWithoutSource` 原本是被循环**反复覆盖**的单变量（`=`），**最后一个未被引用的库获胜**，
+且**无人钉住**。同一 id 在两个可读库里各以**不同层**未被引用时，调用方收到**相反的那一句**：
+
+```
+derived(repo) + raw(global)  => "…is a stored memory, but no source conversation was recorded…"
+raw(repo) + derived(global)  => "…is a generated summary, not a stored memory…"
+```
+
+**第一行里，调用方被告知这一行「是一条已存记忆」，而本会话自己的 repo 库正把它存为一条生成摘要。**
+这句话或许对**某一份副本**为真，但**调用方无从判断是哪一份**，代码也**从未声明它指的是哪一份**。
+
+**`forget` 有一句注释断言「id 跨库唯一」——去查之后发现没有任何东西在保证它**：
+四个铸 id 点全是裸 `randomUUID()`（`extract.ts:339`、`rebuild.ts:354`、`rebuild.ts:561`、
+`service.propose`），**无一在写入前探测别的库**；`memories.id` 的 `UNIQUE` 是**按文件**的，
+**SQLite 无法跨独立数据库文件表达唯一性**，而 group member 根本是别人的文件。
+**故该状态可直接构造**（上面两行读数即由此得来），**读路径必须回答它，而不是崩在它上面**。
+
+**选定 first-wins（`??=`，最近作用域优先）**，理由可复核：**同一循环下方的「可引用」分支
+本来就是 first-wins**（它从循环内 `return`），于是 `=` 让**一个循环跑着两条相反的优先级规则**，
+由「恰好有没有证据」来选；而 `forget` 的 `.find()` 同样是 first-wins——
+**于是这句话描述的那一行，就是 `forget` 会动的那一行**。详见教训 14。
+
 ## 四、已登记的取舍：引文的信任标注是**整条**的，不是**逐段**的
 
 QA 实测：**127/322 = 39.4%** 的引文条目，其 `title`（= 记忆的 provenance）
@@ -381,3 +520,84 @@ turn 产生**两份不一致的转写**（propose 之后的事件不在其中）
    设界、读者按**渲染 token** 计价，而 `renderEntry` 的缩进使二者相差近 2 倍。
    **两个都对的界，其乘积仍可以是缺陷**——与 ADR 0010 教训 1（两条各自正确的
    规则，交互后是缺陷）同型。
+9. **一条规矩必须写清它的域，否则下一个人会从你的例子里反推出错的域。**
+   （v0.4.17 追记）§3 立的是「不否认存在」，但它举的例子全是派生行，
+   于是下一轮的框定变成「**这是关于派生行的**」，方案漏掉了 raw 行那个执行点。
+   实测证伪只用了一格：**带证据的派生行答得好好的**。**规矩要连同它的判别式
+   一起写下来**——本文现在写的是「活行 ≠ 不存在」，而不是「派生行怎么办」。
+10. **规则表达在枚举上时，每一个枚举值都是一个执行点。**（v0.4.17 返工追记）
+    `evidence.kind` 有四个值，本轮的查询只 join 其中一个，于是另外三个值
+    **各自都是一条未被检查的路径**——而初版 raw 文案在它们上面**为假**
+    （见追记之二）。「今天没有写者产生那三个值」不是理由，那正是本轮自己
+    用来论证「0 条真实数据也要守 raw 无证据」的判例。**守一个枚举，要么覆盖
+    它的全部取值，要么把断言收窄到你真正验证过的那个取值。**
+11. **只守住一个切片的失败会换着装重现——第五次了，这次的切片是「raw vs 派生」。**
+    （v0.4.17 返工追记）v0.4.15 是 L2 vs L1/L3，v0.4.16 是 home vs member，
+    本轮**专门为修这个形状而立**，却把派生句用五条反向断言守住、
+    raw 句**一条都没有**：评审把 v0.4.16 的假建议原样塞回 raw 句，**全量 291/0 存活**；
+    把 raw 句尾改成「**这条记忆已被删除**」，仍然 **291/0 存活**——
+    一条**读路径**可以声称它删了用户的记忆而测试全绿，
+    而**同一个变异打在派生句上会被立刻打红**。
+    **根治办法不是把断言复制一份**（复制会漂移，下一句新增的文案又会裸奔），
+    **而是让两句话走同一个断言函数**：本轮的 `assertHonestRefusal` 对两句施加
+    **同一组守卫＋整句逐字相等**，于是「满足全部正向断言、再附上一句假话」这种
+    变异**在结构上无法通过**。**判据：一句新文案若不经过那个函数，它就是没被守。**
+
+    > **⛔ 第六次（v0.4.17 第二次返工，3c）：切片是「service 的句子 vs 工具描述的句子」。**
+    > 上面这条教训写下「让两句话走同一个断言函数」之后，那个函数**被放在
+    > `layers.test.mjs` 里**——于是 `group.test.mjs` 的 6h **够不着它**，
+    > 把 9 条断言 inline 抄了一遍（还硬编码了一份句子字面量）；
+    > 而**同一轮改过的三条面向模型描述串一条都没被守**：
+    > MK（参数描述换成「忘掉它再重新 recall」）、MM（工具描述追加 v0.4.16 假建议原文）、
+    > MN（`GUIDANCE_SECTION` 追加「若无则忘掉它」，157 ≤ 160 **绕过预算断言**）
+    > **三条全部 298/298/0 存活**。
+    > **推论：共享守卫必须住在两个切片都已经 import 的那个模块里**（此处是
+    > `test/helpers.mjs`）。**住在其中一个切片的文件里的守卫，另一个切片不会去 import。**
+
+12. **规则表达在一个枚举上时，"另一个分支"也是那个枚举的执行点。**
+    （v0.4.17 第二次返工）教训 10 说「守一个枚举要覆盖它的全部取值」，
+    本轮据此**收窄了 raw 句**、**写了 T4b×3**、并**亲手写下一条禁止正则**：
+
+    ```
+    /no source passage was recorded|nothing was recorded|has no source passage/i
+    ```
+
+    **然后把它只施加在 raw 分支上。** 旁边那个 `derived` 分支仍写着
+    `… so it has no source passage of its own.`，而**这条正则逐字判它有罪**
+    （命中 `has no source passage`）。实测 **L1/L2/L3 × commit/file/url 共 9 格全假**。
+    **即：套件自己拥有一条能给自己定罪的正则，而它只被用在两个分支中的一个上。**
+    **判据：写下一条禁止正则时，立刻对它所在文件里**每一条**同类文案跑一遍——
+    包括你正在写的那一条。**
+
+13. **修一句 overclaim 时最容易做的事，是把它的修法照抄给一个语义不同的兄弟分支，从而造出第二句 overclaim。**
+    （v0.4.17 第二次返工）raw 句的正解是收窄成 `no source **conversation** was recorded`。
+    把它照搬给派生行**同样为假**——那句话把该行描述成「本可记录一次会话、只是没记」，
+    而**那正是 raw 行的语义**。派生行由 rebuild 作业**从其他已存行**生成
+    （`rebuild.ts:354`／`rebuild.ts:561`），**从来不是从某个 turn 提炼的**，
+    所以诚实的断言必须是关于**它是哪一类行**：
+    `is a generated summary, not a memory recorded from a conversation`。
+    **判据：两个分支之所以是两个分支，是因为它们陈述的是两件不同的事实；
+    修法可以共享判据，措辞不可以共享。**
+
+14. **"这个状态不会发生"必须去查是什么在保证它，而不是继承一句注释。**
+    （v0.4.17 第二次返工）`existsWithoutSource` 被循环反复覆盖（`=`），
+    于是**最后一个未被引用的库**决定调用方收到哪一句；同一 id 在两库以不同层未被引用时，
+    调用方收到的是**相反的那一句**，而**代码从未声明它指的是哪一份副本**。
+    `forget` 有一句注释断言「id 跨库唯一」，**去查之后发现没有任何东西在保证它**：
+    四个铸 id 点全是裸 `randomUUID()`，**无一在写入前探测别的库**，
+    而 `memories.id` 的 `UNIQUE` 是**按文件**的——**SQLite 无法跨独立数据库文件表达唯一性**。
+    **故该状态可直接构造，读路径必须回答它而不是崩在它上面。**
+    选定 **first-wins（最近作用域优先）**，理由是**同一循环下方的「可引用」分支本来就是
+    first-wins**（`=` 让一个循环跑着两条相反的优先级规则，由「恰好有没有证据」来选），
+    且 `forget` 的 `.find()` 也是 first-wins——**于是这句话描述的行，就是 `forget` 会动的那一行**。
+    **判据：一个"主语取决于迭代顺序"的回答不是诚实的回答；要么定下并写明优先级，
+    要么证明该状态不可表示——而"证明"意味着找到那个强制它的机制，不是引用一句注释。**
+
+15. **靠意外杀死一个变异，不算守住它。**（v0.4.17 第二次返工，本轮自查）
+    共享守卫初稿把 MK 的**原话**钉了进去，重跑矩阵时发现 **MN 的载荷一条都没命中**——
+    MN 转红**纯属偶然**：它撞的是另一个文件里一条**与诚实性无关**的锚点唯一性断言，
+    **只要有人改动那个锚点，这个"守卫"就消失**。
+    这正是本文 §S1 已经批评过一次的做法（**钉被拒的字节串，而不是钉属性**）的第三次复发。
+    **判据：每条变异都要问"它是被哪一条断言杀死的"，而不只是"它红了没有"。**
+    改法是按**属性**断言——「读路径不得命令模型销毁记忆」——
+    并**同时验证它不误伤合法用法**（此处是三条串里都合法出现的工具名 `memory_forget`）。

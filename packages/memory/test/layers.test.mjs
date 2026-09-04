@@ -18,7 +18,7 @@ import {
 } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { MemoryService } from '../lib/service.js'
+import { MemoryService, MemoryInputError } from '../lib/service.js'
 import { GLOBAL_STORE_KEY } from '../lib/store/store.js'
 import { captureTurn, readTurn, pruneConversations } from '../lib/store/conversations.js'
 import { collectTurnEvents, QUOTE_LABEL, QUOTE_SEQ } from '../lib/transcript.js'
@@ -36,6 +36,7 @@ import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import {
   DONE_RETENTION_MS,
   EXTRACT_EVENT_EXCERPT_CHARS,
+  GUIDANCE_BUDGET_TOKENS,
   INJECT_BODY_BUDGET_TOKENS,
   INJECT_PACKET_BUDGET_TOKENS,
   INJECT_TOP_N,
@@ -55,7 +56,12 @@ import {
   worstPersonaTokens,
 } from '../lib/constants.js'
 import { collectMetrics } from '../lib/metrics.js'
-import { RECALL_NO_MATCH, SOURCE_NOT_SHOWN, registerTools } from '../lib/tools.js'
+import {
+  GUIDANCE_SECTION,
+  RECALL_NO_MATCH,
+  SOURCE_NOT_SHOWN,
+  registerTools,
+} from '../lib/tools.js'
 import { runDecayJob } from '../lib/pipeline/decay.js'
 import {
   enqueueRebuildIfOverflowing,
@@ -86,6 +92,10 @@ import {
   assistantMessageEvent,
   toolCallEvent,
   toolResultEvent,
+  assertHonestRefusal,
+  assertNoFalseAdvice,
+  DERIVED_SENTENCE,
+  RAW_SENTENCE,
 } from './helpers.mjs'
 
 const makeRepo = () => {
@@ -753,6 +763,974 @@ test('an unshowable sourceOf reports the SOURCE as missing, never the memory', a
   assert.equal(miss.text, RECALL_NO_MATCH, 'a real search miss still reads as one')
   registry.dispose()
   cleanup(root)
+})
+
+// ------------------------- sourceOf: a live row is never told it does not exist --
+
+/**
+ * A live row's id must never be answered with "no memory with id …".
+ *
+ * WHAT WAS WRONG. `service.source()` INNER-JOINed `evidence` to `memories` and
+ * ended with `no memory with id <id>, or it was forgotten`. Reaching that line
+ * meant only "no session evidence row was found", so a row that is PRESENT,
+ * ACTIVE, and whose id `recall` had just handed to the caller was told it does
+ * not exist. Measured on the unmodified tree, all four of these were denied:
+ *
+ * ```
+ * A raw   + evidence      : RETURNED 1 turn(s)
+ * B raw   + NO evidence   : THREW ... no memory with id B-raw-noev, or it was forgotten
+ * C L1/L2/L3 + evidence   : RETURNED 1 turn(s)      <- derived rows WITH evidence answer fine
+ * D L1/L2/L3 + NO evidence: THREW ... no memory with id D-derived-N, or it was forgotten
+ * ```
+ *
+ * CELL C IS THE WHOLE POINT: `derived` is NOT the discriminant. A derived row
+ * with an evidence row answers normally, and cell B shows a RAW row reaches the
+ * same denial. The discriminant is the ABSENCE OF A SESSION EVIDENCE ROW, so
+ * these cases are keyed on EXISTENCE, not on derivedness — and there are FOUR
+ * execution points, not three.
+ *
+ * WHY THIS SURFACE THROWS RATHER THAN RENDERING `SOURCE_NOT_SHOWN`: that
+ * sentence asserts a four-cause disjunction, and for a row with no source every
+ * disjunct is false. Trading a false denial for a false CAUSE is ADR 0012
+ * lesson 6. The case it was written for is unchanged and still pinned below.
+ */
+
+/**
+ * Plant an active derived row of a GIVEN layer in a store.
+ *
+ * `layer` is REQUIRED and has NO DEFAULT (todo-l precedent, and the same
+ * helper contract `test/group.test.mjs` uses). A default would let a call site
+ * stay silent about the layer and quietly re-concentrate the suite on one
+ * value — v0.4.15 and v0.4.16 both shipped that costume of the same failure.
+ *
+ * ORDERING IS LOAD-BEARING: D9's triggers retire the ENTIRE derived layer on
+ * any raw insert/update/delete, so every raw write must already have happened.
+ * A fixture that plants the derived row first holds nothing by the time the
+ * assertion runs and passes for the wrong reason.
+ */
+const plantDerivedRow = (store, id, layer) => {
+  assert.ok(
+    DERIVED_LAYERS.includes(layer),
+    `plantDerivedRow needs an explicit derived layer, got ${layer}`,
+  )
+  store.db
+    .prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+       VALUES (?, 'fact', ?, 'active', 'generated rollup', 'generated', ?, 0, 9000000000000, ?)`,
+    )
+    .run(id, store.kind === 'global' ? 'private' : 'repo-local', DERIVED_PROVENANCE, layer)
+  return id
+}
+
+/**
+ * Sampled at the moment of the `source` call, not at insert time — D9 may have
+ * deleted the row in between, and a fixture that no longer holds what it says
+ * it holds proves nothing.
+ *
+ * The layer is checked EXACTLY. `notEqual(row.derived, LAYER.RAW)` collapses
+ * all three derived layers into one value: it cannot tell an L1 fixture from an
+ * L3 one, so against the layer-coverage gap these cases exist for it asserts
+ * nothing at all.
+ */
+const assertLiveRowAt = (store, id, layer) => {
+  const row = store.db.prepare(`SELECT status, derived FROM memories WHERE id = ?`).get(id)
+  assert.ok(row, `the row ${id} must still be in the store when source() runs`)
+  assert.equal(row.status, 'active', 'and live — a tombstone would take the D5 path instead')
+  assert.equal(
+    row.derived,
+    layer,
+    `and sitting on layer ${layer} exactly — a case that plants one layer while asserting ` +
+      'only "not RAW" cannot detect a production check that covers a different layer',
+  )
+  const evidence = store.db
+    .prepare(`SELECT count(*) AS n FROM evidence WHERE memory_id = ? AND kind = 'session'`)
+    .get(id)
+  assert.equal(
+    evidence.n,
+    0,
+    'the precondition of this whole family is that the row has NO session evidence; with one ' +
+      'it answers normally (cell C) and the case would be testing the success path',
+  )
+}
+
+/**
+ * Capture the refusal and CLASSIFY it. `assert.rejects(p, MemoryInputError)`
+ * cannot do this: the fail-closed `no memory with id …` is ALSO a
+ * MemoryInputError, so that form cannot tell whether the new branch ran at all
+ * — v0.4.16 shipped a vacuous test on exactly this shape.
+ */
+const captureSourceRefusal = async (service, id, agent) => {
+  let message
+  await assert.rejects(service.source(id, agent, SOURCE_TURN_LIMIT), (error) => {
+    assert.ok(error instanceof MemoryInputError, 'the refusal keeps its class')
+    message = error.message
+    return true
+  })
+  return message
+}
+
+const LAYER_NAMES = {
+  [LAYER.SUMMARY]: 'L1 rollup',
+  [LAYER.SCENARIO]: 'L2 scenario',
+  [LAYER.PERSONA]: 'L3 portrait',
+}
+
+/**
+ * ⬆️ `assertHonestRefusal`, `assertNoFalseAdvice`, `DERIVED_SENTENCE` and
+ * `RAW_SENTENCE` NOW LIVE IN `./helpers.mjs` AND ARE IMPORTED AT THE TOP OF
+ * THIS FILE.
+ *
+ * ⛔ WHY THEY MOVED (rework, step 3c). Defining them here guarded the two
+ * `service.ts` sentences and nothing else. Two consequences, both measured:
+ *   - `group.test.mjs`'s 6h cases could not import them and had
+ *     RE-IMPLEMENTED NINE of these assertions inline, plus a hardcoded copy of
+ *     the derived sentence — exactly the drift a shared helper exists to
+ *     prevent, and a copy that a wording rework leaves silently stale.
+ *   - The three MODEL-FACING DESCRIPTION STRINGS this round edited had no
+ *     guard at all. Three mutations, each proven landed in `lib/`, ALL
+ *     survived at 298/298/0: MK (`sourceOf` param description -> `Forget it
+ *     and recall it again to fix this.`), MM (tool description + the literal
+ *     v0.4.16 payload `Start a session inside that checkout and retry.`), and
+ *     MN (`GUIDANCE_SECTION` + `If none, forget it.`, priced at 157 <= 160 so
+ *     the load-time budget assertion does not catch it, and paid on EVERY
+ *     request).
+ *
+ * That is the SIXTH occurrence of "one rule, N execution points, only some
+ * guarded" — this time the slice was *service sentences vs. tool-description
+ * sentences*. A helper living in one slice's test file is a helper the other
+ * slice does not import, so it now lives beside `fakeAgent` in `helpers.mjs`,
+ * which both files already import. The full rationale is on the definitions
+ * there; T8 below runs `assertNoFalseAdvice` over all three descriptions.
+ */
+
+/**
+ * T1-T3: one INDEPENDENT test per derived layer, generated by this loop.
+ *
+ * WHY THREE TESTS AND NOT ONE TEST WITH AN INTERNAL LOOP. Measured, not
+ * stylistic (v0.4.15): a single case looping over the layers stops at its first
+ * failing assertion, so it reports "layer 1 failed" and says NOTHING about
+ * layer 3 — whether the third layer also leaks is unobservable from the result.
+ * Generating a test per layer makes each layer its own execution point, and a
+ * mutant that misses exactly one layer names that layer in the output.
+ */
+for (const layer of DERIVED_LAYERS) {
+  test(`sourceOf on an ${LAYER_NAMES[layer]} says what the row IS, never that it does not exist`, async () => {
+    const { root, registry, principal, service } = setup()
+    const store = service.storeFor(principal, true)
+    // EVERY raw write first (D9), then the derived plant. Reversed, the raw
+    // propose below would delete the layer and the assertion would be made
+    // against an absent row — passing through the fail-closed path.
+    await service.propose(
+      { title: 'raw anchor', body: 'a real memory, written before the plant', kind: 'fact' },
+      principal,
+    )
+    const id = plantDerivedRow(store, `rollup-${layer}`, layer)
+
+    assertLiveRowAt(store, id, layer)
+
+    const message = await captureSourceRefusal(service, id, principal)
+    // Every guard BOTH sentences carry — see `assertHonestRefusal`, which the
+    // raw case calls with the same force. The layer-specific facts follow.
+    assertHonestRefusal(message, id, DERIVED_SENTENCE(id))
+    // What it IS: a generated summary, which is a KIND OF ROW, not a recording
+    // that failed to happen.
+    assert.match(message, /generated summary/)
+    assert.match(message, /not a memory recorded from a conversation/)
+    // ⛔ REWORK (step 3c): the derived sentence used to end `…so it has no
+    // source passage of its own.`, and that clause is FALSE for a derived row
+    // whose only evidence is `commit`/`file`/`url` — `evidence.excerpt` there
+    // holds a real passage. T4d below measures all nine such cells; this pin
+    // stops the overclaim returning through the layer cases too. It is the
+    // SAME forbidden regex T4b applies to the raw sentence, which is how the
+    // defect was found: the suite already owned a regex convicting its own
+    // shipped sentence, applied to one branch only.
+    assert.doesNotMatch(
+      message,
+      /no source passage was recorded|nothing was recorded|has no source passage/i,
+      'the derived sentence may not claim nothing was recorded — a derived row can carry ' +
+        'commit/file/url evidence whose excerpt is a real passage',
+    )
+    // And NOT the raw answer: an L1/L2/L3 row is not "a stored memory whose
+    // source conversation went unrecorded", it is a row that never had one.
+    assert.doesNotMatch(message, /is a stored memory, but no source conversation was recorded/)
+
+    // The row is untouched: this is a read path that refuses, not a writer.
+    assertLiveRowAt(store, id, layer)
+    registry.dispose()
+    cleanup(root)
+  })
+}
+
+test('sourceOf on a RAW row with no session evidence says so, and does not deny it exists', async () => {
+  // T4 — EXECUTION POINT 1, the one the original framing missed entirely by
+  // keying the fix on `derived`. "Unreachable today" is explicitly NOT a
+  // defence in this repo (the "todo p" precedent), and the reachability is thin
+  // anyway: nothing in the schema requires a raw row to carry evidence, and
+  // `propose` is not the only writer.
+  //
+  // Measured under the narrower derived-only fix, this input still emitted
+  // `no memory with id raw-noev, or it was forgotten` — mutation M5 below.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  const { id } = await service.propose(
+    { title: 'a raw memory', body: 'written by the real writer, evidence and all', kind: 'fact' },
+    principal,
+  )
+  // Strip the evidence rather than hand-writing a memory row without one: the
+  // row is then exactly what the real writer produces, minus the one thing
+  // under test. Deleting from `evidence` is not a `memories` write, so D9 does
+  // not fire and nothing else in the fixture moves.
+  store.db.prepare(`DELETE FROM evidence WHERE memory_id = ?`).run(id)
+
+  const row = store.db.prepare(`SELECT status, derived FROM memories WHERE id = ?`).get(id)
+  assert.equal(row.status, 'active', 'the row is live when source() runs')
+  assert.equal(row.derived, LAYER.RAW, 'and RAW exactly — this is the raw execution point')
+  assert.equal(
+    store.db.prepare(`SELECT count(*) AS n FROM evidence WHERE memory_id = ?`).get(id).n,
+    0,
+    'and carries no evidence at all — the precondition this case exists for (P3 removes this ' +
+      'deletion and the case must go red)',
+  )
+
+  const message = await captureSourceRefusal(service, id, principal)
+  // ⛔ REWORK: this line used to be the ONLY positive assertion here, and the
+  // derived sentence's five negatives were not applied to it. Both sentences
+  // now run the SAME guards, from one definition.
+  assertHonestRefusal(message, id, RAW_SENTENCE(id))
+  assert.match(message, /no source conversation was recorded/)
+  // It must NOT call a raw row a generated summary: that is the derived
+  // sentence, and it is false here. Sharing one sentence across both would be
+  // the v0.4.16 defect in miniature.
+  assert.doesNotMatch(
+    message,
+    /generated summary/,
+    'a raw memory is not a generated summary; the two answers are different facts',
+  )
+
+  // AND THROUGH THE TOOL LAYER, not just `service.source()`'s exit. ADR 0012
+  // §5's whole finding is that stopping at the service exit is what let three
+  // mutations survive the suite: the damage happens AFTER it. The derived case
+  // reaches the outermost ruler via T6; without this, the RAW sentence's only
+  // measurement was one layer short of where the model reads it.
+  let thrown
+  await assert.rejects(realRecallTool(ctx, service)({ sourceOf: id }, principal), (error) => {
+    thrown = error
+    return true
+  })
+  assert.ok(thrown instanceof MemoryInputError, 'a deliberate answer passes through untouched')
+  assert.doesNotMatch(thrown.message, /store is unavailable/)
+  assert.notEqual(thrown.message, RECALL_NO_MATCH)
+  assert.notEqual(thrown.message, SOURCE_NOT_SHOWN, 'and it is not the four-cause disjunction')
+  // The bytes the model actually receives carry every guard, unchanged.
+  assertHonestRefusal(thrown.message, id, RAW_SENTENCE(id))
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * T4b — one INDEPENDENT test per NON-SESSION `evidence.kind`.
+ *
+ * ⛔ WHY THIS EXISTS (rework, step 3b). `evidence.kind` is a four-value enum
+ * (`CHECK (kind IN ('session','commit','file','url'))`, schema.ts), and
+ * `source()`'s join reads exactly one of them. A row whose ONLY evidence is
+ * `commit`/`file`/`url` is therefore null-extended and takes the raw branch —
+ * while `evidence.excerpt` on that very row may hold a real recorded passage.
+ * Measured against the build under review:
+ *
+ * ```
+ * only-commit: THREW <id> is a stored memory, but no source passage was recorded for it, …
+ *    ^ evidence.kind=commit excerpt="THE REAL RECORDED PASSAGE" IS recorded
+ * only-file / only-url : identical
+ * ```
+ *
+ * The sentence asserted a fact the store CONTRADICTS. On HEAD this input got
+ * the generic denial — wrong, but only a false DENIAL; the reviewed wording
+ * turned it into a false STATEMENT OF FACT, which is ADR 0012 lesson 6, the
+ * very test this round applies to `SOURCE_NOT_SHOWN` and passes there. Fixed
+ * by narrowing the claim to what the query actually establishes: no source
+ * CONVERSATION was recorded. That is true for all four enum values.
+ *
+ * "No writer emits a non-session kind today" is NOT a defence — the histogram
+ * is `{session: 540}` and live rows whose only evidence is non-session are 0 —
+ * but that is exactly the "todo p" precedent this round invokes to justify
+ * covering raw-no-evidence at 0 real rows. When a rule is expressed over an
+ * enum, EVERY value is an execution point.
+ *
+ * ONE TEST PER KIND, for the reason T1-T3 are three tests: a single case
+ * looping the kinds stops at its first failing assertion, so a mutant that
+ * mishandles only `url` would be reported as "commit failed" and the url
+ * verdict would be unobservable.
+ *
+ * IT ALSO PINS THE ON-CLAUSE PLACEMENT (F4). `service.ts` claims moving
+ * `e.kind = 'session'` into WHERE "would silently restore the INNER JOIN", and
+ * no test delivered that guarantee: review moved it to WHERE as a real tidy-up
+ * would (`AND (e.kind = 'session' OR e.kind IS NULL)`) and got 291/291/0
+ * twice. Under that mutation THIS row joins, is rejected by the WHERE,
+ * produces no row, and falls to `no memory with id …` — which the shared
+ * guards reject. A comment asserting a guarantee no test delivers is itself a
+ * defect; this is the test that delivers it.
+ */
+for (const kind of ['commit', 'file', 'url']) {
+  test(`sourceOf on a raw row whose ONLY evidence is kind=${kind} does not claim nothing was recorded`, async () => {
+    const { root, registry, principal, service } = setup()
+    const store = service.storeFor(principal, true)
+    const { id } = await service.propose(
+      { title: `only ${kind} evidence`, body: 'a real memory, written by the real writer', kind: 'fact' },
+      principal,
+    )
+    // Swap the writer's `session` row for a non-session one CARRYING AN
+    // EXCERPT. The excerpt is the whole point: it is the recorded passage the
+    // reviewed sentence denied the existence of.
+    store.db.prepare(`DELETE FROM evidence WHERE memory_id = ?`).run(id)
+    store.db
+      .prepare(`INSERT INTO evidence (memory_id, kind, ref, excerpt) VALUES (?, ?, ?, ?)`)
+      .run(id, kind, `ref-${kind}`, 'THE REAL RECORDED PASSAGE')
+
+    // The precondition, sampled at call time (P4 removes the INSERT and this
+    // case must go red — it then degenerates into T4's no-evidence-at-all row).
+    const evidence = store.db
+      .prepare(`SELECT kind, excerpt FROM evidence WHERE memory_id = ?`)
+      .all(id)
+      .map((row) => ({ kind: row.kind, excerpt: row.excerpt }))
+    assert.deepEqual(
+      evidence,
+      [{ kind, excerpt: 'THE REAL RECORDED PASSAGE' }],
+      `the fixture must really hold ONE ${kind} evidence row WITH an excerpt, or this case ` +
+        'measures the no-evidence path instead',
+    )
+    assert.equal(
+      store.db
+        .prepare(`SELECT count(*) AS n FROM evidence WHERE memory_id = ? AND kind = 'session'`)
+        .get(id).n,
+      0,
+      'and NO session row — that null-extension is what routes it into the raw branch',
+    )
+
+    const message = await captureSourceRefusal(service, id, principal)
+    // Same guards as every other honest refusal, from the same definition.
+    // `no memory with id` among them is what kills the ON->WHERE migration.
+    assertHonestRefusal(message, id, RAW_SENTENCE(id))
+    // AND THE OVERCLAIM ITSELF. A passage IS recorded, in `evidence.excerpt`;
+    // a sentence saying none was is false against this store.
+    assert.doesNotMatch(
+      message,
+      /no source passage was recorded|nothing was recorded|has no source passage/i,
+      `a ${kind} evidence row holding "THE REAL RECORDED PASSAGE" is a recorded passage; the ` +
+        'answer may say no source CONVERSATION was recorded, never that nothing was',
+    )
+    assert.match(
+      message,
+      /no source conversation was recorded/,
+      'it states the discriminant the query actually applies: it joins kind=session only',
+    )
+    assert.doesNotMatch(message, /generated summary/, 'a raw row is not a generated summary')
+    registry.dispose()
+    cleanup(root)
+  })
+}
+
+/**
+ * T4d — the cell NOBODY BUILT: `derived ∈ {L1,L2,L3}` × `evidence.kind ∈
+ * {commit,file,url}`. NINE independent tests.
+ *
+ * ⛔ WHY THIS EXISTS (rework, step 3c), and it is this round's own signature
+ * failure committed a second time. Step 3b's headline finding (F3) was that
+ * `no source PASSAGE was recorded` is FALSE when a row's only evidence is
+ * `commit`/`file`/`url`, because `evidence.excerpt` on that row holds a real
+ * recorded passage. It narrowed the RAW sentence to `no source CONVERSATION
+ * was recorded` and wrote T4b×3 to pin it — and left the DERIVED sentence
+ * saying `…so it has no source passage of its own.`
+ *
+ * THE SUITE CONVICTED ITSELF. T4b's own forbidden regex, twenty lines above,
+ * is `/no source passage was recorded|nothing was recorded|has no source
+ * passage/i`, and against the shipped DERIVED sentence it MATCHES, on the
+ * substring `has no source passage`. The round had written the exact regex
+ * that convicts its own other branch and applied it to one branch only.
+ *
+ * REPRODUCED IN ALL NINE CELLS before the fix, at home and in both member
+ * domains, through the real registered `memory_recall`:
+ *
+ * ```
+ * fixture : {"status":"active","derived":2},
+ *           evidence=[{kind:"commit", excerpt:"THE REAL RECORDED PASSAGE"}]
+ * BYTES   : "rollup-2-commit is a generated summary, not a stored memory, so
+ *            it has no source passage of its own. The memory itself is
+ *            unaffected."
+ * FALSE CELLS: 9 / 9
+ * ```
+ *
+ * THIS IS NOT THE REGISTERED TODO 3. That todo is a BEHAVIOUR gap (a
+ * non-session excerpt cannot be retrieved). This is the SENTENCE BEING FALSE,
+ * which is the defect class this round exists to eliminate.
+ *
+ * THE RAW FIX'S WORDING DOES NOT TRANSFER. "No source conversation was
+ * recorded" would ALSO be wrong here: it frames the row as one that could have
+ * had a conversation recorded and merely did not, which is what a RAW row is.
+ * The honest derived claim is about WHAT KIND OF ROW IT IS — written by the
+ * rebuild job out of other stored rows, never extracted from a turn — so the
+ * sentence says `is a generated summary, not a memory recorded from a
+ * conversation, so there is no source conversation of its own to show`. Every
+ * clause is established by the `derived` column this branch read, and none of
+ * them claims nothing was stored.
+ *
+ * ONE TEST PER CELL, for the reason T1-T3 and T4b are split: a single case
+ * looping the grid stops at its first failing assertion, so a mutant that
+ * mishandles only `L3 × url` would be reported as `L1 × commit` and the other
+ * eight verdicts would be unobservable.
+ */
+for (const layer of DERIVED_LAYERS) {
+  for (const kind of ['commit', 'file', 'url']) {
+    test(`sourceOf on an ${LAYER_NAMES[layer]} whose ONLY evidence is kind=${kind} does not claim nothing was recorded`, async () => {
+      const { root, registry, principal, ctx, service } = setup()
+      const store = service.storeFor(principal, true)
+      // EVERY raw write first (D9), then the derived plant — reversed, the
+      // trigger retires the whole derived layer and this case measures an
+      // absent row through the fail-closed path.
+      await service.propose(
+        { title: 'raw anchor', body: 'written before the plant, as D9 requires', kind: 'fact' },
+        principal,
+      )
+      const id = plantDerivedRow(store, `rollup-${layer}-${kind}`, layer)
+      // A NON-SESSION evidence row CARRYING AN EXCERPT. The excerpt is the
+      // whole point: it is the recorded passage the old sentence denied.
+      store.db
+        .prepare(`INSERT INTO evidence (memory_id, kind, ref, excerpt) VALUES (?, ?, ?, ?)`)
+        .run(id, kind, `ref-${kind}`, 'THE REAL RECORDED PASSAGE')
+
+      // Preconditions sampled at CALL TIME, and all three of them, because any
+      // one alone is satisfiable by a fixture that measures a different path:
+      // the row must still be derived at THIS layer (D9 may have retired it),
+      // it must carry the non-session excerpt (P4d removes it), and it must
+      // carry no session row (or it answers normally, cell C).
+      assertLiveRowAt(store, id, layer)
+      assert.deepEqual(
+        store.db
+          .prepare(`SELECT kind, excerpt FROM evidence WHERE memory_id = ?`)
+          .all(id)
+          .map((row) => ({ kind: row.kind, excerpt: row.excerpt })),
+        [{ kind, excerpt: 'THE REAL RECORDED PASSAGE' }],
+        `the fixture must really hold ONE ${kind} evidence row WITH an excerpt on a derived ` +
+          'row, or this case measures the no-evidence-at-all path T1-T3 already cover',
+      )
+
+      const message = await captureSourceRefusal(service, id, principal)
+      // Every shared guard, from `helpers.mjs` — one definition for all six
+      // surfaces. `no memory with id` among them is what kills an ON->WHERE
+      // migration reaching a DERIVED row.
+      assertHonestRefusal(message, id, DERIVED_SENTENCE(id))
+      // ⛔ THE OVERCLAIM ITSELF — the byte-level defect this case was written
+      // for. A passage IS recorded, in `evidence.excerpt`; a sentence saying
+      // none was is false against this very store. Same regex T4b applies to
+      // the raw sentence, now applied to the branch beside it.
+      assert.doesNotMatch(
+        message,
+        /no source passage was recorded|nothing was recorded|has no source passage/i,
+        `an L${layer} row with a ${kind} evidence row holding "THE REAL RECORDED PASSAGE" has ` +
+          'a recorded passage; the answer may not claim nothing was recorded',
+      )
+      // What it may say instead: what KIND of row this is.
+      assert.match(message, /generated summary/)
+      assert.match(
+        message,
+        /not a memory recorded from a conversation/,
+        'the honest derived claim is about the kind of row, not about a recording that failed',
+      )
+      // And NOT the raw sentence: a derived row is not a stored memory whose
+      // conversation went unrecorded. Sharing one sentence across both would be
+      // the v0.4.16 defect in miniature.
+      assert.doesNotMatch(
+        message,
+        /is a stored memory, but no source conversation was recorded/,
+        'a generated summary is not a raw row whose recording failed; two different facts',
+      )
+
+      // AND AT THE OUTERMOST RULER — ADR 0012 §5's whole finding is that
+      // stopping at the service exit is what let three mutations survive.
+      let thrown
+      await assert.rejects(realRecallTool(ctx, service)({ sourceOf: id }, principal), (error) => {
+        thrown = error
+        return true
+      })
+      assert.ok(thrown instanceof MemoryInputError)
+      assert.notEqual(thrown.message, SOURCE_NOT_SHOWN, 'not the four-cause disjunction')
+      assertHonestRefusal(thrown.message, id, DERIVED_SENTENCE(id))
+      assert.doesNotMatch(
+        thrown.message,
+        /no source passage was recorded|nothing was recorded|has no source passage/i,
+        'the bytes the MODEL reads are where the falsehood was measured, so they are asserted',
+      )
+      assertLiveRowAt(store, id, layer)
+      registry.dispose()
+      cleanup(root)
+    })
+  }
+}
+
+test('sourceOf keeps searching after an uncited copy: a store further down the list still answers', async () => {
+  // T4c — F5. `service.ts` claims the uncited branch "keep[s] searching … no
+  // store that might hold a citable copy of this id may be skipped", and that
+  // was the most important property of the new branch and completely untested:
+  // review changed `continue` to `break` and got 291/291/0.
+  //
+  // The observable divergence: a row uncited in the FIRST store searched but
+  // citable in a LATER one returns the words under shipped code, and throws
+  // "no source conversation was recorded" under `break`. That is a read that
+  // withholds evidence which is present and readable — D3.
+  //
+  // THE FIXTURE EXPLOITS THE REAL STORE ORDER. `readableStores` is
+  // `[repo, global]`, in that order, so the uncited copy goes in the REPO
+  // store and the citable copy in the GLOBAL one. `break` stops at the repo
+  // store and never reaches the global copy.
+  const { root, registry, principal, service } = setup()
+  const repo = service.storeFor(principal, true)
+  const global = service.globalStore(true)
+
+  // The CITABLE copy, in the global store, written by the real writer so it
+  // carries a genuine session evidence row and a real captured turn.
+  const { id } = await service.propose(
+    { title: 'a shared id', body: 'the copy that CAN be cited', kind: 'fact', scope: 'personal' },
+    principal,
+  )
+  repo.tx(() =>
+    captureTurn(
+      repo,
+      principal.session.id,
+      1,
+      collectTurnEvents(turnEvents(1, [userMessageEvent('THE WORDS BEHIND THE MEMORY')]), 1),
+    ),
+  )
+  assert.equal(
+    global.db.prepare(`SELECT count(*) AS n FROM memories WHERE id = ?`).get(id).n,
+    1,
+    'the citable copy lives in the GLOBAL store (searched second)',
+  )
+  assert.ok(
+    global.db
+      .prepare(`SELECT count(*) AS n FROM evidence WHERE memory_id = ? AND kind = 'session'`)
+      .get(id).n > 0,
+    'and it really is citable — without evidence this case could not distinguish the branches',
+  )
+
+  // The UNCITED copy, same id, in the repo store — searched FIRST.
+  repo.db
+    .prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+       VALUES (?, 'fact', 'repo-local', 'active', 'a shared id', 'the copy that cannot be cited',
+               'principal-explicit', 0, 9000000000000, ${LAYER.RAW})`,
+    )
+    .run(id)
+  // BOTH halves, and the PRESENCE half first. ⛔ Asserting only "no session
+  // evidence here" is VACUOUS: it is trivially true when the row is absent
+  // altogether. Measured — probe P5 removed this whole insert and the case
+  // stayed GREEN at 298/298/0, because with no row in the repo store the loop
+  // never enters the uncited branch and `break` has nothing to break out of.
+  // A precondition that survives the deletion of the thing it describes is the
+  // vacuity this suite exists to catch, and it was in a test written to catch
+  // vacuity. The precondition is "PRESENT, live, and UNCITED", so it is
+  // asserted that way; P5 then turns red.
+  const uncited = repo.db.prepare(`SELECT status, derived FROM memories WHERE id = ?`).get(id)
+  assert.ok(uncited, 'the FIRST store searched must really hold a copy of this id')
+  assert.equal(uncited.status, 'active', 'and hold it live, or it takes the D5 path instead')
+  assert.equal(
+    repo.db
+      .prepare(`SELECT count(*) AS n FROM evidence WHERE memory_id = ? AND kind = 'session'`)
+      .get(id).n,
+    0,
+    'and hold it UNCITED — a present-but-uncited copy in store 1 is what makes the loop ' +
+      'continuation observable at all (P5 drops this row and the case must go red)',
+  )
+
+  // Shipped code walks past the uncited copy and answers from the citable one.
+  // Under `break` this call throws the raw sentence instead.
+  const turns = await service.source(id, principal, SOURCE_TURN_LIMIT)
+  assert.ok(
+    turns.length > 0,
+    'a citable copy exists in a readable store, so the words must come back; stopping at the ' +
+      'first uncited copy withholds evidence that is present and readable (D3)',
+  )
+  assert.match(
+    turns.map((turn) => turn.text).join('\n'),
+    /THE WORDS BEHIND THE MEMORY/,
+    'and they are the real recorded words, not an empty result that merely avoided throwing',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * T4e — WHICH COPY the sentence is about, when two readable stores hold the id
+ * uncited at DIFFERENT layers. Two independent tests, one per arrangement.
+ *
+ * ⛔ WHY THIS EXISTS (rework, step 3c). `existsWithoutSource` was a single
+ * variable the store loop OVERWROTE (`=`), so the LAST uncited store decided
+ * the sentence, and nothing pinned it. Two mutations survived at 298/298/0,
+ * both proven landed in `lib/service.js`:
+ *   MA  `existsWithoutSource = cited.derived` -> `??=`  (first-wins)
+ *   MP  `.reverse()` on the store list
+ *
+ * IT IS NOT BEHAVIOUR-NEUTRAL. Measured on the build that carried `=`, the
+ * caller received the OPPOSITE sentence for the two arrangements:
+ *   derived(repo) + raw(global) => "…is a stored memory, but no source
+ *                                   conversation was recorded…"   (RAW won)
+ *   raw(repo) + derived(global) => "…is a generated summary…"     (DERIVED won)
+ * In the first line the caller is told the row IS a stored memory while THIS
+ * SESSION'S OWN repo store holds it as a generated summary. The sentence may
+ * be true of some copy; the code made no claim about WHICH, so the caller
+ * cannot tell. An answer whose subject is undefined is not an honest answer.
+ *
+ * THE RULE PINNED HERE IS FIRST-WINS, nearest scope first, and it is asserted
+ * as an OBSERVABLE — "the answer describes the REPO copy" — rather than by
+ * reading the implementation. Three reasons it is the honest choice, all
+ * checkable: (1) the citable branch in the same loop already returns on first
+ * hit, so `=` ran two opposite precedence rules in one loop depending on
+ * whether evidence happened to exist; (2) `forget` resolves the same
+ * "which copy" question with `.find()` — first-wins — so `source` now
+ * describes the row `forget` would act on; (3) `readableStores` documents
+ * nearest-scope-first as the list's meaning.
+ *
+ * WHY A RULE AND NOT AN ASSERTION THAT THE STATE CANNOT ARISE. `forget`'s
+ * comment claims "Ids are unique across stores"; that was CHECKED, and nothing
+ * enforces it. All four id-minting sites are bare `randomUUID()`
+ * (`extract.ts:339`, `rebuild.ts:354`, `rebuild.ts:561`, `service.propose`),
+ * none probes another store, and `memories.id`'s `UNIQUE` constraint is
+ * per-FILE — SQLite cannot express uniqueness across separate database files.
+ * The state is directly representable, which is how the readings above were
+ * produced, so a READ path must answer it rather than crash on it.
+ *
+ * TWO TESTS, NOT ONE LOOP: `.reverse()` (MP) and `=` (MA) are different
+ * mutations, and a single looping case would stop at the first and leave the
+ * second arrangement's verdict unobservable.
+ */
+for (const arrangement of [
+  { name: 'derived in the repo store, raw in the global one', repo: LAYER.SCENARIO, global: LAYER.RAW, expected: DERIVED_SENTENCE, other: RAW_SENTENCE },
+  { name: 'raw in the repo store, derived in the global one', repo: LAYER.RAW, global: LAYER.SCENARIO, expected: RAW_SENTENCE, other: DERIVED_SENTENCE },
+]) {
+  test(`sourceOf answers about the NEAREST uncited copy: ${arrangement.name}`, async () => {
+    const { root, registry, principal, service } = setup()
+    const repo = service.storeFor(principal, true)
+    const global = service.globalStore(true)
+    const id = 'collide-uncited'
+    // Plant the SAME id, uncited, in both readable stores at different layers.
+    // Written directly because no writer can produce a cross-store collision —
+    // that is the point: the state is representable, not reachable by design.
+    const plant = (store, layer) =>
+      store.db
+        .prepare(
+          `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+           VALUES (?, 'fact', ?, 'active', 'a colliding id', 'body', ?, 0, 9000000000000, ?)`,
+        )
+        .run(
+          id,
+          store.kind === 'global' ? 'private' : 'repo-local',
+          layer === LAYER.RAW ? 'principal-explicit' : DERIVED_PROVENANCE,
+          layer,
+        )
+    plant(repo, arrangement.repo)
+    plant(global, arrangement.global)
+
+    // BOTH copies must really be there, at the layers claimed, and BOTH
+    // uncited — a precondition that survives the deletion of what it describes
+    // pins nothing (the P5 lesson from T4c).
+    for (const [store, layer, which] of [
+      [repo, arrangement.repo, 'repo'],
+      [global, arrangement.global, 'global'],
+    ]) {
+      const row = store.db.prepare(`SELECT status, derived FROM memories WHERE id = ?`).get(id)
+      assert.ok(row, `the ${which} store must really hold a copy of this id`)
+      assert.equal(row.status, 'active', `and hold it live, or the ${which} copy takes D5`)
+      assert.equal(row.derived, layer, `and at layer ${layer} exactly — the discriminant`)
+      assert.equal(
+        store.db
+          .prepare(`SELECT count(*) AS n FROM evidence WHERE memory_id = ? AND kind = 'session'`)
+          .get(id).n,
+        0,
+        `and UNCITED in the ${which} store — a citable copy would answer instead of refusing`,
+      )
+    }
+
+    const message = await captureSourceRefusal(service, id, principal)
+    // Every shared guard still applies: whichever copy answers, the answer is
+    // still an honest refusal.
+    assertHonestRefusal(message, id, arrangement.expected(id))
+    // AND the precedence itself, stated as an observable: the sentence
+    // describes the REPO copy, because the repo store is searched first.
+    // `.reverse()` (MP) and `=` (MA) each make this the OTHER sentence.
+    assert.notEqual(
+      message,
+      arrangement.other(id),
+      'the answer describes the copy in the store searched FIRST (nearest scope); receiving ' +
+        'the other sentence means iteration order silently chose the subject, and the caller ' +
+        'cannot tell which copy the answer is about',
+    )
+    registry.dispose()
+    cleanup(root)
+  })
+}
+
+test('D5 survives: a FORGOTTEN memory and a never-existent id stay byte-identical', async () => {
+  // T5. D5 requires that forget be unobservable — a forgotten memory must be
+  // indistinguishable from one that never existed, or the denial itself leaks
+  // that something was there.
+  //
+  // ZERO COVERAGE BEFORE THIS ROUND, verified: `grep -rn "or it was forgotten"
+  // test/ src/` matched ONLY `src/service.ts`. Splitting the disjunction into
+  // "memory X was forgotten" vs "no memory with id X" left the whole suite at
+  // 280/0 — mutation M6 below, which this case turns red.
+  //
+  // It also guards THIS round's fix from the other side: `m.status !=
+  // 'tombstone'` must stay in the WHERE clause. Move it into the LEFT JOIN's ON
+  // clause and a tombstoned row starts matching, takes the new "no source
+  // recorded" branch, and announces that a forgotten memory exists.
+  const { root, registry, principal, service } = setup()
+  const { id } = await service.propose(
+    { title: 'to be forgotten', body: 'this memory will be tombstoned', kind: 'fact' },
+    principal,
+  )
+  await service.forget(id, principal)
+  const store = service.storeFor(principal, true)
+  assert.equal(
+    store.db.prepare(`SELECT status FROM memories WHERE id = ?`).get(id).status,
+    'tombstone',
+    'the fixture must really hold a tombstoned row, or this case compares two absent ids',
+  )
+
+  const forgotten = await captureSourceRefusal(service, id, principal)
+  const neverExisted = await captureSourceRefusal(service, `${id}-never-existed`, principal)
+
+  // Compared with the id substituted out, because the id is the ONE thing that
+  // legitimately differs — and it is the caller's own input, so it tells them
+  // nothing they did not already know. Everything else must match byte for byte.
+  assert.equal(
+    forgotten.replace(id, '<ID>'),
+    neverExisted.replace(`${id}-never-existed`, '<ID>'),
+    'a forgotten memory and an id that never existed must be indistinguishable (D5); any ' +
+      'difference here is a leak that something used to be there',
+  )
+  // And neither may drift into this round's new sentences: a tombstoned row
+  // must not be reported as an existing row with no source.
+  for (const message of [forgotten, neverExisted]) {
+    assert.match(message, /no memory with id/)
+    assert.doesNotMatch(
+      message,
+      /generated summary|no source conversation was recorded/,
+      'the new branch must not swallow the tombstone case — that would announce the row exists',
+    )
+  }
+  registry.dispose()
+  cleanup(root)
+})
+
+test('the model RECEIVES the honest sentence, not a denial — at the tool layer', async () => {
+  // T6. ADR 0012 §5 records that stopping assertions at `service.source()`'s
+  // exit is precisely what let three mutations survive the whole suite: the
+  // damage happened AFTER that exit, in the render. So this case asserts the
+  // bytes the model actually gets.
+  //
+  // The path is: `service.source` throws MemoryInputError -> `asToolFailure`
+  // re-throws it untouched (it is a deliberate, already-phrased answer) -> the
+  // platform prefixes `Error: ` and sets `isError: true`. So the sentence
+  // reaches the model verbatim, under an error flag.
+  //
+  // THE `isError: true` WART IS ASSERTED, NOT GLOSSED. It is acceptable only
+  // because `source()`'s contract is already error-shaped — every "cannot
+  // answer" exit throws — and adding a second exit shape for this one case
+  // would be the second mechanism this repo forbids. Pinning it here means a
+  // later change of shape is a test failure rather than a discovery.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  await service.propose(
+    { title: 'raw anchor', body: 'written before the plant, as D9 requires', kind: 'fact' },
+    principal,
+  )
+  const id = plantDerivedRow(store, 'tool-layer-rollup', LAYER.SCENARIO)
+  assertLiveRowAt(store, id, LAYER.SCENARIO)
+
+  const recall = realRecallTool(ctx, service)
+  let thrown
+  await assert.rejects(recall({ sourceOf: id }, principal), (error) => {
+    thrown = error
+    return true
+  })
+  // 1. It survives `asToolFailure` as itself, NOT as the generic "the memory
+  //    store is unavailable right now" — that sentence would be false and
+  //    would tell the model to retry something that will never succeed.
+  assert.ok(thrown instanceof MemoryInputError, 'a deliberate answer passes through untouched')
+  assert.doesNotMatch(thrown.message, /store is unavailable/)
+  // 2. The bytes the model reads. Same guards the raw sentence now carries at
+  //    this same layer (T4), from one definition — including "the memory is
+  //    untouched, and the message does not contradict that".
+  assert.doesNotMatch(thrown.message, /No stored memories matched/)
+  assert.notEqual(thrown.message, RECALL_NO_MATCH)
+  assert.notEqual(thrown.message, SOURCE_NOT_SHOWN, 'and it is not the four-cause disjunction')
+  assertHonestRefusal(thrown.message, id, DERIVED_SENTENCE(id))
+  assert.match(thrown.message, /generated summary/)
+  assert.match(thrown.message, /not a memory recorded from a conversation/)
+  // The reworked overclaim must not reach the model either (step 3c).
+  assert.doesNotMatch(
+    thrown.message,
+    /no source passage was recorded|nothing was recorded|has no source passage/i,
+    'the bytes the model reads may not claim nothing was recorded',
+  )
+  assertLiveRowAt(store, id, LAYER.SCENARIO)
+  registry.dispose()
+  cleanup(root)
+})
+
+test('SOURCE_NOT_SHOWN still covers the genuinely-unshowable case, unchanged', async () => {
+  // T7. The ADR 0012 fix must not regress: a row that HAS evidence but whose
+  // words cannot be produced still renders the four-cause disjunction, and
+  // still does NOT throw. This is the boundary of the new branch — one row with
+  // evidence, one without, same store, different answers — so it also proves
+  // the new branch did not swallow the old case.
+  const { root, registry, principal, ctx, service } = setup()
+  const store = service.storeFor(principal, true)
+  // `propose` writes an evidence row with no excerpt and captures no turn:
+  // evidence EXISTS, the words cannot be shown. That is exactly the domain of
+  // SOURCE_NOT_SHOWN, and it is a different fact from "there is no source".
+  const { id } = await service.propose(
+    { title: 'deploy with make', body: 'make deploy', kind: 'procedure' },
+    principal,
+  )
+  assert.ok(
+    store.db
+      .prepare(`SELECT count(*) AS n FROM evidence WHERE memory_id = ? AND kind = 'session'`)
+      .get(id).n > 0,
+    'the precondition is that evidence DOES exist — without it this case would be testing the ' +
+      'new branch instead of the one it guards',
+  )
+
+  const { value, text } = await realRecallTool(ctx, service)({ sourceOf: id }, principal)
+  assert.equal(value.hits.length, 0, 'nothing could be shown')
+  assert.equal(text, SOURCE_NOT_SHOWN, 'byte-for-byte the sentence ADR 0012 shipped')
+  assert.notEqual(text, RECALL_NO_MATCH)
+  // And the new sentences must NOT have leaked onto this case: the row has a
+  // source, so saying it has none would be a new false statement.
+  assert.doesNotMatch(text, /generated summary/)
+  assert.doesNotMatch(text, /no source passage/)
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * T8 — THE THREE MODEL-FACING DESCRIPTION STRINGS, held to the SAME shared
+ * guard as the refusal sentences.
+ *
+ * ⛔ WHY THIS WAS REWRITTEN (rework, step 3c). The previous version asserted
+ * `match(/no source passage of its own/)` plus a few negative pins against
+ * specific rejected byte strings — and this repo's own NEG1-NEG4 criterion
+ * says a positive-only assertion passes on a message that says the right thing
+ * AND the wrong thing. Three mutations, each proven landed in `lib/tools.js`,
+ * ALL SURVIVED at 298/298/0:
+ *   MK  `sourceOf` param: `The memory is unaffected either way.`
+ *                      -> `Forget it and recall it again to fix this.`
+ *   MM  tool description + `Start a session inside that checkout and retry.`
+ *       (the literal v0.4.16 false-advice payload, deleted for being false)
+ *   MN  `GUIDANCE_SECTION` + `If none, forget it.` — priced at 157 <= 160, so
+ *       the load-time budget assertion does NOT catch it, and this string is
+ *       paid on EVERY request.
+ *
+ * The fix is NOT more one-off `doesNotMatch` byte pins: those pin rejected
+ * spellings rather than the property, and the next payload invented is
+ * unguarded again. All three strings now run `assertNoFalseAdvice` from
+ * `helpers.mjs` — the SAME negative set `assertHonestRefusal` applies to the
+ * two `service.ts` sentences. One definition, six surfaces.
+ */
+test('the three model-facing description strings carry no false advice, and describe all three outcomes', async () => {
+  let captured
+  registerTools(
+    { ...fakeCtx({}), tools: { register: (tool) => { if (tool.name === 'memory_recall') captured = tool } } },
+    {},
+  )
+  assert.ok(captured, 'memory_recall must be registered')
+  // Read off the NORMALISED schema `defineTool` produces, not the literal in
+  // `tools.ts`: that object is what is actually put on the wire to the model,
+  // so a change that stopped the description reaching it would be visible here
+  // and invisible to a test that re-read the source literal.
+  const description = captured.parameters.properties.sourceOf.description
+  assert.ok(description, 'the sourceOf parameter must carry a description at all')
+
+  // ---- THE SHARED GUARD, over all three strings. This is what kills MK, MM
+  // ---- and MN, and it is the same function the refusal sentences run.
+  const SURFACES = [
+    ['the memory_recall tool description', captured.description],
+    ['the sourceOf parameter description', description],
+    ['GUIDANCE_SECTION.text', GUIDANCE_SECTION.text],
+  ]
+  for (const [label, text] of SURFACES) {
+    assertNoFalseAdvice(text, label)
+  }
+
+  // ---- The parameter description must still describe ALL THREE outcomes.
+  // Outcome 1: the stored quotation.
+  assert.match(description, /quote/, 'the quotation outcome is still described')
+  // Outcome 2: the conversation window.
+  assert.match(description, /cited conversation/, 'the transcript outcome is still described')
+  // Outcome 3: THIS round's — and it must name the populated case by name.
+  // Measured on the real stores: 23 derived rows, all 23 with zero evidence
+  // rows, all 23 reachable through `recall`.
+  assert.match(
+    description,
+    /no source (passage|conversation) of its own/,
+    'the third outcome must be described, or the model reads an exhaustive list of two and ' +
+      'treats the third answer as a fault',
+  )
+  assert.match(description, /generated summary/, 'and name the populated case')
+  // It must no longer promise a return unconditionally. `Returns the stored
+  // source behind that memory` is the exact byte sequence that became false.
+  assert.doesNotMatch(
+    description,
+    /Returns the stored source behind that memory/,
+    'the unconditional promise is what this round falsified',
+  )
+  // And it must keep the clause MK replaced: the read path damaged nothing.
+  // Positive AND negative, because MK swapped a true clause for a false one
+  // and a negative-only guard would pass on the clause simply being deleted.
+  assert.match(
+    description,
+    /memory is unaffected either way/i,
+    'the parameter description tells the model the drill-down changes nothing; MK replaced ' +
+      'exactly this clause with advice to forget and re-save the memory',
+  )
+
+  // ---- The tool DESCRIPTION carries the same unconditional promise and gets
+  // ---- the same treatment — a second execution point, not a copy of the first.
+  assert.doesNotMatch(
+    captured.description,
+    /read the source passage that memory was drawn from/,
+    'the tool description promised a read that cannot always happen',
+  )
+  assert.match(captured.description, /no source (passage|conversation) of its own/)
+
+  // ---- GUIDANCE_SECTION: paid on EVERY request, and budget-constrained.
+  //
+  // ⛔ REWORK (S1): this was negative-only against ONE byte string,
+  // `read the source passage behind it`, which pins a rejected spelling rather
+  // than the property. Changing `look up` to `fetch` — the same unconditional
+  // promise in a different word — survived. The assertion below states the
+  // PROPERTY: whatever verb this sentence uses about the source passage, it
+  // must describe the ATTEMPT, never guarantee the result, because for a
+  // generated summary and for a row with no recorded source conversation there
+  // is no result to guarantee.
+  assert.doesNotMatch(
+    GUIDANCE_SECTION.text,
+    /\b(read|fetch|get|retrieve|returns?|shows?|see|obtain|view)\b[^.]*\bsource passage\b/i,
+    'the guidance must not promise the source passage comes back — it names an attempt ' +
+      '("look up"), because two of the three outcomes return no passage at all',
+  )
+  assert.match(
+    GUIDANCE_SECTION.text,
+    /look up the source passage behind it/,
+    'and it must still tell the model what sourceOf is FOR; deleting the clause would satisfy ' +
+      'the negative above while making the guidance useless',
+  )
+  // Priced here as well as at load, because the load-time assertion only fires
+  // ABOVE the budget: MN measured 157 <= 160 and sailed through it. The budget
+  // guard is not, and never was, an honesty guard — that is `assertNoFalseAdvice`
+  // above. This one keeps the per-request cost from drifting.
+  assert.ok(
+    estimateTokens(GUIDANCE_SECTION.text) <= GUIDANCE_BUDGET_TOKENS,
+    `the guidance section is ${estimateTokens(GUIDANCE_SECTION.text)} tokens, past its budget`,
+  )
 })
 
 // ---------------------------------------------- Personal Memory -----------

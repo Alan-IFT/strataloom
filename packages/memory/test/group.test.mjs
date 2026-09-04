@@ -47,7 +47,15 @@ import {
   SOURCE_LABEL_MAX_CHARS,
 } from '../lib/recall/render.js'
 import { DERIVED_LAYERS, DERIVED_PROVENANCE, LAYER } from '../lib/types.js'
-import { openRegistry, cleanup, fakeAgent, fakeCtx, tempRoot } from './helpers.mjs'
+import {
+  openRegistry,
+  cleanup,
+  fakeAgent,
+  fakeCtx,
+  tempRoot,
+  assertHonestRefusal,
+  DERIVED_SENTENCE,
+} from './helpers.mjs'
 
 /** A real git repo with a real remote — repo-key derivation shells out to git. */
 const makeRepo = (dir, remote) => {
@@ -1003,6 +1011,141 @@ test('6g. memory_forget share:true on a member derived row is refused too', asyn
   s.registry.dispose()
   cleanup(s.root)
 })
+
+/**
+ * 6h. `sourceOf` reaches into member stores (`service.source` iterates
+ * `[...readableStores, ...groupStores]`), so the sentence it returns for a row
+ * with no source has TWO input domains — and v0.4.16's whole lesson is that a
+ * sentence whose truth value FLIPS between them must not be shared.
+ *
+ * WHY IT IS SHARED HERE, AND WHY THAT IS NOT THE v0.4.16 MISTAKE REPEATED. The
+ * sentence that flipped in v0.4.16 was ADVICE — "start a session inside that
+ * checkout and retry" is true at home and false across the boundary, because it
+ * claims something a session can DO. These sentences claim nothing about what
+ * any session can do: they say what the ROW IS ("a generated summary, not a
+ * memory recorded from a conversation"). Being a generated summary is a
+ * property of the row, not of the reader's access to it, so there is no half
+ * that can be false in one domain. This case is the measurement of that claim
+ * rather than the reasoning for it — the same wording, asserted in the member
+ * domain.
+ *
+ * ⛔ THE SENTENCE ASSERTED HERE IS IMPORTED, NOT COPIED (rework, step 3c). It
+ * used to be a hardcoded literal ending `…so it has no source passage of its
+ * own.`, and that clause turned out to be FALSE for a derived row whose only
+ * evidence is `commit`/`file`/`url` — `evidence.excerpt` there holds a real
+ * recorded passage (measured 9/9 across L1/L2/L3 x the three kinds). A
+ * hardcoded copy in this file would have gone on asserting the false sentence
+ * after `service.ts` was corrected, so the expected bytes come from
+ * `DERIVED_SENTENCE` in `./helpers.mjs`, which `layers.test.mjs` uses too.
+ *
+ * It also carries test 17's discipline: the branch READS a member store to
+ * choose its wording, and a read that decides something is exactly where a
+ * write sneaks in. "We did not call a writer" is unobservable and re-encodes
+ * the implementation; the assertion is the promise a human approved — the FILE
+ * bytes must not move.
+ *
+ * BOTH MEMBER KINDS, live and archived (rework, step 3b). v0.4.16 found the
+ * ARCHIVED member to be the sharper case: `foreign.archived` selected a second
+ * sentence there, and both of that sentence's halves were false. The argument
+ * above — "these sentences make no claim about what a session can DO, so they
+ * cannot flip" — is stated over BOTH domains, and only the live one was
+ * measured. An argument advanced in a comment and checked on one of its two
+ * domains is exactly the shape this rework exists to remove, so the archived
+ * member is measured too: for `source` the sentence must be the SAME, which is
+ * itself the finding (unlike `forget`, this answer does not consult
+ * `archived`, and must not start to).
+ */
+const SOURCE_MEMBER_DOMAINS = [
+  {
+    name: 'live',
+    store: 'backend',
+    source: (s) => s.sources.backend,
+    declare: (s) => GROUP_OF(s.sources),
+  },
+  {
+    name: 'archived',
+    store: 'archived',
+    source: (s) => s.sources.archived,
+    // No checkout of it exists anywhere in the workspace — that is what makes
+    // it archived, and 6b/6d use the same fixture.
+    declare: (s) => ({
+      version: 1,
+      group: 'acme',
+      members: [{ source: s.sources.archived, archived: true }],
+    }),
+  },
+]
+
+for (const domain of SOURCE_MEMBER_DOMAINS) {
+  for (const layer of DERIVED_LAYERS) {
+    test(`6h-${domain.name}-${layer}. sourceOf on a ${domain.name} member's ${LAYER_NAMES[layer]} says what it IS, and writes nothing there`, async () => {
+      const s = setup({ declaration: GROUP_OF({ backend: '', frontend: '' }) })
+      writeFileSync(join(s.ws, GROUP_FILE), JSON.stringify(domain.declare(s)), 'utf8')
+      const member = s.stores[domain.store]
+      // Every RAW write first (D9), then the derived plant — in that order, or
+      // the trigger deletes the layer and this case measures an absent row.
+      seed(s.stores.parent, [{ title: 'parent deploy', body: 'p' }])
+      seed(member, [{ title: `${domain.store} deploy`, body: 'b' }])
+      plantDerived(member, 'member-rollup', `${domain.store} deploy rollup`, layer)
+      assertDerivedPresent(member, 'member-rollup', layer)
+
+      const file = join(s.root, 'repos', repoKeyFor(domain.source(s)), 'memory.sqlite')
+      // WAL: changed bytes can sit in `-wal` rather than the main file, so a
+      // digest of `memory.sqlite` alone would pass over a real write.
+      const digest = () => {
+        member.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+        const wal = `${file}-wal`
+        return {
+          main: createHash('md5').update(readFileSync(file)).digest('hex'),
+          wal: existsSync(wal)
+            ? createHash('md5').update(readFileSync(wal)).digest('hex')
+            : 'absent',
+          revision: member.db.prepare(`SELECT v FROM meta WHERE k = 'store_revision'`).get() ?? null,
+        }
+      }
+      const before = digest()
+
+      // CAPTURED and classified, never `assert.rejects(p, MemoryInputError)`:
+      // the fail-closed `no memory with id X` is also a MemoryInputError, so that
+      // form cannot tell whether the member store was reached at all — and a byte
+      // comparison whose subject never ran compares a store against itself and
+      // always passes (the exact vacuity that killed v0.4.16's test 6f).
+      let message
+      await assert.rejects(s.service.source('member-rollup', s.principal, 8), (error) => {
+        assert.ok(error instanceof MemoryInputError)
+        message = error.message
+        return true
+      })
+      // ⛔ FOLDED INTO THE SHARED HELPER (rework, step 3c). This block used to
+      // RE-IMPLEMENT nine of `assertHonestRefusal`'s assertions inline, plus a
+      // HARDCODED copy of the derived sentence — precisely the drift the shared
+      // helper exists to prevent, and the copy is what makes it dangerous: when
+      // the derived wording was reworked this round, an inline literal here
+      // would have kept asserting the OLD, FALSE sentence, leaving one file
+      // green while the other moved. Both files now import one definition and
+      // one `DERIVED_SENTENCE` from `./helpers.mjs`.
+      //
+      // `assertHonestRefusal` subsumes every assertion this block used to make:
+      // `no memory with id` (the fail-closed path — without it the id never
+      // reached the member store and everything below measures nothing), the
+      // five false-advice negatives, the "unaffected" clause, the destruction
+      // guard, and the WHOLE SENTENCE byte-for-byte, which is the claim under
+      // test in this domain: an appended clause that is true at home and false
+      // here cannot survive full equality.
+      assertHonestRefusal(message, 'member-rollup', DERIVED_SENTENCE('member-rollup'))
+
+      assert.deepEqual(
+        digest(),
+        before,
+        'a read that chose its wording from a member store changed that store\'s bytes; the ' +
+          'approval prompt promises "nothing is ever written to them"',
+      )
+      assertDerivedPresent(member, 'member-rollup', layer)
+      s.registry.dispose()
+      cleanup(s.root)
+    })
+  }
+}
 
 // ---------------------------------------------------------------- 7 --------
 

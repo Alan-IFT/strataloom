@@ -1,6 +1,42 @@
 # 当前状态
 
-> 最后更新：2026-09-04 · **v0.4.16 已发布**：`forget` 对 group member 库中
+> 最后更新：2026-09-05 · **v0.4.17 已发布**：`source()`（即 `memory_recall`
+> 的 `sourceOf` 下钻）对一条**在库、active、且 id 刚由 `recall` 亲手交给用户**的行，
+> 回答**它不存在**——`no memory with id X, or it was forgotten`。
+> **判别式不是「派生性」而是「存在性」**：`source()` 方法体内 `derived`/`LAYER`
+> 出现 **0 次**，它从来没读过那一列；真正的触发条件是**取不到 `session` 证据行**。
+> 2×2 实测（三次独立复现）：**带证据的派生行答得好好的**（L1/L2/L3 全部 `RETURNED 1`），
+> 而**无证据的 raw 行同样撞上这句假话**——故 lead 开题的「这是派生行的问题」**四个格子里错两个**。
+> 修法：内层 `JOIN` 改为 `memories m LEFT JOIN evidence e ... AND e.kind='session'`，
+> **零新增查询**（`.prepare` 前 1 条、后仍 1 条，只加投影列 `m.derived`），
+> 按行**是什么**给出两句诚实的话，而**不复用 `SOURCE_NOT_SHOWN`**——它的四个析取支
+> 对「根本没有源」的行**全为假**，那是拿**假成因**换掉**假否认**（ADR 0012 教训 6）。
+> 🟡 **今天真实可达**：9 个生产库 **23 条**派生行全部零证据、`recall` **全部**发出其 id。
+> 生产副本全量对照（563 行）：**「谁能拿到 turns」零变化**，**23 条**由假否认转为诚实回答。
+> 测试 280 → **309 / 0 fail**。**D5 未被削弱**（被遗忘 vs 从不存在，逐字节相同，且首次被钉住）。
+> ⛔ **本轮被打回三次，每一次都是同一个形状：「一条规则 N 个执行点，只守住了一部分」。**
+> ①代码审查（6 项）：raw 那句话可被塞回 v0.4.16 的假建议、甚至反转成
+> **「The memory has been deleted as a result.」**（读路径谎称删了用户数据）而**全量 291/0 全绿**。
+> ②再审查＋QA **并行、各自独立得出 FAIL 且结论收敛**：**派生那句话自己就在犯本轮刚诊断出的错**
+> ——它说 `has no source passage`，而 fixture 里 `evidence.excerpt` 确实存着原文；
+> **本轮自己写的禁止正则实测匹配自己的产品文案**（9 个格子全中）；
+> 且**本轮编辑过的三条模型可见描述文字零守卫**，把 v0.4.16 的假建议原样贴进
+> `GUIDANCE_SECTION`（**按次计费**）实测 **157 ≤ 160**，连预算断言都抓不到，**298/0 全绿**。
+> ③`existsWithoutSource` 被循环**覆盖**，**store 迭代顺序**静默决定用户收到哪一句
+> （`??=` 与 `.reverse()` 双双 298/0 存活）——已查明 **id 跨库唯一「无任何机制保证」**
+> （四处 mint 点全是裸 `randomUUID()`，`UNIQUE` 只在单文件内成立），故**明确定为 first-wins**
+> 并与 `forget` 的 `.find()` 对齐：**说的那一行，就是 `forget` 会动的那一行**。
+> ⛔ **执行 agent 自查出自己第一版修复的缺陷**：`FALSE_ADVICE_PATTERNS` 起初钉的是
+> **被拒绝的字节串**，导致 MN **只是被无关断言碰巧打红**——「碰巧杀死」不算守住，已改为**性质断言**。
+> ⚠️ **lead 自己也栽了一次**：一次「变异存活」的读数实为 `replace()` 改到了**注释**上，
+> 重做后 **309/289/20**。**变异必须先证明落地**（anchor 断言 ＋ `lib/` grep），本页已多次写过。
+> **每次工作结束时更新本页**，它是新会话的唯一入口。
+>
+> ⬇️ 以下 v0.4.16 一节及更早各节仍然有效（v11 库不可被 0.4.13 及更早打开的警告同样仍有效）。
+
+---
+
+> 【v0.4.16 发布说明，原文保留】`forget` 对 group member 库中
 > **派生行**给出的拒绝理由**是错的**，而且是一条**可证伪的假建议**——
 > 它说「去那个 checkout 里删」，照做之后得到的是「这是生成的摘要，删不掉」。
 > 即：产品把用户支使到一个**注定失败的目的地**。archived member 更糟，
@@ -30,6 +66,522 @@
 > **每次工作结束时更新本页**，它是新会话的唯一入口。
 >
 > ⬇️ 以下 v0.4.15 一节及更早各节仍然有效（v11 库不可被 0.4.13 及更早打开的警告同样仍有效）。
+
+## 🆕 v0.4.17：活着的行被告知「不存在」——判别式是**存在性**，不是**派生性**
+
+**本轮结项 v0.4.16 待办 1。**
+
+### 判据：不是「说少了」，是**主动否认一个刚发出去的 id**
+
+`service.source()`（`src/service.ts`）内层 `JOIN` 一旦取不到 `session` 证据行，
+就落到最后一句 `no memory with id ${id}, or it was forgotten`。
+即：这一行**在库里、是 active、它的 id 刚刚由 `recall` 亲手交给用户**，
+而产品对用户说**它不存在**。
+
+### ⛔ lead 原判断被证伪：**「这是派生行的问题」**（保留原文＋标注证伪）
+
+lead 原判断（**原文保留**，见 v0.4.16 一节「本轮登记的待办」第 1 条）：
+
+> 🟢 **`source()` 对一切派生行返回「不存在」，而该行确实存在** ——
+> home 与 member **同样**返回 `no memory with id X, or it was forgotten`。
+> 根因是派生行**无 evidence 行**（生产 15/15 实测 `evidenceRows=0`）
+
+❌ **「这是关于派生行的」被证伪。** 实测 `source()` 方法体内 `derived`／`LAYER`
+出现 **0 次**——它从来没有读过这一列，所以派生性**不可能**是判别式。
+本轮在**未修改的 HEAD** 上独立复现的 2×2（第三次复现，与评审两次读数一致）：
+
+```
+A raw   + evidence      : RETURNED 1 turn(s)
+B raw   + NO evidence   : THREW MemoryInputError: no memory with id B-raw-noev, or it was forgotten
+C L1 derived + evidence : RETURNED 1 turn(s)     <- 带证据的派生行答得好好的
+D L1 derived + NO evid  : THREW ... no memory with id D-derived-1, or it was forgotten
+C L2 derived + evidence : RETURNED 1 turn(s)
+D L2 derived + NO evid  : THREW ... no memory with id D-derived-2, or it was forgotten
+C L3 derived + evidence : RETURNED 1 turn(s)
+D L3 derived + NO evid  : THREW ... no memory with id D-derived-3, or it was forgotten
+```
+
+**格 C 单独证伪了原判断**：派生行只要有 evidence 行就正常返回，所以「派生 ⇒ 被否认」为假。
+**格 B 是原判断漏掉的那一半**：**raw 行**同样会撞上这句话。
+故真正的判别式是**没有 session 证据行**，而修法必须钉在**行是否存在**上。
+
+直接后果：执行点是**四个**不是三个，第 1 个（**raw + 无证据**）在 lead 的窄方案下
+**依然发假话**——变异 M5 实测，该输入仍输出 `no memory with id …, or it was forgotten`。
+按本仓「待办 p 判例」，**「今天还没有数据」不是不守它的理由**。
+
+原判断中**成立的部分照录**：根因确是「派生行无 evidence 行」，方向确是 fail-closed，
+且它自己写的解锁条件——「须先决定派生行的 source 是它汇总的 raw 行、还是干脆声明它没有」——
+**本轮做了决定**：**声明它没有**。理由不是取舍偏好，是**schema 事实**：
+`memories` 无派生→源列，`evidence` 只以 `memory_id` 为键，
+`rebuild.ts:348`／`rebuild.ts:557` 写派生行时**一条 evidence 都不写**
+（实测该文件 `INSERT INTO evidence` 出现 **0 次**）。
+**没有映射就不能承诺用户去找得到**——这正是 v0.4.16 删掉的那类假建议。
+
+### 生产暴露面（本轮重测，只读 `VACUUM INTO` 副本）
+
+派生行 **23 条**，**23/23 无 evidence 行**，**23/23 可达**（`recall` 把它们连同 id 交出去）；
+raw 非 tombstone 行 **537 条**，其中**无 session 证据的 0 条**——
+故执行点 1 **真实存在但今天未被填充**，按判例照守不误。
+
+### 修法：**零新增 `.prepare`**，且形态是「抛出＋诚实文案」
+
+既有查询本是 `evidence INNER JOIN memories`，改为**由 `memories` 出发 LEFT JOIN `evidence`**，
+并把投影加宽一列 `m.derived`——**同一条语句、同一次访问**，
+这正是 v0.4.16 的判例（`SELECT 1` → `SELECT derived`，复用同一次 `.find()`）。
+**用第二次查询去问「这行在不在」是本仓明令禁止的第二套机器。**
+
+两条子句是承重的，**不可在 ON 与 WHERE 之间迁移**：
+- `e.kind = 'session'` 必须留在 **ON**。挪进 WHERE 会把空扩展行滤掉，
+  **SQL 里还写着 LEFT，语义已悄悄退回 INNER**——缺陷原样复活。
+- `m.status != 'tombstone'` 必须留在 **WHERE**，使被遗忘的行**取不到任何行**、
+  继续落到最后那句通用否认。这就是 **D5**。
+
+**不走 `SOURCE_NOT_SHOWN`**（形态 (a)：抛出）。该句断言的是**四因析取**
+（引文过大／老化／属于本会话读不到的仓库），而对一条**根本没有源**的行，
+**每一个析取支都为假**——那是拿**假成因**换掉**假否认**，
+即 ADR 0012 教训 6：**修复引入的新失效比原缺陷更坏**。
+
+**`isError: true` 这个瑕疵已写进注释，不留给下一个 agent 去发现**：
+实测 `asToolFailure`（`tools.ts:331`）原样重抛 `MemoryInputError`，
+平台加 `Error: ` 前缀并置 `isError: true`，故句子**逐字**送达模型，但戴着错误标记。
+它可接受**仅仅因为** `source()` 的契约本来就是错误形态的（每一个「答不了」的出口都是 throw），
+而**为这一种情形新增第二种出口形态**就是本仓禁止的第二套机器。
+
+### 两句诚实文案，以及它们**为什么可以跨域共用**（v0.4.16 恰在此处走了反向）
+
+| 输入 | 文案 |
+|---|---|
+| **派生行** | `<id> is a generated summary, not a stored memory, so it has no source passage of its own. The memory itself is unaffected.` |
+| **raw 行无证据** | `<id> is a stored memory, but no source passage was recorded for it, so there is nothing to show. The memory itself is unaffected.` |
+
+> **⛔ 本表两行文案**均**已被后续返工替换**（原文保留在上方，勿改）：
+> - **raw 行**：`no source **passage**` → `no source **conversation** was recorded`（返工 3b，F3）。
+> - **派生行**：`… so it has no source passage of its own.` → **`<id> is a generated summary,
+>   not a memory recorded from a conversation, so there is no source conversation of its own
+>   to show.`**（返工 3c，阻断 1）。原句对**唯一证据为 `commit`/`file`/`url` 的派生行为假**，
+>   **实测 9/9 格全假**，且**恰好被本轮自己写的那条禁止正则逐字判罪**。
+> **两行的「The memory itself is unaffected.」尾句、以及 D5 对照组两行，逐字不变。**
+
+v0.4.16 的教训是**真值随输入域翻转的句子不可共用**，那一轮翻转的是**建议**
+（「去那个 checkout 里重试」在 home 为真、跨域为假，因为它宣称**某个会话能做某事**）。
+这两句**不宣称任何会话能做任何事**，只陈述**这一行是什么**——
+「是生成摘要」是**行的属性**，不是**读者权限的属性**，**没有可翻转的半句**。
+这一条**不是推理，是实测**：`6h-1/2/3` 在 **member 域**逐字断言同一句话，
+并同时做**字节级快照**证明 member 库未被写。
+
+### 变异矩阵（每条**只改一个执行点** → `npm run build` → 跑**全量** → 还原＋重 build＋复跑确认回基线）
+
+基线 **291 / 0 fail**（改动前 280/0，本轮新增 11 条）。
+
+| 变异 | 读数 tests/pass/fail | 杀掉的具名测试 |
+|---|---|---|
+| **M1** 整块删掉新分支 | 291 / 283 / **8** | L1、L2、L3、**T4 raw**、T6 工具层、6h-1、6h-2、6h-3 |
+| **M2** 收窄成 `=== LAYER.SCENARIO` | 291 / 287 / **4** | **L1 与 L3 各自转红，L2 保持绿**；6h-1、6h-3 |
+| **M3** `>= LAYER.SCENARIO`（漏 L1） | 291 / 289 / **2** | **只杀 L1**；6h-1 |
+| **M4** 只漏 L3（**不用** `<= SCENARIO`，那会把 RAW 也拉进来污染读数） | 291 / 289 / **2** | **只杀 L3**；6h-3 |
+| **M5** 只修派生行（**lead 的原窄方案**） | 291 / 290 / **1** | **只杀 T4**——执行点 1 确被守住 |
+| **M6** 把 D5 析取拆成可分辨的两句 | 291 / 290 / **1** | **只杀 T5**（该变异在改动前**存活 280/0**） |
+| **M7** 把 `sourceOf` 参数描述改回无条件承诺 | 291 / 290 / **1** | **只杀 T8** |
+
+**M2 是 v0.4.16 的签名实验**：L1 与 L3 **各自单独转红**而 L2 保持绿，
+证明三层是**三个独立执行点**而非一个——这也是为什么必须 `for (const layer of DERIVED_LAYERS) test(...)`
+生成三条**独立** `test()`，而不是一条内部循环的测试（循环测试停在第一条失败断言，
+「第 3 层是不是也漏了」**不可观测**，v0.4.15 已实测过）。
+
+### 空转探针（本仓规矩：拆掉 fixture 的前提，若仍绿则它什么都没钉住）
+
+| 探针 | 读数 | 结论 |
+|---|---|---|
+| **P1** 删掉各层测试里的派生行 plant | 291 / 288 / **3** | 三条**全部转红** ✅ |
+| **P2** 把 id 换成**从不存在**的 id | 291 / 288 / **3** | 三条**全部转红** ✅——证明它们不是靠 fail-closed 路径通过的（v0.4.16 测试 6f 正是死于这种空转） |
+| **P3** 删掉 T4 里的 evidence 行删除 | 291 / 290 / **1** | T4 **转红** ✅ |
+
+### 送达模型的字节：**四个否认点** before / after（同一探针，穿过真实 `execute`）
+
+```
+                                BEFORE (HEAD)                                   AFTER
+点1 raw+无证据   Error: no memory with id <id>, or it was forgotten   Error: <id> is a stored memory, but no source passage was recorded for it, …
+点2 L1 SUMMARY   Error: no memory with id derived-1, or it was …      Error: derived-1 is a generated summary, not a stored memory, …
+点3 L2 SCENARIO  Error: no memory with id derived-2, or it was …      Error: derived-2 is a generated summary, not a stored memory, …
+点4 L3 PERSONA   Error: no memory with id derived-3, or it was …      Error: derived-3 is a generated summary, not a stored memory, …
+--- D5 对照组，必须保持不变 ---
+被遗忘的行       Error: no memory with id <id>, or it was forgotten   Error: no memory with id <id>, or it was forgotten   （不变）
+从不存在的 id    Error: no memory with id <id>, or it was forgotten   Error: no memory with id <id>, or it was forgotten   （不变）
+```
+
+**D5 不可分辨性逐字保持**：两者除调用方自己输入的 id 外**完全一致**，
+由 T5 以「把 id 替换成 `<ID>` 后整串相等」的方式钉住；该断言此前**零覆盖**
+（实测 `grep -rn "or it was forgotten" test/ src/` 只匹配 `src/service.ts` 一处）。
+
+> **⛔ 上表「点1」的 AFTER 文案已被返工替换**（原文保留在上方，勿改）：
+> `no source passage was recorded` 对**唯一证据是 `commit`/`file`/`url` 的行为假**，
+> 现为 `no source **conversation** was recorded`。理由与实测见下节「返工」F3。
+> **该表其余各行、以及 D5 对照组两行，返工后逐字不变**（本轮重测确认）。
+
+### 六个陈述面的清点（本轮自己重跑，非引用）
+
+| # | 面 | 处置 |
+|---|---|---|
+| 1 | `tools.ts` `sourceOf` **参数**描述 | **改**：原文穷举了两种结局，第三种一出现它就**不完整**；现列全三种。由 **T8 + M7** 钉住 |
+| 2 | `tools.ts` **工具**描述 | **改**：`read the source passage that memory was drawn from` 是**无条件承诺**，装上修复后当场变假；改为「look up …，并说明有一种结局是它没有源」 |
+| 3 | `GUIDANCE_SECTION` | **改一词**：`read` → `look up`。⚠️ 该文本受**加载期硬预算断言**约束，**已重新计价**：改前 **152** tokens，改后 **152** tokens，预算 `GUIDANCE_BUDGET_TOKENS = 160`。候选里那句把第三种结局也写进提示词的（`…, if one was recorded`）实测 **155**，虽可容纳但要花掉 8 token 余量里的 3 个，而 schema 描述已把三种结局说全，**故不放在按次计费的提示词里** |
+| 4 | `SOURCE_NOT_SHOWN` | **字节一字未动**，且**仍为真**：它的域是「证据存在、但取不到词」，与「根本没有源」不相交——后者在 `service.source` 就抛出，**根本到不了 render**。由 **T7** 钉住 |
+| 5 | `README.md`（第 31、58 行附近） | **改**：「returns the original conversation」「returns the stored turns behind a memory」已过时，补上第三种结局与 D5 说明<br>**⛔ 本行被评审证伪（返工已修）**：**第 31 行改了，第 58 行没改**。评审实测该行原样留着 ``returns the stored turns behind a memory, so "where did this come from" has an answer``——**就在证伪它的那段新文字上方三行**。即本表这一格**本身就是一句关于本轮工作的不实陈述**，而本轮存在的理由正是删除这一类缺陷。返工已改第 58 行为 `looks up …`＋「记录了源会话时才有答案」，并补上非 session kind 的说明 |
+| 6 | `metrics.ts:117` 的 `LIKE RECALL_NO_MATCH \|\| '%'` | **无需改，且已实测**：抛出 ⇒ 无 render ⇒ `conversations` 表**零新增行**（实测 before/after 均为 0），故**不可能污染** ADR 0005 依赖的 recall 未命中率。`RECALL_NO_MATCH` 字节未动 |
+
+### ⛔ 第 4 步代码评审**打回本轮**（6 条阻断 + 3 条建议）——**同形状第五次，切片是「raw vs 派生」**
+
+**按本仓惯例：上面各节的原判断、原读数、原表格全部保留原文，不修改，只在此标注证伪。**
+
+**最有价值的一条，先写**：本轮**专门为「只守一个切片」这个形状而立**——
+页首摘要自己写着「**在专门修『只守一个切片』的这一轮里，我自己也只守了一个切片**（同形状第四次）」——
+然后**又犯了第五次**。前四次的切片是 `L2 vs L1/L3`（v0.4.15）与 `home vs member`（v0.4.16），
+**这一次的切片是「raw 句 vs 派生句」**：
+
+| | 派生句 | raw 句（T4） |
+|---|---|---|
+| 反向断言 | **5 条**（否认存在／被遗忘／三类假建议／rebuild） | **0 条** |
+| 「memory itself is unaffected」 | T6 钉住 | **无人钉** |
+| 到达最外层尺子 | T6 穿过 `realRecallTool` | **止于 `service.source()` 出口** |
+
+评审的两次实测，**全量全绿**：
+
+```
+MK2 把 raw 句尾换成 v0.4.16 的假建议原文        ℹ tests 291  ℹ pass 291  ℹ fail 0
+ML  把 raw 句尾改成「The memory has been deleted as a result.」
+                                              ℹ tests 291  ℹ pass 291  ℹ fail 0
+```
+
+**ML 的含义要说白**：一条**读路径**可以声称**它删掉了用户的记忆**，而测试全绿。
+**同一个变异打在派生句上当场转红**（291/290/1，被 T6 的 `/memory itself is unaffected/i` 杀死）。
+这正是本轮自己在 T1-T3 注释里引用的 v0.4.16 **NEG1-NEG4 判据**
+（「正向断言会在一条**既说真话又说假话**的消息上通过」）——**引用了，然后没有用在 T4 上**。
+
+**返工的修法不是「把断言复制到 T4」**。复制会漂移，而且下一句新增文案又会裸奔。
+两句话现在**走同一个断言函数** `assertHonestRefusal(message, id, expected)`：
+同一组反向守卫 ＋ **整句逐字相等**（把 id 替换成 `<ID>` 后）。
+于是「满足全部正向断言、再在后面附一句假话」这种消息**在结构上无法通过**，
+且**新增第三句文案时若不走这个函数，就等于没被守**——判据写进函数注释。
+
+#### 六条阻断的处置
+
+| # | 阻断 | 处置 | 证据（变异读数，基线 **298/0**） |
+|---|---|---|---|
+| **F1** | raw 句可被塞回 v0.4.16 假建议而全绿 | `assertHonestRefusal` 施加与派生句**同一组**反向断言 ＋ 整句相等 | **MK2** 298/294/**4**、**MK** 298/294/**4**（评审处均为 291/291/0） |
+| **F2** | 「memory itself is unaffected」无人守，且**可被反转** | 同上函数内：正向断言该子句 ＋ **矛盾守卫**（不得声称删除/移除/更改） | **ML** 298/294/**4**、**MA**（删掉该子句）298/294/**4**（评审处均为 291/291/0） |
+| **F3** | raw 句对**非 session kind** 的行**为假** | **收窄断言**：`no source **conversation** was recorded`。新增 T4b **三条独立测试**（commit/file/url 各一条） | **MF3**（改回旧措辞）298/294/**4** |
+| **F4** | `e.kind='session'` 可挪出 ON 而无人发现，**注释却声称守住了** | **钉住**（非删注释）：T4b 的行在该变异下落到通用否认，被共享守卫杀死 | **MC** 298/295/**3**（评审处 291/291/0，两次） |
+| **F5** | `continue`→`break` 存活，跨库结果被改变 | 新增 T4c：store 1 持**未被引用**副本、store 2 持**可引用**副本，断言取回原话 | **MB** 298/297/**1**（**只杀 T4c**，评审处 291/291/0） |
+| **F6** | `README.md:58` 未改，而 STATUS 声称已改 | 改 README:58；上表第 5 行**保留原文并标注证伪** | 见上方「六个陈述面」第 5 行 |
+
+**F3 值得单独说，因为它是本文档教训 6 的又一次实例，且犯在本轮自己身上。**
+`evidence.kind` 是**四值枚举**（schema.ts `CHECK (kind IN ('session','commit','file','url'))`），
+本查询**只 join `session`**，故唯一证据是另外三种 kind 的行被空扩展、走 raw 分支。
+**lead 独立复现（走已装修复的构建）**：
+
+```
+only-commit: THREW <id> is a stored memory, but no source passage was recorded for it, …
+   ^ evidence.kind=commit excerpt="THE REAL RECORDED PASSAGE" IS recorded
+only-file / only-url : 同样
+```
+
+**该行的 `evidence.excerpt` 里确实存着一段原文**，而句子断言「没有记录过」——
+**store 直接反驳它**。在 HEAD 上这个输入得到的是**通用否认**（错，但只是**假否认**）；
+装上修复后它变成**一句假的事实陈述**——**修复把缺陷换成了更坏的失效模式**，
+正是 ADR 0012 **教训 6**，也正是本轮拿去检验 `SOURCE_NOT_SHOWN` 并**通过了**的那把尺子。
+
+**选定的修法：收窄断言，不加第二条查询、不改 join。**
+`no source **conversation** was recorded` 对**四个枚举值全部为真**——
+本下钻是从 `session` 行作答的（引文即那次会话的摘录），其余三种 kind 确实没有会话。
+**它陈述判别式，而不是否认「什么都没存」。**
+**被否决的替代**（记下以免重提）：把全部 kind 放进 join 直接返回非会话 excerpt——
+①`ref` 不再是 session id ⇒ 回退取不到 ⇒ 返回 `[]` ⇒ 渲染成 `SOURCE_NOT_SHOWN`，
+而它四个析取支对这种行**全为假**，**又是一次假成因**；
+②把 commit/file/url 的 excerpt 挂上 `QUOTE_LABEL` 等于断言「这是从**会话**里引的」，
+而 ADR 0012 §2.2 的存在就是为了让该标注为真。**保持一条规则、一条查询、一句文案。**
+
+**「今天没有写者产生非 session kind」不是不守它的理由**（生产直方图 `{session: 540}`，
+唯一证据为非 session 的活行 **0 条**）——那正是本轮**自己**用来论证
+「raw 无证据 0 条真实数据也要守」的**同一条「待办 p 判例」**。
+**规则一旦表达在枚举上，每一个取值都是执行点**（已写进 ADR 0012 教训 10）。
+
+#### 三条建议的处置
+
+| # | 建议 | 处置 | 证据 |
+|---|---|---|---|
+| **S1** | `GUIDANCE_SECTION` 只有反向断言，钉的是**一个被拒的字节串**而非**属性** | **已做**。改为按属性断言：凡对 source passage 使用**保证取回**类动词（read/fetch/get/retrieve/return/show/…）即失败；另加正向断言防止「整句删掉也能过」 | **MS1**（`look up`→`fetch`）298/297/**1**（评审处**存活** 291/0）。**重新计价：152 tokens，预算 160，未变** |
+| **S2** | T4 止于 service 出口，未到最外层尺子 | **已做**（推荐项）。T4 增加穿过 `realRecallTool` 的一段，对**模型实际读到的字节**施加同一组守卫 | **P7d**（只在工具层改写文案的变异）298/297/**1**，**只杀 T4**——证明该段非空转 |
+| **S3** | archived member 域只在注释里论证，未测量 | **已做**。6h 改为 **2 域 × 3 层 = 6 条**（live/archived），archived 用既有 fixture，**不写 member 库** | **M1** 杀掉全部 6 条；**M2** 在两域各杀 L1、L3 而 L2 保持绿 |
+
+#### 完整变异矩阵（返工后重跑；基线 **298 / 298 / 0 fail**）
+
+每条**只改一个执行点** → `npm run build` → 跑**全量** → 记录 → **还原 src ＋ 重 build ＋ 复跑确认回基线**。
+⚠️ 一律**不用 `git checkout`**（HEAD 是**未修复**的代码），还原自 `/tmp/rw/snap` 快照。
+
+| 变异 | 读数 tests/pass/fail | 杀掉的具名测试 | 评审/上一轮读数 |
+|---|---|---|---|
+| **MK2** raw 句 = v0.4.16 假建议原文 | 298 / 294 / **4** | T4、T4b×3 | ⛔ 291/291/**0** |
+| **MK** raw 句 ＋「Start a session inside…」 | 298 / 294 / **4** | T4、T4b×3 | ⛔ 291/291/**0** |
+| **MA** raw 句**删掉**「unaffected」子句 | 298 / 294 / **4** | T4、T4b×3 | ⛔ 291/291/**0** |
+| **ML** raw 句改称「记忆已被删除」 | 298 / 294 / **4** | T4、T4b×3 | ⛔ 291/291/**0** |
+| **MF3** raw 句改回 `no source passage was recorded` | 298 / 294 / **4** | T4、T4b×3 | （本轮新增执行点） |
+| **MC** `e.kind='session'` 挪进 WHERE ＋ `OR e.kind IS NULL` | 298 / 295 / **3** | **T4b×3** | ⛔ 291/291/**0**（两次） |
+| **MB** 未引用分支 `continue`→`break` | 298 / 297 / **1** | **只杀 T4c** | ⛔ 291/291/**0** |
+| **MS1** `GUIDANCE` `look up`→`fetch` | 298 / 297 / **1** | 只杀 T8 | ⛔ 291/291/**0** |
+| **MTOOLDESC** 工具描述改回无条件承诺 | 298 / 297 / **1** | 只杀 T8 | ✅ 同向 |
+| **M1** 整块删掉新分支 | 298 / 284 / **14** | L1/L2/L3、T4、T4b×3、T6、6h-live×3、6h-archived×3 | ✅（原 291/283/8） |
+| **M2** 收窄成 `=== LAYER.SCENARIO` | 298 / 292 / **6** | **L1 与 L3 各自转红，L2 绿**；6h-live-1/3、6h-archived-1/3 | ✅（原 291/287/4） |
+| **M3** 漏 L1 | 298 / 295 / **3** | **只杀 L1**；6h-live-1、6h-archived-1 | ✅ |
+| **M4** 只漏 L3 | 298 / 295 / **3** | **只杀 L3**；6h-live-3、6h-archived-3 | ✅ |
+| **M5** 只修派生行（lead 原窄方案） | 298 / 294 / **4** | T4、T4b×3 | ✅（原只杀 T4） |
+| **M6** 拆开 D5 析取 | 298 / 297 / **1** | **只杀 T5** | ✅ |
+| **M7** `sourceOf` 参数描述改回无条件承诺 | 298 / 297 / **1** | **只杀 T8** | ✅ |
+
+**M2 仍是签名实验**：L1 与 L3 **各自单独转红**、L2 保持绿，且**在 live 与 archived 两个域各来一次**。
+
+> **⛔ 上表（返工 3b 的「完整变异矩阵」）已被 3c 证伪为不完整**（原表保留，勿改）：
+> 它声称是**完整**矩阵，但**三条本轮自己改过的面向模型描述串一条都没进表**——
+> **MK / MM / MN 三条变异在这张表所依据的那个构建上全部 298/298/0 存活**，
+> 且 **MA（`existsWithoutSource` 覆盖语义）与 MP（store 顺序）同样存活**。
+> 一张自称完整、却漏掉本轮修改过的执行点的矩阵，**本身就是一句关于本轮工作的不实陈述**，
+> 与「六个陈述面」第 5 格是同一种缺陷。3c 的完整矩阵见上文。
+
+#### 空转探针（每条新测试各配一条：拆掉前提 ⇒ 必须转红）
+
+| 探针 | 构造 | 读数 | 结论 |
+|---|---|---|---|
+| **P1** | 删掉 T1-T3 的派生行 plant | 298 / 295 / **3** | 三条全红 ✅ |
+| **P2** | T1-T3 换成**从不存在**的 id | 298 / 295 / **3** | 三条全红 ✅（非靠 fail-closed 通过） |
+| **P3** | 删掉 T4 里的 evidence 删除 | 298 / 297 / **1** | T4 转红 ✅ |
+| **P4** | 删掉 T4b 的非 session evidence 插入 | 298 / 295 / **3** | 三条全红 ✅ |
+| **P5** | 删掉 T4c 的未引用副本**及其前提断言** | 298 / 298 / **0** | ⛔ **本轮自查发现的空转，已修**，见下 |
+| **P5b** | **只**删该副本、保留前提断言 | 298 / 297 / **1** | T4c 转红 ✅ |
+| **P6** | 6h 两域去掉 plant | 298 / 292 / **6** | 六条全红 ✅ |
+| **P7d** | **只在工具层**改写文案（service 层不动） | 298 / 297 / **1** | **只杀 T4** ✅ 证明 S2 那段非空转 |
+| **P8b** | 拆掉 S1 属性断言后**再**施加 MS1 | 298 / 298 / **0** | ✅ 归因成立：MS1 正是被该断言杀死 |
+
+> **⛔ P5 是本轮自查抓到的一处自身空转，如实记录。** T4c 初版的前提只断言
+> 「store 1 里这个 id **没有 session 证据**」——而当那一行**根本不存在**时，
+> 该断言**恒真**。于是拆掉 fixture 后测试**仍然全绿 298/0**：
+> **一条为抓空转而写的测试，自己是空转的。**
+> 已改为断言「**存在、live、且未被引用**」三者，P5b 复测转红。
+> 判据：**前提断言必须会因它所描述之物被删除而失败**，否则它什么都没钉住。
+
+#### 硬约束复验（返工后重测，非引用）
+
+| 约束 | 结果 |
+|---|---|
+| **D5 不可分辨** | ✅ 逐字相同：`no memory with id <ID>, or it was forgotten`（替换 id 后整串相等，**M6 仍只杀 T5**） |
+| **member 库不可写** | ✅ 6h **六条**（live×3 ＋ archived×3）逐条比对 `memory.sqlite` ＋ `-wal` 的 md5 ＋ `store_revision`，全部不变 |
+| **`RECALL_NO_MATCH` 字节** | ✅ 未动：`"No stored memories matched."`；`SOURCE_NOT_SHOWN.startsWith(RECALL_NO_MATCH) === false`（metrics 前缀匹配不受污染） |
+| **`SOURCE_NOT_SHOWN` 字节** | ✅ 未动，且仍由 **T7** 钉住 |
+| **一条查询 / 零新增 `.prepare`** | ✅ `source()` 方法体内 `.prepare(` 计数 = **1** |
+| **`GUIDANCE_SECTION` 预算** | ✅ **152** tokens ≤ **160**（`estimateTokens` 实测，加载期断言未触发） |
+
+### 本轮登记的待办
+
+| # | 事项 | 现状（实测 2026-09-05） | 处置判据 |
+|---|---|---|---|
+| 1 | 🟢 **`isError: true` 与「这是一个正常结局」语义不符** | 三种结局里有两种成功（返回 hits），第三种**戴错误标记**送达模型，实测 `Error: ` 前缀 ＋ `isError: true` | **登记而不修**，判据已写进 `service.ts` 注释：`source()` 全部「答不了」的出口都是 throw，**为一种情形新增第二种出口形态**就是第二套机器。要改须**整体**把该方法改成结果型返回，属独立选题 |
+| 2 | 🟢 **`npm test` 偶发进程级崩溃（`store.test.mjs`）** | 本轮**第一次**全量跑出现 253/1（`store.test.mjs` 进程崩溃退出），随后**连续 4 次**均 280/0；单独跑该文件 28/28 稳定通过 | **登记**。与本轮改动无关（发生在改动前的基线确认阶段，且改动后 10+ 次全量跑未复现），但它是**能把读数从 280 变成 253 的东西**，任何依赖读数的判断都应先复跑确认 |
+| 3 | 🟢 **非 session 证据的行拿不到它的 excerpt**（返工登记） | F3 收窄了**文案**使其不再说假话，但**行为未变**：唯一证据是 `commit`/`file`/`url` 的行，其 `evidence.excerpt` 里的原文**仍然取不回来**——`sourceOf` 只从 `session` 行作答 | **登记而不修，且这是刻意的**。要取回它须解决两个真问题：①`ref` 不是 session id，回退窗口无从谈起；②渲染标注要么复用 `QUOTE_LABEL`（等于谎称「引自会话」，违反 ADR 0012 §2.2），要么**新增一种标注**——那是渲染契约变更，属独立选题。今天**零真实数据**（唯一证据为非 session 的活行 0 条，直方图 `{session: 540}`），故**先让文案为真**是本轮的正确止损点。**一旦有写者开始产生非 session kind，这条立即升级** |
+
+### ⛔ 第二次返工（步骤 3c）：**代码复评审与 QA 并行，双双 FAIL，且收敛到同一形状**
+
+**按本仓惯例：以上各节的原判断、原读数、原表格全部保留原文，不修改，只在此标注证伪。**
+
+**最有价值的一条，先写：本轮的签名形状——「修哪个缺陷，就在哪个缺陷上再犯一次」——
+在这一轮里又发生了两次，而且两次都发生在它刚刚写下诊断的那几行旁边。**
+
+1. **派生句重复了本轮刚诊断出来的那一条 overclaim。** F3 的全部内容是
+   「`no source **passage** was recorded` 对唯一证据为 `commit`/`file`/`url` 的行为假」，
+   本轮为此收窄了 **raw 句**、写了 T4b×3、并**亲手写下一条禁止正则**。
+   而**派生句从头到尾没被收窄**，仍写着 `… so it has no source passage of its own.`——
+   **本轮自己写的那条正则，逐字判它有罪**：
+
+   ```
+   test/layers.test.mjs:1151 的禁止正则：
+     /no source passage was recorded|nothing was recorded|has no source passage/i
+   对已发布的派生句：matches = true    matched substring: "has no source passage"
+   ```
+
+   **测试套件自己给自己定了罪**：规则写好了、正则写好了，只施加在两个分支中的一个上。
+   QA 走**真实注册的 `memory_recall`**，在 **L1/L2/L3 × commit/file/url 共 9 格**、
+   home 与两个 member 域（live/archived）**全部复现**，lead 独立复现 **9/9 为假**。
+
+2. **守卫函数覆盖了 service 的两句话，却没覆盖同一轮改掉的工具文案。**
+   `assertHonestRefusal` 本身是健全的，但**只施加在 `service.ts` 的两句上**。
+   本轮**自己改过**的三条**面向模型的描述串**，**一条守卫都没有**：
+
+   | 变异 | 载荷 | 读数（评审处） |
+   |---|---|---|
+   | **MK** | `sourceOf` 参数描述：`The memory is unaffected either way.` → `Forget it and recall it again to fix this.` | ⛔ 298/298/**0** |
+   | **MM** | 工具描述追加 v0.4.16 假建议原文 `Start a session inside that checkout and retry.` | ⛔ 298/298/**0**（lead 独立复现，附 `lib/tools.js` grep 证明） |
+   | **MN** | `GUIDANCE_SECTION` 追加 `If none, forget it.`，实测 **157 ≤ 160**，**绕过加载期预算断言** | ⛔ 298/298/**0** |
+
+   **这是「一条规则、N 个执行点、只守其中几个」的第六次**，本次切片是
+   **「service 的句子 vs 工具描述的句子」**。T8 当时只有
+   `match(/no source passage of its own/)` 加几条针对**特定被拒字节串**的反向钉——
+   而本仓自己的 **NEG1-NEG4 判据**写得很清楚：
+   **正向断言会在一条「既说真话又说假话」的消息上通过**。
+
+3. **第三条阻断（两个 agent 各自独立提出）：store 迭代顺序在无声地决定调用方收到哪一句。**
+
+#### 阻断 1 的修法：派生句必须换一种**为真**的表述，而 raw 句的措辞**不能照搬**
+
+**为什么不能照搬。** raw 句的修法是把断言收窄到 `no source **conversation** was recorded`。
+把它抄给派生行**同样是假的**——那句话把该行描述成「本来可以记录一次会话、只是没记」，
+而这正是 **raw 行**的语义。**派生行是另一类东西**：它由 rebuild 作业**从其他已存行**生成
+（`rebuild.ts:354` / `rebuild.ts:561`，输入是 `queryInjectableSet` / `queryPersonaSources`），
+**从来不是从某个 turn 提炼出来的**。所以诚实的派生断言是关于**它是哪一类行**，
+而不是关于**一次没能发生的记录**。
+
+**新文案**（每个子句都由该分支已经读到的 `derived` 列确立）：
+
+```
+<id> is a generated summary, not a memory recorded from a conversation, so there is
+no source conversation of its own to show. The memory itself is unaffected.
+```
+
+**对四个 `evidence.kind` 取值全部为真、对三层全部为真**（`commit`/`file`/`url` 都不是会话）。
+它**刻意不说这份摘要是从什么建出来的**——那是本查询从未确立的事实，
+**在删掉一条 overclaim 的同时发明另一条**，正是本轮反复掉进去的那个循环。
+
+**新增 T4d：`derived ∈ {L1,L2,L3} × evidence.kind ∈ {commit,file,url}` 共 9 条独立测试**
+（不是一条内部循环：循环停在第一条失败断言，`L3 × url` 的判决将不可观测）。
+装修复前 **9/9 全红**，装修复后 **9/9 全绿**，且**每条都走到最外层尺子**
+（真实 `memory_recall`），因为假话正是在那一层被测到的。
+
+#### 阻断 2 的修法：**把共享守卫搬出 `layers.test.mjs`**，让两类串走同一组反向断言
+
+**不是「再加几条 `doesNotMatch` 字节钉」**——那正是 S1 已经被批评过一次的做法
+（钉的是**被拒的拼法**，不是**属性**），下一个被发明出来的载荷照样裸奔。
+
+`assertHonestRefusal`、`assertNoFalseAdvice`、`FALSE_ADVICE_PATTERNS`、
+`DERIVED_SENTENCE`、`RAW_SENTENCE` **全部移入 `test/helpers.mjs`**，
+理由是**结构性的**：守卫住在哪个测试文件里，另一个切片就不会 import 它。
+`layers.test.mjs` 与 `group.test.mjs` 本来就都从 `helpers.mjs` 取东西。
+三条描述串现在**逐条跑 `assertNoFalseAdvice`**，与两句拒绝文案**同一组反向集合**。
+
+**顺带折叠掉评审指出的漂移**：`group.test.mjs` 的 6h **把 9 条守卫断言 inline 重写了一遍**，
+并且**硬编码了一份派生句字面量**。硬编码那份才是真危险：本轮改掉派生措辞之后，
+它会**继续断言那句已经被证伪的旧话**，一个文件绿着、另一个文件早已改口。
+现已改为 `assertHonestRefusal(message, 'member-rollup', DERIVED_SENTENCE('member-rollup'))`，
+**两个文件共用一份定义、一份期望字节**。
+
+> **⛔ 本轮自查抓到的第二处「守卫是假的」，如实记录，因为它正是同一形状的第三次。**
+> `FALSE_ADVICE_PATTERNS` 初稿把 MK 的**原话**（`forget it and recall it again`）钉了进去。
+> 重跑矩阵时发现 **MN 的载荷 `If none, forget it.` 一条都没命中**——
+> MN 之所以转红，**纯属偶然**：它撞的是 `guidance.test.mjs` 里一条**与诚实性无关**的
+> 锚点唯一性断言，**只要有人改动那个锚点，这个「守卫」就消失**。
+> **靠意外杀死一个变异不算守住它**，而「钉被拒的字节串而不是钉属性」正是 S1 的原批评。
+> 已改为**按属性**断言：`/(?<!memory_)\bforget\s+(it|them|this|that|these|those|the\b)/i`
+> ——**读路径不得命令模型销毁记忆**，同时**不误伤**三条串里都合法出现的工具名 `memory_forget`
+> （三条现网串全部通过，已实测）。改后 MN **由 T8 本身杀死**。
+
+#### 阻断 3 的修法：**先证明「id 跨库唯一」没有任何东西在保证它**，再定优先级规则
+
+`existsWithoutSource` 原本是一个被循环**反复覆盖**的变量（`=`），**最后一个未被引用的库获胜**。
+**它不是行为中性的**：同一个 id 在两个可读库里各以**不同层**未被引用时，
+调用方收到的是**相反的那一句**（lead 实测，走已装修复的构建）：
+
+```
+derived(repo) + raw(global)  => "…is a stored memory, but no source conversation was recorded…"
+raw(repo) + derived(global)  => "…is a generated summary, not a stored memory…"
+```
+
+**QA 的判词更锋利，且必须被接受**：第一行里，调用方被告知这一行**是一条已存记忆**，
+而**本会话自己的 repo 库**正把它存为一条**生成摘要**。这句话或许对**某一份副本**为真，
+但**调用方无从判断是哪一份**，而代码**从未声明它指的是哪一份**。
+**一个主语未定义的回答不是诚实的回答**。
+
+**先查「这状态到底能不能出现」，因为 `forget` 有一句注释断言 id 跨库唯一。**
+**实测：没有任何东西在保证它。** 四个铸 id 的点全部是裸 `randomUUID()`
+（`extract.ts:339`、`rebuild.ts:354`、`rebuild.ts:561`、`service.propose`），
+**没有一个在写入前探测别的库**；而 `memories.id` 的 `UNIQUE` 约束是**按文件**的——
+**SQLite 无法跨独立数据库文件表达唯一性**，何况 group member 根本是别人的文件。
+**故唯一性是概率性的，不是结构性的**，该状态**可直接构造**（上面两行读数就是这么来的）。
+**结论：不是断言它不会发生（那会让一条读路径在可被喂到的状态上崩溃），而是定下优先级并说明理由。**
+
+**选定规则：FIRST-WINS（`??=`），最近作用域优先。** 三条理由都可复核：
+
+1. **同一个循环里下方的「可引用」分支本来就是 first-wins**（它从循环内 `return`）。
+   在 `=` 之下，**一个循环跑着两条相反的优先级规则**，由「恰好有没有证据」来选：
+   repo 里有引用就从 repo 答，repo 里没引用就从 global 答。
+   `??=` 让两个分支**报告同一行**，回答的主语不再取决于调用方看不见的事实。
+2. **`forget` 用 `.find()` 解决的是同一个「哪一份副本」的问题**——也是 first-wins。
+   `source` 现在与它一致，**这句话描述的行，就是 `forget` 会动的那一行**。
+3. **`readableStores` 的注释本来就写明「nearest scope first」**，`=` 在这一个分支上悄悄反转了它。
+
+**新增 T4e（两条独立测试，不是一条循环）**，断言的是**可观测量**
+（「回答描述的是 repo 那一份」），而不是去读实现。**MA 与 MP 各自被两条同时杀死**。
+
+#### 完整变异矩阵（**返工后重跑**；新基线 **309 / 309 / 0 fail**）
+
+每条**只改一个执行点** → `npm run build` → **证明落到 `lib/`**（anchor 断言 ＋ `lib/` grep）
+→ 跑**全量** → 记录 → **还原 src ＋ 重 build ＋ 复跑确认回基线**。
+⚠️ 一律**不用 `git checkout`**（HEAD 是**未修复**的代码），还原自 `/tmp/rw3/snap-*` 快照。
+
+**本轮三条阻断对应的变异**（评审处全部 **298/298/0 存活**）：
+
+| 变异 | 落地证明（`lib/` grep） | 读数 | 杀掉的具名测试 | 评审处 |
+|---|---|---|---|---|
+| **MK** `sourceOf` 参数描述 → `Forget it and recall it again to fix this.` | ✅ `lib/tools.js` | 309/308/**1** | T8 | ⛔ 298/298/**0** |
+| **MM** 工具描述 ＋ `Start a session inside that checkout and retry.` | ✅ `lib/tools.js` | 309/308/**1** | T8 | ⛔ 298/298/**0** |
+| **MN** `GUIDANCE_SECTION` ＋ `If none, forget it.`（157 ≤ 160） | ✅ `lib/tools.js` | 309/307/**2** | **T8**（诚实性）＋ guidance-1（预算锚点） | ⛔ 298/298/**0** |
+| **MA** `existsWithoutSource ??=` → `=`（last-wins） | ✅ `lib/service.js` | 309/307/**2** | **T4e ×2** | ⛔ 298/298/**0** |
+| **MP** store 列表 `.reverse()` | ✅ `lib/service.js` | 309/307/**2** | **T4e ×2** | ⛔ 298/298/**0** |
+| **MD3** 派生句改回 `has no source passage of its own`（9 格假话） | ✅ `lib/service.js` | 309/289/**20** | **T4d ×9**、T1-T3、6h-live×3、6h-archived×3、T6、T4e-1 | ⛔ 298/298/**0** |
+
+**前一轮矩阵复验，全部仍红**（读数因新增 11 条测试而上移）：
+
+| 变异 | 落地证明 | 读数 | 杀掉的具名测试 |
+|---|---|---|---|
+| **F1 / MK2** raw 句 = v0.4.16 假建议原文 | ✅ `lib/service.js` | 309/304/**5** | T4、T4b×3、T4e-2 |
+| **F2 / ML** raw 句改称「记忆已被删除」 | ✅ `lib/service.js` | 309/304/**5** | T4、T4b×3、T4e-2 |
+| **F3 / MF3** raw 句改回 `no source passage was recorded` | ✅ `lib/service.js` | 309/304/**5** | T4、T4b×3、T4e-2 |
+| **F4 / MC** `e.kind='session'` 挪进 WHERE ＋ `OR e.kind IS NULL` | ✅ `lib/service.js` | 309/297/**12** | T4b×3 ＋ **T4d×9**（较上轮 3 → 12，T4d 加固了该钉） |
+| **F5 / MB** 未引用分支 `continue`→`break` | ✅ `lib/service.js` | 309/308/**1** | **只杀 T4c** |
+| **D5**（`m.status != 'tombstone'` 由 WHERE 挪进 ON） | ✅ `lib/service.js` | 309/308/**1** | **只杀 T5** |
+| **S1** `GUIDANCE` `look up`→`fetch` | ✅ `lib/tools.js` | 309/308/**1** | 只杀 T8 |
+| **S3** 6h fixture 去掉 `archived:true` | ✅ 测试文件行 1074 | 309/306/**3** | **只杀 6h-archived×3** |
+| **M1** 整块删掉新分支 | ✅ `lib/service.js` | 309/283/**26** | L1/L2/L3、T4、T4b×3、**T4d×9**、T4e×2、T6、6h×6 |
+| **M2** 收窄成 `!== LAYER.SCENARIO` | ✅ `lib/service.js` | 309/297/**12** | L1、L3 **各自转红**，L2 绿；T4d 的 L1/L3 各 3 条；6h 两域的 L1/L3 |
+| **M5** 只修派生行（**lead 原窄方案**） | ✅ `lib/service.js` | 309/304/**5** | T4、T4b×3、T4e-2 |
+| **M6** 拆开 D5 析取 | ✅ `lib/service.js` | 309/308/**1** | **只杀 T5** |
+| **M7** `sourceOf` 参数描述改回无条件承诺 | ✅ `lib/tools.js` | 309/308/**1** | 只杀 T8 |
+
+> ⚠️ **M1 的一次读数是 300/274/26**（有测试文件整体中止），复跑取 309 口径；
+> 还原后基线一律以**复跑**为准，见下方待办 2 与新登记的待办 4。
+
+#### 空转探针（拆掉 fixture 的前提 ⇒ 必须转红）
+
+| 探针 | 构造 | 读数 | 结论 |
+|---|---|---|---|
+| **P1** | 删掉 T1-T3 的派生行 plant | 309/306/**3** | 三条全红 ✅ |
+| **P2** | T1-T3 换成**从不存在**的 id | 309/306/**3** | 三条全红 ✅（非靠 fail-closed 通过） |
+| **P3** | 删掉 T4 里的 evidence 删除 | 309/308/**1** | T4 转红 ✅ |
+| **P4d** | **新**：删掉 T4d 的非 session evidence 插入 | 309/300/**9** | **九条全红** ✅（否则退化成 T1-T3） |
+| **P5b** | **只**删 T4c 的未引用副本、保留前提断言 | 309/308/**1** | T4c 转红 ✅ |
+| **P9** | **新**：删掉 T4e 的第二份（global）副本 | 309/307/**2** | **两条全红** ✅（无碰撞即无可仲裁之事） |
+
+#### 硬约束复验（返工后重测，非引用）
+
+| 约束 | 结果 |
+|---|---|
+| **D5 不可分辨** | ✅ 逐字相同（替换 id 后整串相等，实测 `BYTE-IDENTICAL: true`）；**D5 变异仍只杀 T5** |
+| **member 库不可写** | ✅ 6h **六条**逐条比对 `memory.sqlite` ＋ `-wal` 的 md5 ＋ `store_revision`，全部不变；本轮**未新增任何对 member 库的写** |
+| **`RECALL_NO_MATCH` 字节** | ✅ 未动：`"No stored memories matched."`；`SOURCE_NOT_SHOWN.startsWith(RECALL_NO_MATCH) === false` |
+| **`SOURCE_NOT_SHOWN` 字节** | ✅ 未动（`git diff` 对该常量零改动行），仍由 **T7** 钉住 |
+| **一条查询 / 零新增 `.prepare`** | ✅ `source()` 方法体内 `.prepare(` 计数 = **1** |
+| **`GUIDANCE_SECTION` 预算** | ✅ **152** tokens ≤ **160**（本轮**未改该文本**，仅加注释与守卫） |
+| **9 格派生假话** | ✅ **0 / 9**（返工前 **9 / 9**），同一探针复测 |
+
+### 本轮（3c）新登记的待办
+
+| # | 事项 | 现状（实测） | 处置判据 |
+|---|---|---|---|
+| 4 | 🟢 **`e2e.test.mjs` 里任一断言失败会让 `node --test` 挂死，而不是失败** | **既有缺陷，非本轮引入**：`boot()` 型测试在断言抛出后**跳过 `await shutdown()`**，fiber 存活，进程不退出。在**未变异的产品代码**上复现为 **RC=137 / 240s**。`e2e.test.mjs` **不在本轮 7 个改动文件之列** | **登记而不修**。它把「测试失败」变成「测试挂死」，会让任何**红着跑全量**的人误判。**施工绕法已验证**：跑全量时加 `--test-timeout=90000`（本轮全部矩阵读数均如此取得；20000 会误伤 `resilience.test.mjs`，它单文件就要 18.8s）。要真修须给 `boot()` 型测试加 `t.after(shutdown)` 之类的**无条件收尾**，属独立选题 |
 
 ## 🆕 v0.4.16：一句话在两个输入域真值不同，却被共用（**假建议，非数据事故**）
 
@@ -254,7 +806,7 @@ AFTER forgetting exactly 1 raw row
 
 | # | 事项 | 现状（实测 2026-09-04） | 处置判据 |
 |---|---|---|---|
-| 1 | 🟢 **`source()` 对一切派生行返回「不存在」，而该行确实存在** | home 与 member **同样**返回 `no memory with id X, or it was forgotten`。根因是派生行**无 evidence 行**（生产 15/15 实测 `evidenceRows=0`） | **统一缺陷**（非 member 专属），**方向 fail-closed**（说少了，不是说错了），故危害远低于本轮选题。**非本轮范围**。修法须先决定「派生行的 source 应该是它汇总的那些 raw 行的 source，还是干脆声明它没有」——是设计问题不是措辞问题 |
+| 1 | ~~🟢 **`source()` 对一切派生行返回「不存在」，而该行确实存在**~~ **⛔ 已结项，且其「派生行」框定被证伪：见 v0.4.17** | home 与 member **同样**返回 `no memory with id X, or it was forgotten`。根因是派生行**无 evidence 行**（生产 15/15 实测 `evidenceRows=0`） | **统一缺陷**（非 member 专属），**方向 fail-closed**（说少了，不是说错了），故危害远低于本轮选题。**非本轮范围**。修法须先决定「派生行的 source 应该是它汇总的那些 raw 行的 source，还是干脆声明它没有」——是设计问题不是措辞问题<br>**⛔ v0.4.17 证伪**：判别式**不是派生性**而是**存在性**——实测 `source()` 体内 `derived`/`LAYER` 出现 **0 次**，且**带 evidence 的派生行答得好好的**（2×2 格 C），**无 evidence 的 raw 行同样被否认**（格 B）。故执行点是**四个**不是三个。**成立的部分**：根因确为「无 evidence 行」，方向确为 fail-closed；它自陈的解锁条件（先决定派生行的 source 是什么）**v0.4.17 已决定：声明它没有**——因为 schema 里**根本没有派生→源映射** |
 | 2 | ~~🟡 **`service.ts:978`（`share` 的派生判断）零覆盖**~~ **⛔ 已作废：本轮补掉，见下** | **变异 M5 实测存活：删掉整行后 277/277/0 全绿** | ~~与本轮 `forget` 侧同族，但**暴露面小得多**：`share` 只走 `storeFor()`，member 库根本进不来，故只能在 **home 派生行**上触发；且 `share` 后续还有 `looksSecret` 与投影两道，失守后果是「把一条生成摘要投影进 `.repo_memory/`」而非数据丢失。**登记而不修**——判据是下一次动 `share` 时一并补~~ |
 | 3 | 🟢 **`service.ts:932` 的 `AND derived = ${LAYER.RAW}` 零覆盖** | **变异 M6 实测存活：删掉后 280/280/0 全绿** | **维持登记**。该处源码注释自己已写明「今天 UNREACHABLE，且是刻意保留」（D9 的 INSERT 先落地已整层删除派生层）。故这不是「没人发现」，是**已登记的纵深防御**。要补测试须先造出一个能绕过 D9 排序的场景——**属独立选题**，且与「待办 p 判例」**不冲突**：那条注释正是按判例写的 |
 | 4 | 🟢 **工具层 `memory_forget` 的 `share: false`（默认 forget）路径无覆盖** | 6g 只测了 `share: true` 那一半；`share: false` 分支只在 service 层被测，未经工具层 | 两条路径在 `tools.ts` 是同一 `execute` 的两个分支，默认路径由 e2e 的 `memory_forget` 调用间接覆盖。**登记**，判据是下次动该工具的参数或分派时一并补齐两半 |

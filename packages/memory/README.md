@@ -28,7 +28,7 @@ injection, and forgetting all work; only automatic extraction is disabled
 | Surface | Audience | Behavior |
 |---|---|---|
 | `memory_propose` | principal only | Saves as `active`; `scope: 'personal'` targets the cross-repo store; `replaces` supersedes an entry and the result lists near-duplicates |
-| `memory_recall` | any agent | FTS across both scopes; `sourceOf: <id>` returns the original conversation |
+| `memory_recall` | any agent | FTS across both scopes; `sourceOf: <id>` returns the cited quotation, else the original conversation, else says the memory has no source of its own |
 | `/memory` | any live agent (list) / principal (forget) | Shows what is stored here without needing a search term — the plugin learns silently, so this is how a person sees the result |
 | `memory_forget` | principal only | Tombstones by id in either scope; `share: true` requests approval to commit it to `.repo_memory/` |
 | context injection | principal only | Personal memories first, then repo working set; framed, ≤1400 tok |
@@ -55,9 +55,32 @@ directly — one XOR expression states the invariant in both directions:
 
 Each principal turn is classified once and written to `conversations` in the
 same transaction that queues its extraction. That makes provenance
-*checkable*: `memory_recall` with `sourceOf` returns the stored turns behind
-a memory, so "where did this come from" has an answer that does not depend on
-the platform session log still existing.
+*checkable*: `memory_recall` with `sourceOf` looks up the stored turns behind
+a memory, so where a source conversation was recorded, "where did this come
+from" has an answer that does not depend on the platform session log still
+existing.
+
+Not every memory has such an answer, and the drill-down says which case it
+is in rather than denying the memory exists. A **generated summary** (any
+derived layer) is not a memory recorded from a conversation at all — the
+rebuild job builds it from other stored rows, writes no evidence row, and the
+schema keeps no derived→source mapping — so it has no source conversation of
+its own to show. A **raw entry** may carry no `session` evidence row, whether
+because none was recorded or because its only evidence is of another `kind`
+(`commit`/`file`/`url`), which this drill-down does not read.
+
+Both get a statement saying so, and **neither claims more than that**. In
+particular neither says "nothing was recorded": a row of either layer can
+carry a `commit`/`file`/`url` evidence row whose `excerpt` holds a real
+passage, so the sentences speak only about a source *conversation*, which is
+the one thing the query actually establishes. Only an id that is absent *or
+forgotten* gets "no memory with id …", and those two remain deliberately
+indistinguishable (D5).
+
+When the same id is held uncited by more than one readable store, the answer
+describes the copy in the **nearest** one (repo before global before group
+members), matching both the citable branch beside it and `forget`'s own
+lookup — so the row the sentence is about is the row `forget` would act on.
 
 L0 is deliberately **not** a second search index — the distilled layer is
 what gets searched; L0 is reached by id. Any turn a live memory cites is kept
