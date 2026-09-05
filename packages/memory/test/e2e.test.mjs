@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { Context } from '@deepseek-ai/cordis'
@@ -45,6 +45,10 @@ const boot = async (rootDir) => {
   await fiber
   return {
     ctx,
+    // Exposed so a test can assert the plugin fiber is genuinely gone after
+    // teardown: `fiber.uid` is a real discriminator — a number while the fiber
+    // is live, `null` once it has been disposed.
+    fiber,
     shutdown: async () => {
       await fiber.dispose()
       for (const entry of [...platform].reverse()) await entry.dispose()
@@ -62,13 +66,52 @@ const callTool = async (ctx, agent, name, args) =>
     signal: new AbortController().signal,
   })
 
-test('e2e: real agent saves, recalls, sees injection, and forgets', async () => {
+test('e2e: real agent saves, recalls, sees injection, and forgets', async (t) => {
   clearRepoIdentityMemo()
   const repo = makeRepo()
   const root = tempRoot()
-  const { ctx, shutdown } = await boot(root)
+  const { ctx, fiber, shutdown } = await boot(root)
+  let principal
 
-  const principal = await ctx.agents.create({
+  // ⛔ TEARDOWN IS REGISTERED HERE, NOT LEFT AT THE TAIL, and that is the
+  // whole point of this shape. The plugin owns a 30s `ctx.interval`, so a live
+  // fiber holds the event loop open by itself. With teardown only at the tail,
+  // ANY failing assertion above it skips `shutdown()`, the fiber survives, and
+  // `node --test` never exits: the file-level subtest HANGS instead of
+  // reporting the failure. Measured on this exact file: a never-matching
+  // assertion produced `cancelled 1` and RC=124 under an external 45s timeout,
+  // and `--test-timeout` does NOT bound it, because the failing test itself
+  // finished in ~40ms — what hangs is the FILE. Registered as `t.after`, the
+  // same failure is reported in milliseconds. `principal` is disposed inside
+  // the teardown, before `shutdown()`, preserving the original order.
+  t.after(async () => {
+    await principal?.dispose?.()
+    await shutdown()
+    cleanup(root)
+  })
+
+  // ⛔ REGISTERED SECOND ON PURPOSE — DO NOT MERGE THIS INTO THE TEST BODY.
+  // `t.after` callbacks run FIFO (registration order, measured), so this one
+  // observes the state left behind by the teardown above. Asserting the same
+  // thing in the body would be vacuous: at that moment teardown legitimately
+  // has not run yet. This is the only check that can tell a REAL teardown from
+  // an empty one — gutting the callback above leaves every named test in this
+  // file green, with only the file-level RC=124 noticing.
+  // `fiber.uid` is the discriminator (a number while live, `null` once
+  // disposed). `ctx.get('memory')` would ALSO flip here — measured: an object
+  // while live, `undefined` after teardown, and it does NOT throw — but it is
+  // the narrower reading. It reports only that the memory service was
+  // unpublished, while `uid` reports the fiber's own disposal, and the fiber
+  // is what owns the 30s interval that keeps this file's event loop alive.
+  // Measured: disposing the plugin fiber while LEAKING the entire platform
+  // root already reads `undefined`, so `ctx.get` cannot tell a partial
+  // teardown from a complete one.
+  t.after(() => {
+    assert.equal(fiber.uid, null, 'teardown really disposed the plugin fiber')
+    assert.equal(existsSync(root), false, 'teardown really removed the temp store root')
+  })
+
+  principal = await ctx.agents.create({
     sessionId: randomUUID(),
     meta: { cwd: repo },
   })
@@ -109,21 +152,27 @@ test('e2e: real agent saves, recalls, sees injection, and forgets', async () => 
   assert.equal(renderContextSnapshot(afterAssembly), '')
   const afterRecall = await callTool(ctx, agent, 'memory_recall', { query: 'pnpm' })
   assert.equal(afterRecall.value.hits.length, 0)
-
-  await principal.dispose?.()
-  await shutdown()
-  cleanup(root)
 })
 
-test('e2e: a real subagent-shaped child is refused writes but may recall', async () => {
+test('e2e: a real subagent-shaped child is refused writes but may recall', async (t) => {
   clearRepoIdentityMemo()
   const repo = makeRepo()
   const root = tempRoot()
   const { ctx, shutdown } = await boot(root)
+  let parent, child
 
-  const parent = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
+  // Teardown registered at acquisition, not at the tail: see the first test in
+  // this file for why a tail-only teardown turns a failure into a hang.
+  t.after(async () => {
+    await child?.dispose?.()
+    await parent?.dispose?.()
+    await shutdown()
+    cleanup(root)
+  })
+
+  parent = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
   // A child created the way dsh-subagent creates one: origin + depth stamped.
-  const child = await ctx.agents.create({
+  child = await ctx.agents.create({
     sessionId: randomUUID(),
     meta: { cwd: repo, parentSession: parent.agent.id, origin: 'subagent', delegationDepth: 1 },
   })
@@ -153,19 +202,24 @@ test('e2e: a real subagent-shaped child is refused writes but may recall', async
   // principal still sees it
   const parentAssembly = await ctx.systemPrompt.assemble({ agent: parent.agent, scope: parent.agent.ctx })
   assert.match(renderContextSnapshot(parentAssembly), /make all/)
-
-  await child.dispose?.()
-  await parent.dispose?.()
-  await shutdown()
-  cleanup(root)
 })
 
-test('e2e: personal memory and L0 drill-down through the real tool pipeline', async () => {
+test('e2e: personal memory and L0 drill-down through the real tool pipeline', async (t) => {
   clearRepoIdentityMemo()
   const repo = makeRepo()
   const root = tempRoot()
   const { ctx, shutdown } = await boot(root)
-  const principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
+  let principal
+
+  // Teardown registered at acquisition, not at the tail: see the first test in
+  // this file for why a tail-only teardown turns a failure into a hang.
+  t.after(async () => {
+    await principal?.dispose?.()
+    await shutdown()
+    cleanup(root)
+  })
+
+  principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
   const agent = principal.agent
 
   // A personal preference and a repo fact, saved through the real tools.
@@ -199,18 +253,24 @@ test('e2e: personal memory and L0 drill-down through the real tool pipeline', as
   const source = await callTool(ctx, agent, 'memory_recall', { sourceOf: personal.value.id })
   assert.equal(source.isError, false)
   assert.equal(source.value.hits.length, 0)
-
-  await principal.dispose?.()
-  await shutdown()
-  cleanup(root)
 })
 
-test('e2e: an agent with no repo affiliation is refused writes and injects nothing', async () => {
+test('e2e: an agent with no repo affiliation is refused writes and injects nothing', async (t) => {
   clearRepoIdentityMemo()
   const root = tempRoot()
   const { ctx, shutdown } = await boot(root)
+  let stray
+
+  // Teardown registered at acquisition, not at the tail: see the first test in
+  // this file for why a tail-only teardown turns a failure into a hang.
+  t.after(async () => {
+    await stray?.dispose?.()
+    await shutdown()
+    cleanup(root)
+  })
+
   // cwd outside any git work tree
-  const stray = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: tempRoot() } })
+  stray = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: tempRoot() } })
 
   const proposed = await callTool(ctx, stray.agent, 'memory_propose', {
     title: 't', body: 'b', kind: 'fact',
@@ -230,12 +290,9 @@ test('e2e: an agent with no repo affiliation is refused writes and injects nothi
     /be terse/,
     'personal memory reaches a repo-less session',
   )
-  await stray.dispose?.()
-  await shutdown()
-  cleanup(root)
 })
 
-test('e2e: memory content containing {{...}} is data, never prompt syntax', async () => {
+test('e2e: memory content containing {{...}} is data, never prompt syntax', async (t) => {
   // Regression. Prompt text is STRICTLY interpolated: an unknown `{{name}}`
   // throws and a known one silently expands. Memory bodies legitimately carry
   // brace pairs (CI matrices, Jinja/Handlebars, commit templates), and
@@ -249,7 +306,17 @@ test('e2e: memory content containing {{...}} is data, never prompt syntax', asyn
   const repo = makeRepo()
   const root = tempRoot()
   const { ctx, shutdown } = await boot(root)
-  const principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
+  let principal
+
+  // Teardown registered at acquisition, not at the tail: see the first test in
+  // this file for why a tail-only teardown turns a failure into a hang.
+  t.after(async () => {
+    await principal?.dispose?.()
+    await shutdown()
+    cleanup(root)
+  })
+
+  principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
   const agent = principal.agent
 
   const hostile = [
@@ -283,13 +350,9 @@ test('e2e: memory content containing {{...}} is data, never prompt syntax', asyn
   // The turn path still works afterwards: the store is not poisoned.
   const recalled = await callTool(ctx, agent, 'memory_recall', { query: 'matrix' })
   assert.equal(recalled.isError, false)
-
-  await principal.dispose?.()
-  await shutdown()
-  cleanup(root)
 })
 
-test('e2e: parallel tool calls from one agent all commit correctly', async () => {
+test('e2e: parallel tool calls from one agent all commit correctly', async (t) => {
   // A model can request several tool calls in one step, and the registry may
   // overlap them. Every write takes the same transaction entry, so this must
   // neither lose a write nor deadlock against the reads running beside it.
@@ -297,7 +360,17 @@ test('e2e: parallel tool calls from one agent all commit correctly', async () =>
   const repo = makeRepo()
   const root = tempRoot()
   const { ctx, shutdown } = await boot(root)
-  const principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
+  let principal
+
+  // Teardown registered at acquisition, not at the tail: see the first test in
+  // this file for why a tail-only teardown turns a failure into a hang.
+  t.after(async () => {
+    await principal?.dispose?.()
+    await shutdown()
+    cleanup(root)
+  })
+
+  principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
   const agent = principal.agent
 
   const calls = []
@@ -312,13 +385,9 @@ test('e2e: parallel tool calls from one agent all commit correctly', async () =>
 
   const final = await callTool(ctx, agent, 'memory_recall', { query: 'parallel' })
   assert.equal(final.value.hits.length, 6, 'every write landed exactly once')
-
-  await principal.dispose?.()
-  await shutdown()
-  cleanup(root)
 })
 
-test('e2e: an optional string/enum argument sent as "" behaves as if omitted', async () => {
+test('e2e: an optional string/enum argument sent as "" behaves as if omitted', async (t) => {
   // Many callers cannot distinguish "leave this optional field out" from
   // "send it as an empty string" — observed directly against a real agent
   // import: `memory_recall` got `sourceOf: ""` when only `query` was meant,
@@ -330,7 +399,17 @@ test('e2e: an optional string/enum argument sent as "" behaves as if omitted', a
   const repo = makeRepo()
   const root = tempRoot()
   const { ctx, shutdown } = await boot(root)
-  const principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
+  let principal
+
+  // Teardown registered at acquisition, not at the tail: see the first test in
+  // this file for why a tail-only teardown turns a failure into a hang.
+  t.after(async () => {
+    await principal?.dispose?.()
+    await shutdown()
+    cleanup(root)
+  })
+
+  principal = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
   const agent = principal.agent
 
   // recall: sourceOf as "" must search, not fail as "no memory with id ''"
@@ -356,8 +435,4 @@ test('e2e: an optional string/enum argument sent as "" behaves as if omitted', a
   assert.match(badKind.error.message, /unknown kind/)
   assert.equal(badScope.isError, true)
   assert.match(badScope.error.message, /unknown scope/)
-
-  await principal.dispose?.()
-  await shutdown()
-  cleanup(root)
 })

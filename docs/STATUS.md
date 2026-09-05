@@ -1,5 +1,228 @@
 # 当前状态
 
+> 最后更新：2026-09-05 · **本轮不发版，版本仍为 v0.4.17**（判据见本节末）：
+> **一次测试失败会被伪装成一次超时**。
+> 装载 memory 插件为活 fiber 的测试形如「`boot()` → 断言 → 尾部 `await shutdown()`」，
+> 断言一抛就**跳过收尾**，插件自持的 30s `ctx.interval`（`src/index.ts:103`）继续
+> 持有事件循环，`node --test` **永不退出**。即：**红色变成挂死**。
+> ⛔ **本轮同时证伪了 STATUS 自己登记的绕法**：待办 4 写着「跑全量时加
+> `--test-timeout=90000`」——**假的**。实测 `--test-timeout=3000` 仍挂满 45s，
+> 因为失败的那条测试自己 40ms 就判负了，**挂的是文件级 subtest**，per-test 超时不触发。
+> **本页此前全部「全量矩阵读数」都取自这个假绕法**，故历史上任何一次「红着跑全量」
+> 都可能读到 `cancelled`。⛔ **登记范围也少了两个文件**：待办 4 只写 `e2e.test.mjs`，
+> 实测 `lifecycle.test.mjs` 与 **`command.test.mjs`** 同型失效（各 RC=124）。
+> **范围判据不是「有没有释放资源」**（全仓约 500 个释放点，绝大多数无关）**而是
+> 「有没有把插件装成活 fiber」**：`grep -ln "ctx.plugin(memoryPlugin" test/*.mjs` **恰好三个**。
+> 反向验证该判据非空转：`pipeline-e2e.test.mjs` 同样 `new Context()` ＋尾部 shutdown
+> 但不装该插件 ⇒ 变异后 **0.19s RC=1 不挂**；`service.test.mjs` 0.265s RC=1。
+> 修法：收尾改由 `t.after` 在**获取处**注册。**11/11 执行点全守**（22 个变异体
+> ＝每 test × early/late 两处，全部 RC=1／cancelled 0／0.16–0.45s，无一挂死）。
+> 🟢 **决定性对照**：全量跑 ＋ 一条失败 e2e 断言，**改前 3m20s／RC=124／`cancelled 1`**，
+> **改后 19.2s／RC=1／`cancelled 0`**——**故障诊断成本降约 100 倍**。
+> ⛔ **本轮被打回三次，三次都是同一形状：为一个真实存在的断言编造错误理由。**
+> ①代码审查：三处注释称 `ctx.get('memory')` 会抛 inject error 而「碰巧杀死变异」——
+> **实测不抛**（live 为对象、teardown 后 `undefined`），且**同文件 `:121` 自己就有一行
+> 长期通过的 `assert.equal(ctx.get('memory'), undefined)`**，注释与断言直接矛盾；
+> 它还**为一个本来可用的替代探针编造了否决理由**。②QA：两处称「泄漏的 platform root
+> 会让定时器活过测试」——**实测泄漏全部 platform fiber 后 `activeTimeouts=0`、进程 0.109s 退出**，
+> 定时器**只**归插件 fiber。③执行 agent 自己查出**第四个执行点**：`lifecycle.test.mjs:29`
+> 的 **HEAD 既有**注释写着同一条假因果，且**就长在本轮改写的那个 `boot()` helper 上**——
+> 留着它，同一文件会自相矛盾。**三次都不是「注释瑕疵」**：本轮选题正是「产品对用户说假话」，
+> 而注释是**对下一个 agent 说的话**。
+> ⚠️ **执行 agent 两次拒绝照抄 lead／审查给的措辞**，理由都是实测推翻了它
+> （「平台 fiber 持有 interval」为假）——**不可用一个未经测量的断言替换另一个假断言**。
+> 🆕 **顺带查明本页待办 2「偶发进程级崩溃」的真正机理**（自 v0.4.17 悬置）：
+> `package.test.mjs` 跑 `npm pack` ⇒ 触发 `prepare: tsc` ⇒ **就地重写 `lib/**/*.js`**，
+> 而 `node --test` 并发跑的其他文件正从同一个 `lib/` import，**读到写了一半的文件**。
+> 实测 mtime 前后改变（**lead 独立复现**）；18 次全量跑 2 次失败（`decay.js` 缺导出、
+> `group.js:78` 截断在半行），**去掉该文件后 8/8 全绿**。**既有缺陷，本轮不修，已登记。**
+> 测试 309 → **309 / 0 fail**（**未增删测试**，测试名与基线逐字符相同；本轮改的是收尾机制）。
+> ⛔ **本轮明确不发版，且这是实测结论不是省事**：本轮只动 `test/`，而 `package.json`
+> 的 `files` 字段**不含任何测试文件**（`lib/**/*.js`、`lib/types/**/*.d.ts`、
+> `cordis.patch.yml`、`README.md`）。**实测**：本地 `npm pack` 产物与**已发布的
+> v0.4.17 资产**逐文件对比 —— `diff -r` **输出 0 行**、59 个文件**字节全等**。
+> 故发 v0.4.18 只会把**同样的字节**换个版本号推给所有装机用户；而
+> `scripts/release.sh` 的既有守卫本就写明：装机 URL 不带版本，**内容在固定 URL 下改变
+> 等同于供应链替换**。**没有可交付的字节变化，就没有版本**。本轮价值全部落在
+> **开发者可观测性**（红色不再变成挂死）与**文档诚实性**上，二者都不进 tarball。
+> **每次工作结束时更新本页**，它是新会话的唯一入口。
+>
+> ⬇️ 以下 v0.4.17 一节及更早各节仍然有效（v11 库不可被 0.4.13 及更早打开的警告同样仍有效）。
+
+## 🆕 2026-09-05（**未发版**，仍为 v0.4.17）：失败被伪装成超时——判别式是**谁持有事件循环**，不是**谁申请了资源**
+
+**本轮结项 v0.4.17 待办 4，并查明待办 2 的机理（登记不修）。**
+
+### 判据：不是「测试慢」，是**一次失败永远不会被报告**
+
+`boot()` 型测试把收尾放在尾部。断言一抛就跳过它，插件 fiber 存活，事件循环不排空。
+**因果隔离实测**（这一步才是根因证明，而不是「看起来像」）：
+
+```
+失败断言在收尾之前 → RC=124，外部 timeout 才杀得掉，node 打印
+                     'Promise resolution is still pending but the event loop has already resolved'
+同一条断言挪到收尾之后 → 0.389s，RC=1
+```
+
+**同一条断言、同一个夹具，差异只可能来自收尾跑没跑。**
+
+### ⛔ 证伪待办 4 的绕法（原文保留在下方 v0.4.17 一节，勿改）
+
+| 绕法宣称 | 实测 |
+|---|---|
+| `--test-timeout=90000` 可兜住 | ⛔ **假**。`--test-timeout=3000` ＋外部 45s ⇒ 仍 RC=124，`duration_ms 44981` |
+| 只有 `e2e.test.mjs` 受影响 | ⛔ **少两个**。`lifecycle.test.mjs`、`command.test.mjs` 各 RC=124 |
+| 「20000 会误伤 `resilience.test.mjs`」 | ✅ **成立，照录不改** |
+
+per-test 超时不触发的原因：**失败的那条测试自己 ~40ms 就完成了**，挂的是**文件级 subtest**。
+
+### 执行点枚举（判据写死，供下一个 agent 复核）
+
+```
+$ grep -ln "ctx.plugin(memoryPlugin" test/*.mjs
+test/command.test.mjs    test/e2e.test.mjs    test/lifecycle.test.mjs
+```
+
+**恰好三个。** 反向验证该判据不是空转（形状像但走不到的，必须实测排除）：
+
+| 文件 | 形状 | 变异读数 | 是否在范围内 |
+|---|---|---|---|
+| `pipeline-e2e.test.mjs` | `new Context()` ＋ `bootLlm()` ＋尾部 shutdown | **0.19s RC=1** | ❌ 不装该插件 |
+| `service.test.mjs` | `StoreRegistry` ＋尾部 cleanup | **0.265s RC=1** | ❌ |
+| `layers.test.mjs` | 166 个释放点（全仓最密） | RC=1 | ❌ |
+
+**「有没有释放资源」是错的判据**（约 500 个释放点，泄漏 fd 与临时目录会让进程变脏，
+但**不阻止退出**）。**「持不持有 `ctx.interval`」才是。**
+
+### 修法：收尾在**获取处**注册，而不是在尾部执行
+
+`t.after(...)` 紧跟资源获取。于是**任何**后续断言抛出都不再能跳过它——
+不是靠下一个编辑者记得把新断言写在收尾之前。
+
+### ⛔ Rule B：**收尾只能「加成网」，不能「搬走」**——盲目机械变换会静默掏空测试
+
+`lifecycle.test.mjs` 三处 mid-test dispose 是**被断言的对象**，不是单纯的资源释放：
+
+| 站点 | 那个 dispose 的角色 |
+|---|---|
+| `:54` | 其后数行断言「贡献消失了」 |
+| `:87` | **测试前提**：第二次 boot 必须发生在第一个 fiber 已消失之后 |
+| `:100` | HMR 重载的前提 |
+
+**实测盲目搬走 `:87` 的 `first.shutdown()`**：
+
+```
+✔ BLIND: dispose closes stores; a fresh boot on the same root re-opens cleanly   pass 1 / fail 0
+>> ORIGINAL premise (first disposed before 2nd boot) holds?: false
+>> BLIND version: first service still published at 2nd boot?: true
+```
+
+**全绿，而测试已不测原来那件事**——`assert.notEqual` 比较两个不同实例，
+**无论第一个 fiber 是否还活着都通过**。故三处 dispose **原位保留**，`t.after` 仅作幂等安全网
+（重复 dispose 幂等不抛，已实测）。**并把前提由「假设」升级为「断言」**：
+现在删掉 `:87` 的 mid-test shutdown 会**报红** `the first fiber is disposed before the second boot / 6 !== null`
+（**同一删除在 HEAD 上是 `pass 4 / fail 0` 静默通过**）。
+
+### 空转探针必须**注册成第二个** `t.after`
+
+`t.after` 是 **FIFO**（先注册先跑，实测 `["A-registered-first","B-registered-second","C-registered-third"]`），
+故第二个回调观察到的是**收尾之后**的状态。**写在测试体里的探针是假探针**——那一刻收尾本来就还没跑。
+**实测：把收尾函数体掏空（保留注册），7 个具名测试全绿**，只有文件级 RC=124 察觉。
+
+探针用**性质断言** `fiber.uid`（live 为 number、dispose 后为 `null`，实测 `6 → null`）。
+⛔ **lead 给的探针配方在 `lifecycle:54` 上本身是假的**，由执行 agent 查出并纠正：
+该测试**自己**在体内 dispose 了插件 fiber，故 `fiber.uid` 在任何收尾前**已是 `null``——恒真。
+改为断言 platform fiber 全部 disposed 后，掏空实验才真正翻转（`4 !== 0`）。
+**代码审查独立复核确认：按原配方写，掏空收尾后 `pass 4 / fail 0 / RC=0` 完全失明。**
+
+### 11/11 执行点全守（QA 的 22 个变异体，每 test × 两处位置）
+
+| 文件 | 用例 | early（紧跟注册后） | late（体末） |
+|---|---|---|---|
+| `e2e` #0–#6 | 7 | 7× RC=1 `pass 6 fail 1 cancelled 0` 0.37–0.43s | 7× 同上 |
+| `command` #0 | 1 | RC=1 `pass 0 fail 1 cancelled 0` 0.16s | RC=1 0.20s |
+| `lifecycle` #1–#3 | 3 | 3× RC=1 `pass 3 fail 1 cancelled 0` | 3× 同上 |
+
+HEAD 形态对照（失败断言插在获取之后、尾部收尾之前）：三文件**全部 RC=124 / 45.0s / `cancelled 1`**。
+**「一条规则 N 个执行点只守一部分」这次没有重演。**
+
+### 送达开发者的读数：before / after
+
+```
+                                   BEFORE (HEAD)              AFTER
+全量 ＋ 一条失败 e2e 断言    3m20s  RC=124  cancelled 1    19.2s  RC=1  cancelled 0
+e2e   单文件变异             45s    RC=124  cancelled 1    0.39s  RC=1  cancelled 0
+command 单文件变异           60s    RC=124  cancelled 1    0.176s RC=1  cancelled 0
+lifecycle 单文件变异         60s    RC=124  cancelled 1    0.213s RC=1  cancelled 0
+--- 必须保持不变 ---
+全量基线                     309/309/0  19.3s              309/309/0  19.3s（测试名逐字符相同）
+```
+
+### ⛔ 三次打回，三次同一形状：**为一个真实存在的断言编造错误理由**
+
+**按本仓惯例：以上各节原判断保留原文，只在此标注证伪。**
+
+| # | 打回方 | 假断言 | 实测证伪 |
+|---|---|---|---|
+| 1 | 代码审查 | 三处注释：`ctx.get('memory')` **会抛** inject error，故「会碰巧杀死变异」 | **不抛**：live 为 `object`、teardown 后 `undefined`。**仓内反证**：同文件 `:121` 长期通过的 `assert.equal(ctx.get('memory'), undefined)` |
+| 2 | QA | 两处注释＋两条断言消息：「泄漏的 platform root 会让定时器活过测试」 | 泄漏**全部** platform fiber（`uids=[1,2,3,4]`）后 **`activeTimeouts=0`，进程 0.109s 退出 RC=0**。定时器**只**归插件 fiber |
+| 3 | 执行 agent 自查 | `lifecycle.test.mjs:29` **HEAD 既有**注释同一条假因果 | 同上。且**它就长在本轮改写的 `boot()` helper 上**，留着会让同一文件自相矛盾 |
+
+**第 1 条的危害不止「写错了」**：它**为一个本来可用的替代探针编造了否决理由**，
+下一个 agent 读到就会避开 `ctx.get('memory')`，而它其实能干净地区分真假拆除。
+**这与本轮选题同型**——本轮修的正是「产品对用户说假话」，而注释是**对下一个 agent 说的话**。
+
+⚠️ **执行 agent 两次拒绝照抄上游给的措辞**，值得记：审查与 lead 都提议写
+「包含持有 30s interval 的**平台** fiber」，实测为假（`platform-only` 拆除后进程照常退出，
+因为 Timer 被一并拆掉）。**用一个未经测量的断言替换另一个假断言，等于没修。**
+
+### 硬约束复验（本轮实测，非引用）
+
+| 约束 | 结果 |
+|---|---|
+| 全量基线 | ✅ 309/309/0，测试名与 HEAD **逐字符相同**（无增删改） |
+| 产品代码未动 | ✅ `git diff --name-only -- packages/memory/src` 为空 |
+| 顺序依赖 | ✅ 三文件**全部 6 种排列**均 `12 pass 12 fail 0` |
+| 资源泄漏未加重 | ✅ temp-dir 每跑 `delta=9`，**HEAD 与修复版完全相同**；fd 跨 11 次 boot/teardown `delta=0` |
+| 空洞化（`let` ＋可选链） | ✅ 5 个「获取永不发生」场景**全部命名报红**，无一静默变绿 |
+| 抛错的 `t.after` 不被吞 | ✅ 实测报 `Error: TEARDOWN BOOM`，RC=1 |
+| 回归判据可机检 | ✅ `grep -L "t\.after" $(grep -ln "ctx.plugin(memoryPlugin" test/*.mjs)` **输出为空** |
+| 假因果残留扫描 | ✅ `grep -rn "platform timer outlives\|no timer outlives\|keeps a timer alive" test/*.mjs` 为空 |
+
+### 🆕 查明 v0.4.17 待办 2「偶发进程级崩溃」的机理（**既有缺陷，本轮不修**）
+
+`package.test.mjs` 跑 `npm pack` ⇒ npm 触发 `prepare: tsc -p tsconfig.json` ⇒
+**就地重写 `lib/**/*.js`**；而 `node --test` **并发**跑的其他文件正从同一个 `lib/` import，
+**读到写了一半的文件**，得到模块级 `SyntaxError`，整文件红。
+
+```
+lead 独立复现：
+  lib/store/group.js mtime BEFORE=1788592373
+  （单独跑 test/package.test.mjs，RC=0）
+  lib/store/group.js mtime AFTER =1788593012   >>> lib/ 被就地重写 <<<
+
+QA 18 次全量：16 次 309/309/0；
+  1 次 295/fail 1  —— resilience: `'./decay.js' does not provide an export named 'runDecayJob'`
+  1 次 300/fail 1  —— service:    `Unexpected end of input`，`lib/store/group.js:78` 截断在半行
+去掉 package.test.mjs 后：8/8 全绿
+```
+
+**这解释了待办 2 记的 253/1，以及 v0.4.7 待办 I 记的 `service.test.mjs` 整文件失败**——
+两者此前都被记为「进程级偶发、无法复现」。**它不是 flake，是竞态，有确定成因。**
+
+### 本轮登记的待办
+
+| # | 事项 | 现状（实测 2026-09-05） | 处置判据 |
+|---|---|---|---|
+| 1 | 🟡 **`prepare: tsc` × `npm pack` × 并发 `node --test` 竞态** | 机理已查明（见上）。18 跑 2 次失败 ≈ **11%**；去掉 `package.test.mjs` 后 8/8 全绿。`git diff HEAD -- test/package.test.mjs packages/memory/package.json` **为空**，纯属既有 | **登记而不修**（超出本轮三文件范围）。**它是「CI 上莫名红一次」的真凶，且 `npm run verify` 同样中招**——任何依赖读数的判断遇到非 309 应先复跑。修法候选：`npm pack --ignore-scripts`／先 `tsc` 到临时目录再打包／给该文件 `--test-concurrency=1`。**须一并作废待办 2 与 v0.4.7 待办 I 的「无法复现」定性** |
+| 2 | 🟢 **`e2e` 探针缺 platform 维度，三文件三种实现** | QA 实测：`e2e` #0 的 `shutdown()` 若**只**拆插件 fiber、泄漏 7 个 platform ⇒ **`pass 7 fail 0` 完全漏过**；`command` #0 有该维度故抓得到。`e2e` #1–#6 无探针，掏空只能靠 hang 发现 | **登记而不修**。风险有限（`existsSync(root)` 抓得到漏 `cleanup` 的情形；#1–#6 掏空均被 RC=124 抓到）。**但这正是本仓签名形状在测试层的新入口**——判据是下次动这些探针时，把它抽成 `helpers.mjs` 里**一个** `assertTornDown(fiber, platform, root)` 三文件共用 |
+| 3 | 🟢 **`makeRepo()` 的外层 `tempRoot()` 从不清理** | `/tmp` 现存 **29.6 万** 个 `strataloom-test-*`（最早 2026-08-23）。每跑 `delta=9`，**HEAD 与修复版相同**，非本轮引入 | **登记而不修**。⚠️ **取数陷阱**：`ls -d /tmp/strataloom-test-*` 因 argv 溢出**静默返回 0**，会误导资源测量；必须用 `ls -U /tmp \| grep -c` |
+
+> **⛔ 作废 v0.4.17 待办 2 与 v0.4.7 待办 I 的「进程级偶发、无法确定性复现」定性**（原文保留）：
+> 二者是**同一个竞态**的两次显形，成因已确定（见上）。**「无法复现」当时是真话，
+> 但它把一个有确定成因的竞态记成了随机噪声**，从而使它在四个版本里无人追查。
+
+---
 > 最后更新：2026-09-05 · **v0.4.17 已发布**：`source()`（即 `memory_recall`
 > 的 `sourceOf` 下钻）对一条**在库、active、且 id 刚由 `recall` 亲手交给用户**的行，
 > 回答**它不存在**——`no memory with id X, or it was forgotten`。
@@ -383,7 +606,7 @@ only-file / only-url : 同样
 | # | 事项 | 现状（实测 2026-09-05） | 处置判据 |
 |---|---|---|---|
 | 1 | 🟢 **`isError: true` 与「这是一个正常结局」语义不符** | 三种结局里有两种成功（返回 hits），第三种**戴错误标记**送达模型，实测 `Error: ` 前缀 ＋ `isError: true` | **登记而不修**，判据已写进 `service.ts` 注释：`source()` 全部「答不了」的出口都是 throw，**为一种情形新增第二种出口形态**就是第二套机器。要改须**整体**把该方法改成结果型返回，属独立选题 |
-| 2 | 🟢 **`npm test` 偶发进程级崩溃（`store.test.mjs`）** | 本轮**第一次**全量跑出现 253/1（`store.test.mjs` 进程崩溃退出），随后**连续 4 次**均 280/0；单独跑该文件 28/28 稳定通过 | **登记**。与本轮改动无关（发生在改动前的基线确认阶段，且改动后 10+ 次全量跑未复现），但它是**能把读数从 280 变成 253 的东西**，任何依赖读数的判断都应先复跑确认 |
+| 2 | ~~🟢 **`npm test` 偶发进程级崩溃（`store.test.mjs`）**~~ **⛔ 机理已查明（2026-09-05）：不是 flake，是竞态，见本页顶部与本轮待办 1** | 本轮**第一次**全量跑出现 253/1（`store.test.mjs` 进程崩溃退出），随后**连续 4 次**均 280/0；单独跑该文件 28/28 稳定通过<br>**⛔ 成因**：`package.test.mjs` 跑 `npm pack` ⇒ 触发 `prepare: tsc` ⇒ **就地重写 `lib/**/*.js`**，而并发跑的其他测试文件正从同一个 `lib/` import，**读到写了一半的文件**。实测 mtime 前后改变；18 次全量 2 次失败，**去掉该文件后 8/8 全绿**。**「无法确定性复现」当时是真话，但它把一个有确定成因的竞态记成了随机噪声，使它悬置了四个版本** | **登记**。与本轮改动无关（发生在改动前的基线确认阶段，且改动后 10+ 次全量跑未复现），但它是**能把读数从 280 变成 253 的东西**，任何依赖读数的判断都应先复跑确认 |
 | 3 | 🟢 **非 session 证据的行拿不到它的 excerpt**（返工登记） | F3 收窄了**文案**使其不再说假话，但**行为未变**：唯一证据是 `commit`/`file`/`url` 的行，其 `evidence.excerpt` 里的原文**仍然取不回来**——`sourceOf` 只从 `session` 行作答 | **登记而不修，且这是刻意的**。要取回它须解决两个真问题：①`ref` 不是 session id，回退窗口无从谈起；②渲染标注要么复用 `QUOTE_LABEL`（等于谎称「引自会话」，违反 ADR 0012 §2.2），要么**新增一种标注**——那是渲染契约变更，属独立选题。今天**零真实数据**（唯一证据为非 session 的活行 0 条，直方图 `{session: 540}`），故**先让文案为真**是本轮的正确止损点。**一旦有写者开始产生非 session kind，这条立即升级** |
 
 ### ⛔ 第二次返工（步骤 3c）：**代码复评审与 QA 并行，双双 FAIL，且收敛到同一形状**
@@ -581,7 +804,7 @@ raw(repo) + derived(global)  => "…is a generated summary, not a stored memory�
 
 | # | 事项 | 现状（实测） | 处置判据 |
 |---|---|---|---|
-| 4 | 🟢 **`e2e.test.mjs` 里任一断言失败会让 `node --test` 挂死，而不是失败** | **既有缺陷，非本轮引入**：`boot()` 型测试在断言抛出后**跳过 `await shutdown()`**，fiber 存活，进程不退出。在**未变异的产品代码**上复现为 **RC=137 / 240s**。`e2e.test.mjs` **不在本轮 7 个改动文件之列** | **登记而不修**。它把「测试失败」变成「测试挂死」，会让任何**红着跑全量**的人误判。**施工绕法已验证**：跑全量时加 `--test-timeout=90000`（本轮全部矩阵读数均如此取得；20000 会误伤 `resilience.test.mjs`，它单文件就要 18.8s）。要真修须给 `boot()` 型测试加 `t.after(shutdown)` 之类的**无条件收尾**，属独立选题 |
+| 4 | ~~🟢 **`e2e.test.mjs` 里任一断言失败会让 `node --test` 挂死，而不是失败**~~ **⛔ 已结项（2026-09-05），且本条的范围与绕法双双被证伪：见本页顶部** | **既有缺陷，非本轮引入**：`boot()` 型测试在断言抛出后**跳过 `await shutdown()`**，fiber 存活，进程不退出。在**未变异的产品代码**上复现为 **RC=137 / 240s**。`e2e.test.mjs` **不在本轮 7 个改动文件之列**<br>**⛔ 证伪 1（范围）**：不止 `e2e.test.mjs`，`lifecycle.test.mjs` 与 `command.test.mjs` **同型失效**（各实测 RC=124）。完备判据是 `grep -ln "ctx.plugin(memoryPlugin" test/*.mjs`，**恰好三个**。<br>**⛔ 证伪 2（绕法）**：「加 `--test-timeout=90000` 可兜住」**是假的**——实测 `--test-timeout=3000` ＋外部 45s **仍挂满 45s**，因为失败的测试自己 ~40ms 就判负，**挂的是文件级 subtest**。**本页此前全部全量矩阵读数都取自这个假绕法。**「20000 会误伤 `resilience.test.mjs`」那半句**成立，照录不改** | **登记而不修**。它把「测试失败」变成「测试挂死」，会让任何**红着跑全量**的人误判。**施工绕法已验证**：跑全量时加 `--test-timeout=90000`（本轮全部矩阵读数均如此取得；20000 会误伤 `resilience.test.mjs`，它单文件就要 18.8s）。要真修须给 `boot()` 型测试加 `t.after(shutdown)` 之类的**无条件收尾**，属独立选题 |
 
 ## 🆕 v0.4.16：一句话在两个输入域真值不同，却被共用（**假建议，非数据事故**）
 

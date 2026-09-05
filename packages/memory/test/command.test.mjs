@@ -26,7 +26,7 @@ import * as memoryPlugin from '../lib/index.js'
 import { clearRepoIdentityMemo } from '../lib/store/repo-key.js'
 import { tempRoot } from './helpers.mjs'
 
-test('/memory lists what was learned, forgets by id, and keeps the D1 boundary', async () => {
+test('/memory lists what was learned, forgets by id, and keeps the D1 boundary', async (t) => {
   clearRepoIdentityMemo()
   const repo = join(tempRoot(),'r'); mkdirSync(repo,{recursive:true})
   execFileSync('git',['init','-q'],{cwd:repo})
@@ -39,6 +39,51 @@ test('/memory lists what was learned, forgets by id, and keeps the D1 boundary',
   await Promise.all(platform)
   const fiber = ctx.plugin(memoryPlugin, { rootDir: tempRoot() })
   await fiber
+  let child
+
+  // Tear the root down. The plugin owns a 30s interval, so a test that leaks
+  // its fiber keeps the whole run alive — invisible under
+  // `--test-force-exit`, and a hang under plain `npm run verify`.
+  //
+  // ⛔ REGISTERED HERE RATHER THAN RUN AT THE TAIL, and the placement is the
+  // point: at the tail, any failing assertion below skips it, the fiber
+  // survives, and the failure becomes a HANG instead of a report. Measured on
+  // this exact file: a never-matching assertion left `cancelled 1` and RC=124
+  // under an external 40s timeout. `--test-timeout` does not bound it, because
+  // the test itself finished in ~44ms — what hangs is the FILE.
+  t.after(async () => {
+    await child?.dispose?.()
+    await fiber.dispose()
+    for (const entry of [...platform].reverse()) await entry.dispose()
+  })
+
+  // ⛔ REGISTERED SECOND ON PURPOSE — DO NOT FOLD THIS INTO THE TEST BODY.
+  // `t.after` callbacks run FIFO, so this one observes the state the teardown
+  // above left behind; asserting the same thing in the body would be vacuous,
+  // since at that moment teardown legitimately has not run yet. This is what
+  // separates a real teardown from an emptied one: gutting the callback above
+  // leaves the named test green, and only the file-level RC=124 notices.
+  // `fiber.uid` is the discriminator — a number while live, `null` once
+  // disposed. `ctx.get('memory')` would also flip (measured: an object while
+  // live, `undefined` after teardown; it does NOT throw), but it reports only
+  // that the memory service was unpublished and says nothing about the
+  // PLATFORM fibers, which this test also asserts on: a live platform fiber is
+  // direct evidence that the teardown above did not run to completion.
+  //
+  // That second assertion is NOT about timers. Measured: the 30s interval is
+  // held by the PLUGIN fiber alone — disposing it drops the process to zero
+  // active Timeouts even with all 8 platform fibers deliberately leaked, and
+  // the run still exits in ~0.12s. The platform check earns its place as a
+  // completeness check on the teardown, nothing more.
+  t.after(() => {
+    assert.equal(fiber.uid, null, 'teardown really disposed the plugin fiber')
+    assert.equal(
+      platform.filter((entry) => entry.uid !== null).length,
+      0,
+      'teardown really disposed every platform fiber',
+    )
+  })
+
   const { agent } = await ctx.agents.create({ sessionId: randomUUID(), meta: { cwd: repo } })
 
   const run = (input) => ctx.commands.execute(agent, `/memory${input ? ' ' + input : ''}`, [], new AbortController().signal)
@@ -70,7 +115,7 @@ test('/memory lists what was learned, forgets by id, and keeps the D1 boundary',
 
   // D1: the command runs in an agent context, so a subagent is refused the
   // write exactly as it is through the tool — no second permission path.
-  const child = await ctx.agents.create({
+  child = await ctx.agents.create({
     sessionId: randomUUID(),
     meta: { cwd: repo, parentSession: agent.id, origin: 'subagent', delegationDepth: 1 },
   })
@@ -84,11 +129,4 @@ test('/memory lists what was learned, forgets by id, and keeps the D1 boundary',
   const listed = await ctx.commands.execute(child.agent, '/memory', [], new AbortController().signal)
   assert.equal(listed.result.kind, 'success')
   assert.match(listed.result.text, /survivor/, 'reads stay open to any live agent')
-
-  // Tear the root down. The plugin owns a 30s interval, so a test that leaks
-  // its fiber keeps the whole run alive — invisible under
-  // `--test-force-exit`, and a hang under plain `npm run verify`.
-  await child.dispose?.()
-  await fiber.dispose()
-  for (const entry of [...platform].reverse()) await entry.dispose()
 })
