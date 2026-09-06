@@ -166,7 +166,7 @@
       "type": "messagebus",
       "label": "补入队 decay",
       "sublabel": "按日期幂等",
-      "tag": "溢出才 rebuild",
+      "tag": "repo 溢出 / global 有行",
       "width": 120
     },
     {

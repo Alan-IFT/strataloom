@@ -5401,7 +5401,7 @@
         <ul>
           <li>&bull; MAX_CLAIMS = 5：认领上限，超出即判定为毒 job</li>
           <li>&bull; LEASE_DURATION_MS = 5 分钟：单次认领的租约时长</li>
-          <li>&bull; JOB_TIMEOUT_MS = 4 分钟：小于租约，所以 worker 先被 abort</li>
+          <li>&bull; JOB_TIMEOUT_MS = 4 分钟：小于租约，故 worker 先被 abort——但正确性由提交前 CAS 保证，超时只减少重复劳动</li>
           <li>&bull; RETRY_BACKOFF_MS = 60s × attempts：线性退避</li>
           <li>&bull; TICK_INTERVAL_MS = 30s；CLEANUP_INTERVAL_MS = 6 小时</li>
         </ul>
@@ -5416,6 +5416,7 @@
           <li>&bull; attempts 在认领时自增而非完成时：崩溃的 worker 也消耗预算，这是毒 job 防线</li>
           <li>&bull; commitClaimedJob 是唯一成功出口；failClaimedJob 是唯一失败出口，也是 last_error 的唯一写点</li>
           <li>&bull; 所有出口 CAS 都带 state=&#39;running&#39; AND lease_token=?；租约丢失则出口变 no-op</li>
+          <li>&bull; 判毒路径不跑 handler，故不覆盖 last_error——保留上次真实失败的诊断</li>
         </ul>
       </div>
 

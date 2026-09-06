@@ -5161,13 +5161,13 @@
         </g>
         </g>
 
-        <g data-edge-from="memsvc" data-edge-to="renderer" data-edge-label="home 预算 500 tok；每个 group 成员另计 220 tok" data-edge-key="11" data-edge-id="b4">
+        <g data-edge-from="memsvc" data-edge-to="renderer" data-edge-label="渲染按 1820 tok 出包" data-edge-key="11" data-edge-id="b4">
           <path data-composition-edge-from="memsvc" data-composition-edge-to="renderer" data-composition-edge-id="b4" data-composition-points="558,660;688.1666666666666,660" d="M 558 660 L 688.1666666666666 660" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
         <g data-detail="context">
-          <rect x="497.48333333333323" y="640" width="251.20000000000002" height="16" rx="3" class="c-mask"/>
-          <text x="623.0833333333333" y="650" class="t-backend" font-size="9" text-anchor="middle">home 预算 500 tok；每个 group 成员另计 220 tok</text>
+          <rect x="565.0833333333333" y="640" width="116" height="16" rx="3" class="c-mask"/>
+          <text x="623.0833333333333" y="650" class="t-backend" font-size="9" text-anchor="middle">渲染按 1820 tok 出包</text>
         </g>
-        <text data-detail="fine" x="570" y="678" class="t-dim" font-size="7">先贴 source 标签再计价</text>
+        <text data-detail="fine" x="570" y="678" class="t-dim" font-size="7">service 侧 home 500 + 每成员 220；先贴 source 标签再计价</text>
         </g>
 
         <g data-edge-from="memsvc" data-edge-to="agent" data-edge-label="返回结果；无命中返回固定文案 RECALL_NO_MATCH（该字节是指标契约）" data-edge-key="12" data-edge-id="b5">
@@ -5552,8 +5552,8 @@
           <h3>一个渲染器，三份预算</h3>
         </div>
         <ul>
-          <li>&bull; 注入、recall、跨仓成员三条读出口共用同一个渲染器（D8）</li>
-          <li>&bull; 预算各自独立：注入 1300 tok / recall 500 tok / 跨仓成员 220 tok</li>
+          <li>&bull; 注入、recall、跨仓成员三条读出口（注入 / recall / propose 近重复列表）共用同一个渲染器（D8）</li>
+          <li>&bull; 预算各自独立：注入正文 1300 tok / recall home 500 tok / 每个跨仓成员 220 tok</li>
           <li>&bull; personal 侧另有 171 tok 帽子，容器上限 1400 tok</li>
         </ul>
       </div>

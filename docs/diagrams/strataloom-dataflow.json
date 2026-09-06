@@ -153,7 +153,7 @@
       "sublabel": "FTS5 · 全 provenance",
       "stage": 4,
       "row": 2,
-      "tag": "≤500 tok"
+      "tag": "home ≤500 tok"
     },
     {
       "id": "project",
@@ -213,15 +213,23 @@
       "from": "raw",
       "to": "persona",
       "label": "persona 作业",
-      "classification": "模型可裁决 keep"
+      "classification": "模型可裁决 keep",
+      "labelAt": [
+        590,
+        392
+      ]
     },
     {
       "id": "raw-write",
-      "from": "dormant",
+      "from": "raw",
       "to": "trig",
       "label": "任一 RAW 行写入",
       "classification": "store_revision 自增",
-      "variant": "security"
+      "variant": "security",
+      "labelAt": [
+        637,
+        560
+      ]
     },
     {
       "id": "kill-derived",
@@ -273,7 +281,7 @@
       "dot": "rose",
       "title": "失效由数据承担（D9）",
       "items": [
-        "三个触发器挂在 memories 上，条件是 derived != 0——整层一起退休",
+        "触发条件是 RAW 行写入（derived = 0），体内 DELETE ... WHERE derived != 0——整层一起退休",
         "只删不入队：raw 集不再溢出时，L2 就再也不会回来",
         "store_revision 自增，rebuild 在认领与提交两处各围栏一次"
       ]

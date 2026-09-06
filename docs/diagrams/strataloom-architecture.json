@@ -39,7 +39,7 @@
           "derived",
           "agent"
         ],
-        "note": "注入、recall、sourceOf 共用唯一渲染器 renderEntry（D8），预算各自独立。"
+        "note": "注入、recall、propose 近重复列表共用渲染器 renderEntry（D8），预算各自独立。"
       },
       {
         "id": "derived-layers",
@@ -177,7 +177,7 @@
       "id": "service",
       "type": "backend",
       "label": "MemoryService",
-      "sublabel": "provenance 闸门 · 唯一写入口",
+      "sublabel": "provenance 闸门 · 工具写入口",
       "pos": [
         392,
         230
@@ -266,7 +266,7 @@
       "id": "derived",
       "type": "database",
       "label": "派生层 L2",
-      "sublabel": "derived=1 rollup · =2 场景块",
+      "sublabel": "derived=2 场景块 · ≤6 块",
       "pos": [
         590,
         700
@@ -397,7 +397,7 @@
       "id": "decay",
       "type": "backend",
       "label": "decay",
-      "sublabel": "休眠 · 归档 · 无 LLM",
+      "sublabel": "休眠 · 复活 · 无 LLM",
       "pos": [
         800,
         560
@@ -589,7 +589,7 @@
       "id": "service-l1",
       "from": "service",
       "to": "l1",
-      "label": "唯一写入口",
+      "label": "工具唯一写入口",
       "labelAt": [
         566,
         410

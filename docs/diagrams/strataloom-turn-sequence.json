@@ -168,9 +168,9 @@
       "from": "memsvc",
       "to": "renderer",
       "y": 660,
-      "label": "home 预算 500 tok；每个 group 成员另计 220 tok",
+      "label": "渲染按 1820 tok 出包",
       "variant": "default",
-      "note": "先贴 source 标签再计价"
+      "note": "service 侧 home 500 + 每成员 220；先贴 source 标签再计价"
     },
     {
       "id": "b5",
@@ -317,8 +317,8 @@
       "dot": "cyan",
       "title": "一个渲染器，三份预算",
       "items": [
-        "注入、recall、跨仓成员三条读出口共用同一个渲染器（D8）",
-        "预算各自独立：注入 1300 tok / recall 500 tok / 跨仓成员 220 tok",
+        "注入、recall、跨仓成员三条读出口（注入 / recall / propose 近重复列表）共用同一个渲染器（D8）",
+        "预算各自独立：注入正文 1300 tok / recall home 500 tok / 每个跨仓成员 220 tok",
         "personal 侧另有 171 tok 帽子，容器上限 1400 tok"
       ]
     },

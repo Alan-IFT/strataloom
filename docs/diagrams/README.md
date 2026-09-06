@@ -46,8 +46,13 @@ scripts/diagram.sh --watch   # 编辑时自动重建（约 1 秒内响应）
 ## 引用核验（只有架构图有）
 
 架构图声明了 `meta.repository` 与逐节点的 `sources`（21 处 `文件:行号` 引用），
-因此它是用 `--repo-root` 渲染的：archify 会**拿每一条引用去比对本 checkout**，
-引用失效就拒绝交付。
+因此它是用 `--repo-root` 渲染的：archify 会拿每一条引用去比对 `meta.repository.revision`
+钉住的那个 git 对象——**路径在该 revision 上不存在、或行号越界，就拒绝交付**。
+
+要说清它的强度边界：它校验的是「路径存在 + 行号不越界」，**不校验行号指向什么**。
+所以它能挡住「模块被删/改名」，挡不住「行号漂移到了同一文件的别处」——后者仍要靠
+人审。本轮就实测到一例：`runPersonaJob` 曾被标成 529 行（文件共 609 行，故校验通过），
+而真正的定义在 482 行，529 是它函数体内的一条 SELECT。已修正。
 
 这一条正好补上了「手写规约」的那个缺口：**图上的框可以手写，但它声称的代码位置
 不能是想象的**。模块被重命名或删除时，在这里就会红，而不是留给某个信任了一个
@@ -64,11 +69,11 @@ scripts/diagram.sh --watch   # 编辑时自动重建（约 1 秒内响应）
 |---|---|
 | 采集由 turn 结束触发 | `auto-extract.ts` 的 `agent/turn-stopping` 钩子 |
 | L0 无条件写入、且不建 FTS | `conversations.ts` 的 `captureTurn`；全库只有 `memories_fts` 一张虚表 |
-| 三条读出口共用渲染器 | `render.ts` 的 `renderEntry`（D8），`inject.ts` 再导出 |
-| 注入 ≤1400 tok / recall ≤500 tok / 跨仓成员 ≤220 tok | `constants.ts` 的三个预算常量 |
+| 三条读出口共用渲染器 | `render.ts` 的 `renderEntry`（D8），`inject.ts` 再导出。三条＝注入、recall（含 sourceOf 与跨仓成员）、propose 的近重复列表——口径见 `inject.ts` 的模块注释 |
+| 注入正文 1300 / packet 1400 · recall home 500 · 每个跨仓成员 220 tok | `constants.ts` 的四个预算常量；recall 的**渲染**预算是 `RECALL_PACKET_BUDGET_TOKENS = 500 + 6×220 = 1820`，与 service 侧两个容器之和相等，故渲染不会裁掉 service 已放行的行 |
 | 注入是工作集 top-N、不逐轮检索 | `fts.ts` 的 `queryInjectableSet`：只有 `ORDER BY 优先级, updated_at`，不接受查询串 |
 | 注入优先派生层 | `fts.ts` 的 `queryInjectionRows`：`derived DESC`，为空才回落 raw |
-| D9 触发器：raw 写入即删**整个**派生层 | `schema.ts` 的 `invalidate_derived_*` 三个触发器（`derived != 0`） |
+| D9 触发器：raw 写入即删**整个**派生层 | `schema.ts` 的三个 `invalidate_derived_*`：条件 `NEW/OLD.derived = 0`（被写的是 RAW），体内 `DELETE … WHERE derived != 0` |
 | revision 围栏 | `rebuild.ts` 的 `readRevision`，认领后与提交内各查一次 |
 | 派生层由 Packet 溢出触发 | `rebuild.ts` 的 `if (!packetOverflows(store)) return false` |
 | L2 最多 6 块 / L3 恰好 1 条 | `ROLLUP_MAX_SCENARIOS` / `runPersonaJob` 的 delete-then-insert |
@@ -81,8 +86,11 @@ scripts/diagram.sh --watch   # 编辑时自动重建（约 1 秒内响应）
 
 ## 与初始规范的偏差（只有一处，且是显式推翻）
 
-初始 `plugin-architecture.md` **三处否决**过 L2/L3 双派生粒度（§2.2、§12、
-§13），理由不是「没必要」，而是**两个粒度的语义差异从未被定义**。
+初始 `plugin-architecture.md` **三处否决**过 L2/L3 双派生粒度
+（`plugin-architecture.md:374`「`level` 同理收缩为 `derived` 标志」、
+`:854`「先**一个** derived 层——两个粒度是未验证假设」、
+`:1092`「level 预设两个派生粒度」），理由不是「没必要」，而是
+**两个粒度的语义差异从未被定义**。
 
 而今天的实现是两层。这不是漂移：
 [ADR 0002](../decisions/0002-l2-l3-need-defined-boundaries.md) 先用
