@@ -1,0 +1,757 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Strataloom 异步记忆管线全景",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "docs/diagrams/strataloom-pipeline-workflow.html"
+  },
+  "lanes": [
+    {
+      "id": "turn",
+      "label": "入口 A · turn 边界（同步）"
+    },
+    {
+      "id": "tick",
+      "label": "入口 B · 定时 tick（每 30 秒）"
+    },
+    {
+      "id": "maint",
+      "label": "维护分支（每 6 小时）"
+    },
+    {
+      "id": "claim",
+      "label": "认领分支（每 store 每 tick 至多 1 个）"
+    },
+    {
+      "id": "term",
+      "label": "分派与提前退出"
+    },
+    {
+      "id": "hd",
+      "label": "handler · decay（纯 SQL）"
+    },
+    {
+      "id": "hx",
+      "label": "handler · extract（抽取候选）"
+    },
+    {
+      "id": "hr",
+      "label": "handler · reconcile（裁决入库）"
+    },
+    {
+      "id": "hb",
+      "label": "handler · rebuild（重建派生层）"
+    },
+    {
+      "id": "exit",
+      "label": "出口三态（runner 收尾）"
+    }
+  ],
+  "mainPath": [
+    "run_handler",
+    "ex_read",
+    "ex_llm",
+    "ex_commit",
+    "commit"
+  ],
+  "nodes": [
+    {
+      "id": "turn_stop",
+      "lane": "turn",
+      "col": 0,
+      "type": "external",
+      "label": "turn-stopping",
+      "sublabel": "同步收尾",
+      "width": 120
+    },
+    {
+      "id": "capture_l0",
+      "lane": "turn",
+      "col": 1,
+      "type": "database",
+      "label": "captureTurn 写 L0",
+      "sublabel": "原始 turn 落库",
+      "tag": "无条件",
+      "width": 120
+    },
+    {
+      "id": "gate_chain",
+      "lane": "turn",
+      "col": 2,
+      "type": "security",
+      "label": "闸门链（全部 AND）",
+      "sublabel": "principal · repo · llm",
+      "tag": "turnTokens ≥ 200",
+      "width": 120
+    },
+    {
+      "id": "enq_extract",
+      "lane": "turn",
+      "col": 3,
+      "type": "messagebus",
+      "label": "enqueueJob",
+      "sublabel": "kind=extract",
+      "tag": "与 L0 同一事务",
+      "width": 120
+    },
+    {
+      "id": "tick_timer",
+      "lane": "tick",
+      "col": 0,
+      "type": "external",
+      "label": "定时 tick",
+      "sublabel": "每 30 秒一轮",
+      "width": 120
+    },
+    {
+      "id": "singleflight",
+      "lane": "tick",
+      "col": 1,
+      "type": "security",
+      "label": "单飞判定",
+      "sublabel": "running/stopped 闩锁",
+      "width": 120
+    },
+    {
+      "id": "iterate",
+      "lane": "tick",
+      "col": 2,
+      "type": "backend",
+      "label": "遍历所有 store",
+      "sublabel": "逐库依次处理",
+      "width": 120
+    },
+    {
+      "id": "maint_gate",
+      "lane": "maint",
+      "col": 0,
+      "type": "security",
+      "label": "距上次清理 > 6h？",
+      "width": 120
+    },
+    {
+      "id": "collect_metrics",
+      "lane": "maint",
+      "col": 1,
+      "type": "cloud",
+      "label": "collectMetrics",
+      "sublabel": "独立 try/catch",
+      "tag": "观测旁路",
+      "width": 120
+    },
+    {
+      "id": "cleanup_jobs",
+      "lane": "maint",
+      "col": 2,
+      "type": "database",
+      "label": "cleanupJobs",
+      "sublabel": "3 条 DELETE",
+      "width": 120
+    },
+    {
+      "id": "prune_conv",
+      "lane": "maint",
+      "col": 3,
+      "type": "database",
+      "label": "pruneConversations",
+      "sublabel": "剪枝历史会话",
+      "width": 120
+    },
+    {
+      "id": "enq_maint",
+      "lane": "maint",
+      "col": 4,
+      "type": "messagebus",
+      "label": "补入队 decay",
+      "sublabel": "按日期幂等",
+      "tag": "溢出才 rebuild",
+      "width": 120
+    },
+    {
+      "id": "busy_err",
+      "lane": "maint",
+      "col": 5,
+      "type": "security",
+      "label": "是 busy 错误？",
+      "width": 120,
+      "sublabel": "维护抛错时"
+    },
+    {
+      "id": "peek",
+      "lane": "claim",
+      "col": 0,
+      "type": "backend",
+      "label": "peekClaimable 空？",
+      "sublabel": "先探队列",
+      "tag": "跳过不抬 attempts",
+      "width": 120
+    },
+    {
+      "id": "busy_agent",
+      "lane": "claim",
+      "col": 1,
+      "type": "security",
+      "label": "principal 在跑？",
+      "width": 120,
+      "sublabel": "agent busy"
+    },
+    {
+      "id": "claim_job",
+      "lane": "claim",
+      "col": 2,
+      "type": "backend",
+      "label": "claimNextJob",
+      "sublabel": "attempts+1 · 租约 5min",
+      "tag": "CAS 认领",
+      "width": 120
+    },
+    {
+      "id": "poison",
+      "lane": "claim",
+      "col": 3,
+      "type": "security",
+      "label": "isPoisoned？",
+      "width": 120,
+      "sublabel": "attempts > 5",
+      "tag": "判毒即拦截"
+    },
+    {
+      "id": "skip_busy",
+      "lane": "claim",
+      "col": 5,
+      "type": "external",
+      "label": "跳过本 store 认领",
+      "sublabel": "维护 busy 错误",
+      "width": 120
+    },
+    {
+      "id": "skip_idle",
+      "lane": "term",
+      "col": 0,
+      "type": "external",
+      "label": "跳过本 store",
+      "sublabel": "无可认领 / agent 忙",
+      "width": 120
+    },
+    {
+      "id": "run_handler",
+      "lane": "term",
+      "col": 1,
+      "type": "backend",
+      "label": "执行 handler",
+      "sublabel": "按 job.kind 分派",
+      "tag": "持 5 分钟租约",
+      "width": 120
+    },
+    {
+      "id": "dead_letter",
+      "lane": "term",
+      "col": 3,
+      "type": "security",
+      "label": "dead-letter",
+      "sublabel": "不跑 handler",
+      "tag": "不覆盖 last_error",
+      "width": 120
+    },
+    {
+      "id": "ex_read",
+      "lane": "hx",
+      "col": 2,
+      "type": "database",
+      "label": "readTurn 读 L0",
+      "sublabel": "预算裁剪",
+      "tag": "空则空提交·不调 LLM",
+      "width": 120
+    },
+    {
+      "id": "ex_llm",
+      "lane": "hx",
+      "col": 3,
+      "type": "cloud",
+      "label": "LLM 抽取 → 解析",
+      "sublabel": "不含 { 即没什么可记",
+      "width": 120
+    },
+    {
+      "id": "ex_commit",
+      "lane": "hx",
+      "col": 4,
+      "type": "database",
+      "label": "提交并入队",
+      "sublabel": "来源抑制检查",
+      "width": 120,
+      "tag": "写 candidate + evidence"
+    },
+    {
+      "id": "rc_take",
+      "lane": "hr",
+      "col": 2,
+      "type": "database",
+      "label": "取候选",
+      "sublabel": "+ 既有 30 条",
+      "width": 120,
+      "tag": "候选空则空提交"
+    },
+    {
+      "id": "rc_llm",
+      "lane": "hr",
+      "col": 3,
+      "type": "cloud",
+      "label": "LLM 裁决",
+      "sublabel": "恰好覆盖每个候选一次",
+      "width": 120
+    },
+    {
+      "id": "rc_apply",
+      "lane": "hr",
+      "col": 4,
+      "type": "database",
+      "label": "逐条落库",
+      "sublabel": "activate/drop/supersede",
+      "tag": "preference 永不被 supersede",
+      "width": 120
+    },
+    {
+      "id": "rb_fence",
+      "lane": "hb",
+      "col": 2,
+      "type": "security",
+      "label": "revision 围栏",
+      "sublabel": "precheck 不等即空提交",
+      "tag": "不烧 LLM",
+      "width": 120
+    },
+    {
+      "id": "rb_scope",
+      "lane": "hb",
+      "col": 3,
+      "type": "security",
+      "label": "global 库？",
+      "width": 120
+    },
+    {
+      "id": "rb_l3",
+      "lane": "hb",
+      "col": 4,
+      "type": "cloud",
+      "label": "L3 画像",
+      "sublabel": "模型裁决 keep 则不写",
+      "width": 120,
+      "yOffset": -42
+    },
+    {
+      "id": "rb_l2",
+      "lane": "hb",
+      "col": 4,
+      "type": "database",
+      "label": "L2 复算溢出 → 重写",
+      "sublabel": "不溢出则空提交",
+      "tag": "提交内再查 revision",
+      "width": 120,
+      "yOffset": 42
+    },
+    {
+      "id": "dc_sql",
+      "lane": "hd",
+      "col": 2,
+      "type": "database",
+      "label": "纯 SQL 维护",
+      "sublabel": "全程不调 LLM",
+      "width": 120
+    },
+    {
+      "id": "dc_gate",
+      "lane": "hd",
+      "col": 3,
+      "type": "security",
+      "label": "active 数 > 50？",
+      "width": 120
+    },
+    {
+      "id": "dc_sleep",
+      "lane": "hd",
+      "col": 4,
+      "type": "database",
+      "label": "60 天休眠 UPDATE",
+      "sublabel": "超额才休眠",
+      "width": 120,
+      "yOffset": -58
+    },
+    {
+      "id": "dc_revive",
+      "lane": "hd",
+      "col": 4,
+      "type": "database",
+      "label": "复活 UPDATE",
+      "sublabel": "14 天内被命中",
+      "tag": "无地板闸门",
+      "width": 120,
+      "yOffset": 58
+    },
+    {
+      "id": "fencing",
+      "lane": "exit",
+      "col": 0,
+      "type": "security",
+      "label": "FencingError",
+      "sublabel": "租约丢失 · 仅记 info",
+      "tag": "不改 job 行 · 不耗预算",
+      "width": 120
+    },
+    {
+      "id": "fail_job",
+      "lane": "exit",
+      "col": 1,
+      "type": "backend",
+      "label": "failClaimedJob",
+      "sublabel": "dead=false · 回 pending",
+      "tag": "退避 60s×attempts",
+      "width": 120
+    },
+    {
+      "id": "commit",
+      "lane": "exit",
+      "col": 5,
+      "type": "database",
+      "label": "commitClaimedJob",
+      "sublabel": "CAS 先行 → done",
+      "tag": "业务写在 CAS 后同事务",
+      "width": 120
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-l0",
+      "from": "turn_stop",
+      "to": "capture_l0",
+      "label": "无条件写 L0",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-gate",
+      "from": "capture_l0",
+      "to": "gate_chain",
+      "label": "闸门链判定"
+    },
+    {
+      "id": "e-enq",
+      "from": "gate_chain",
+      "to": "enq_extract",
+      "label": "四项全通过",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-tick",
+      "from": "tick_timer",
+      "to": "singleflight",
+      "label": "30 秒到期"
+    },
+    {
+      "id": "e-sf",
+      "from": "singleflight",
+      "to": "iterate",
+      "label": "未运行则放行"
+    },
+    {
+      "id": "e-maint",
+      "from": "iterate",
+      "to": "maint_gate",
+      "label": "先做维护"
+    },
+    {
+      "id": "e-metrics",
+      "from": "maint_gate",
+      "to": "collect_metrics",
+      "label": "是 · 先采指标",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e-metrics-on",
+      "from": "collect_metrics",
+      "to": "cleanup_jobs",
+      "label": "异常自吞不阻断",
+      "variant": "dashed"
+    },
+    {
+      "id": "e-prune",
+      "from": "cleanup_jobs",
+      "to": "prune_conv"
+    },
+    {
+      "id": "e-enqm",
+      "from": "prune_conv",
+      "to": "enq_maint"
+    },
+    {
+      "id": "e-mend",
+      "from": "enq_maint",
+      "to": "busy_err",
+      "label": "维护结束/抛错"
+    },
+    {
+      "id": "e-nowin",
+      "from": "maint_gate",
+      "to": "peek",
+      "label": "否 · 未到窗口",
+      "role": "branch"
+    },
+    {
+      "id": "e-goclaim",
+      "from": "busy_err",
+      "to": "peek",
+      "label": "否 · 继续认领"
+    },
+    {
+      "id": "e-skipbusy",
+      "from": "busy_err",
+      "to": "skip_busy",
+      "label": "是 · busy",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "e-peek",
+      "from": "peek",
+      "to": "busy_agent",
+      "label": "非空"
+    },
+    {
+      "id": "e-claim",
+      "from": "busy_agent",
+      "to": "claim_job",
+      "label": "否 · 不忙"
+    },
+    {
+      "id": "e-pre",
+      "from": "claim_job",
+      "to": "poison",
+      "label": "执行前判定"
+    },
+    {
+      "id": "e-skip-empty",
+      "from": "peek",
+      "to": "skip_idle",
+      "label": "为空 · 跳过",
+      "role": "branch"
+    },
+    {
+      "id": "e-skip-busy2",
+      "from": "busy_agent",
+      "to": "skip_idle",
+      "label": "是 · 跳过",
+      "role": "branch"
+    },
+    {
+      "id": "e-dead",
+      "from": "poison",
+      "to": "dead_letter",
+      "label": "是 · 判毒",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "e-dispatch",
+      "from": "poison",
+      "to": "run_handler",
+      "label": "否 · 按 kind 分派",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-k-extract",
+      "from": "run_handler",
+      "to": "ex_read",
+      "label": "extract",
+      "role": "branch"
+    },
+    {
+      "id": "e-k-reconcile",
+      "from": "run_handler",
+      "to": "rc_take",
+      "label": "reconcile",
+      "role": "branch"
+    },
+    {
+      "id": "e-k-rebuild",
+      "from": "run_handler",
+      "to": "rb_fence",
+      "label": "rebuild",
+      "role": "branch"
+    },
+    {
+      "id": "e-k-decay",
+      "from": "run_handler",
+      "to": "dc_sql",
+      "label": "decay",
+      "role": "branch"
+    },
+    {
+      "id": "e-ex1",
+      "from": "ex_read",
+      "to": "ex_llm",
+      "label": "裁剪后非空"
+    },
+    {
+      "id": "e-ex2",
+      "from": "ex_llm",
+      "to": "ex_commit",
+      "label": "解析出候选"
+    },
+    {
+      "id": "e-ex3",
+      "from": "ex_commit",
+      "to": "commit",
+      "label": "③ 正常提交",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-rc1",
+      "from": "rc_take",
+      "to": "rc_llm",
+      "label": "候选非空"
+    },
+    {
+      "id": "e-rc2",
+      "from": "rc_llm",
+      "to": "rc_apply",
+      "label": "决策逐条落库"
+    },
+    {
+      "id": "e-rc3",
+      "from": "rc_apply",
+      "to": "commit"
+    },
+    {
+      "id": "e-rb1",
+      "from": "rb_fence",
+      "to": "rb_scope",
+      "label": "revision 相等"
+    },
+    {
+      "id": "e-rb2",
+      "from": "rb_scope",
+      "to": "rb_l3",
+      "label": "是 · global",
+      "role": "branch"
+    },
+    {
+      "id": "e-rb3",
+      "from": "rb_scope",
+      "to": "rb_l2",
+      "label": "否 · L2 层",
+      "role": "branch"
+    },
+    {
+      "id": "e-rb4",
+      "from": "rb_l3",
+      "to": "commit"
+    },
+    {
+      "id": "e-rb5",
+      "from": "rb_l2",
+      "to": "commit"
+    },
+    {
+      "id": "e-dc1",
+      "from": "dc_sql",
+      "to": "dc_gate",
+      "label": "统计 active"
+    },
+    {
+      "id": "e-dc2",
+      "from": "dc_gate",
+      "to": "dc_sleep",
+      "label": "是 · 超过 50",
+      "role": "branch"
+    },
+    {
+      "id": "e-dc3",
+      "from": "dc_sleep",
+      "to": "dc_revive",
+      "label": "接着复活"
+    },
+    {
+      "id": "e-dc4",
+      "from": "dc_gate",
+      "to": "dc_revive",
+      "label": "否 · 直接复活",
+      "role": "branch"
+    },
+    {
+      "id": "e-dc5",
+      "from": "dc_revive",
+      "to": "commit"
+    },
+    {
+      "id": "e-fence",
+      "from": "run_handler",
+      "to": "fencing",
+      "label": "① 租约丢失",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "e-fail",
+      "from": "run_handler",
+      "to": "fail_job",
+      "label": "② 其它异常",
+      "role": "error"
+    },
+    {
+      "id": "e-ex-rc",
+      "from": "ex_commit",
+      "to": "rc_take",
+      "label": "入队 reconcile",
+      "variant": "dashed",
+      "role": "async"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "两个写入口，一条不变量",
+      "items": [
+        "工具路径走 commitL1Mutation，job 路径走 commitClaimedJob",
+        "“每次写入都成立”的不变量不能靠“记得调用”来保证",
+        "必须下沉到 schema 层强制执行"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "reconcile 的三条硬规则",
+      "items": [
+        "preference 永不被 supersede",
+        "derived 目标不可 supersede",
+        "procedure 被覆盖时转 archived 而非 superseded"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "rebuild 的双重围栏",
+      "items": [
+        "precheck：revision 不等即空提交，不烧 LLM",
+        "提交内再查一次 revision，然后删派生层、插 ≤6 块",
+        "global 库走 L3 画像，模型可裁决 keep（keep 则不写）"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "围栏先于业务写入",
+      "items": [
+        "租约丢失即零写入回滚",
+        "崩溃与正常退出共用一条恢复路径"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "认领即消耗预算",
+      "items": [
+        "每个 store 每 tick 最多认领 1 个 job",
+        "attempts 在认领时自增，而非完成时",
+        "崩溃的 worker 同样消耗重试预算"
+      ]
+    }
+  ]
+}

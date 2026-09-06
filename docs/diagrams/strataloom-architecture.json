@@ -2,12 +2,16 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "StrataLoom · 分层记忆插件架构",
+    "title": "StrataLoom · 分层记忆插件架构（v0.4.17 · schema v11）",
     "locale": "zh-CN",
     "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Alan-IFT/strataloom",
+      "revision": "b113048b08ca810ed1305ae1eeeb344f58a74ff7"
+    },
     "viewBox": [
-      1320,
-      900
+      1240,
+      1120
     ],
     "views": [
       {
@@ -22,7 +26,7 @@
           "reconcile",
           "l1"
         ],
-        "note": "一个 turn 结束触发采集，写入 L0；提炼与对账把它变成 L1 记忆。"
+        "note": "turn 结束触发采集：L0 无条件写入，extract 入队与它同一事务。"
       },
       {
         "id": "read-path",
@@ -32,11 +36,10 @@
           "tools",
           "render",
           "l1",
-          "l2",
-          "l3",
+          "derived",
           "agent"
         ],
-        "note": "注入、recall、sourceOf 共用同一个渲染器（D8），预算各自独立。"
+        "note": "注入、recall、sourceOf 共用唯一渲染器 renderEntry（D8），预算各自独立。"
       },
       {
         "id": "derived-layers",
@@ -44,11 +47,23 @@
         "focus": [
           "l1",
           "rebuild",
-          "l2",
-          "l3",
+          "derived",
+          "persona",
           "decay"
         ],
-        "note": "任何 raw 写入触发 D9 失效，派生层由维护轮按 revision 围栏重建。"
+        "note": "raw 写入即触发 D9 失效；rebuild 按 revision 围栏重建派生层。"
+      },
+      {
+        "id": "isolation",
+        "label": "身份与边界",
+        "focus": [
+          "identity",
+          "tools",
+          "inject",
+          "group",
+          "projection"
+        ],
+        "note": "身份只从平台事实派生；跨仓只读与投影都是显式声明的窄口。"
       }
     ]
   },
@@ -57,14 +72,42 @@
       "id": "agent",
       "type": "external",
       "label": "DSH Agent",
-      "sublabel": "会话与工具调用",
+      "sublabel": "会话 · 回合 · 工具调用",
       "pos": [
-        36,
-        400
+        28,
+        430
       ],
       "size": [
-        150,
-        80
+        124,
+        76
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/index.ts",
+          "line": 60,
+          "label": "apply(ctx)"
+        }
+      ]
+    },
+    {
+      "id": "identity",
+      "type": "security",
+      "label": "身份闸门",
+      "sublabel": "由平台事实派生",
+      "pos": [
+        28,
+        780
+      ],
+      "size": [
+        124,
+        72
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/identity.ts",
+          "line": 1,
+          "label": "D1"
+        }
       ]
     },
     {
@@ -73,40 +116,82 @@
       "label": "transcript 采集",
       "sublabel": "turn-stopping 钩子",
       "pos": [
-        259,
-        110
+        196,
+        90
       ],
       "size": [
-        162,
-        74
+        140,
+        72
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/auto-extract.ts",
+          "line": 29,
+          "label": "installAutoExtract"
+        }
       ]
     },
     {
       "id": "tools",
       "type": "frontend",
       "label": "memory_* 工具",
-      "sublabel": "recall / propose / forget",
+      "sublabel": "recall · propose · forget",
       "pos": [
-        259,
-        400
+        196,
+        430
       ],
       "size": [
-        162,
-        74
+        140,
+        76
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/tools.ts",
+          "line": 357,
+          "label": "registerTools"
+        }
       ]
     },
     {
       "id": "inject",
       "type": "frontend",
       "label": "注入 Provider",
-      "sublabel": "工作集 top-N · 不逐轮检索",
+      "sublabel": "systemPrompt 变量值 · 同步",
       "pos": [
-        259,
-        690
+        196,
+        880
       ],
       "size": [
-        162,
-        74
+        140,
+        72
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/recall/inject.ts",
+          "line": 1,
+          "label": "buildContextProvider"
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "MemoryService",
+      "sublabel": "provenance 闸门 · 唯一写入口",
+      "pos": [
+        392,
+        230
+      ],
+      "size": [
+        150,
+        76
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/service.ts",
+          "line": 1,
+          "label": "commitL1Mutation"
+        }
       ]
     },
     {
@@ -115,110 +200,155 @@
       "label": "唯一渲染器",
       "sublabel": "renderEntry · withinBudget",
       "pos": [
-        464,
-        580
+        392,
+        700
       ],
       "size": [
-        170,
-        74
-      ]
-    },
-    {
-      "id": "service",
-      "type": "backend",
-      "label": "MemoryService",
-      "sublabel": "provenance 闸门 · §2.3/2.4",
-      "pos": [
-        464,
-        210
+        150,
+        76
       ],
-      "size": [
-        170,
-        74
+      "sources": [
+        {
+          "path": "packages/memory/src/recall/render.ts",
+          "line": 127,
+          "label": "D8"
+        }
       ]
     },
     {
       "id": "l0",
       "type": "database",
       "label": "L0 conversations",
-      "sublabel": "原始转写 · 唯一物证",
+      "sublabel": "原始转写 · 无条件写入",
       "pos": [
-        740,
-        100
+        590,
+        90
       ],
       "size": [
-        168,
-        74
+        156,
+        72
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/store/conversations.ts",
+          "line": 1,
+          "label": "captureTurn"
+        }
       ]
     },
     {
       "id": "l1",
       "type": "database",
       "label": "L1 memories",
-      "sublabel": "4 kinds · D9 触发器失效派生层",
+      "sublabel": "derived=0 · 4 kinds · FTS5",
       "pos": [
-        740,
-        310
+        590,
+        320
       ],
       "size": [
-        168,
-        74
+        156,
+        76
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/store/schema.ts",
+          "line": 276,
+          "label": "memories"
+        },
+        {
+          "path": "packages/memory/src/store/fts.ts",
+          "line": 55,
+          "label": "queryInjectableSet"
+        }
       ]
     },
     {
-      "id": "l2",
+      "id": "derived",
       "type": "database",
-      "label": "L2 场景块",
-      "sublabel": "derived=2 · ≤620 字符",
+      "label": "派生层 L2",
+      "sublabel": "derived=1 rollup · =2 场景块",
       "pos": [
-        740,
-        560
+        590,
+        700
       ],
       "size": [
-        168,
-        74
+        156,
+        76
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/types.ts",
+          "line": 77,
+          "label": "LAYER"
+        }
       ]
     },
     {
-      "id": "l3",
+      "id": "persona",
       "type": "database",
       "label": "L3 画像",
-      "sublabel": "derived=3 · ≤600 字符",
+      "sublabel": "derived=3 · 全局唯一",
       "pos": [
-        740,
-        740
+        590,
+        970
       ],
       "size": [
-        168,
-        74
+        156,
+        72
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/pipeline/rebuild.ts",
+          "line": 482,
+          "label": "runPersonaJob"
+        }
       ]
     },
     {
       "id": "runner",
       "type": "messagebus",
       "label": "JobRunner",
-      "sublabel": "租约 · revision 围栏",
+      "sublabel": "30s tick · 租约 · 围栏",
       "pos": [
-        1026,
-        100
+        800,
+        90
       ],
       "size": [
-        162,
-        74
+        140,
+        72
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/pipeline/runner.ts",
+          "line": 1,
+          "label": "tick / claim"
+        },
+        {
+          "path": "packages/memory/src/pipeline/jobs.ts",
+          "line": 61,
+          "label": "enqueueJob"
+        }
       ]
     },
     {
       "id": "extract",
       "type": "backend",
       "label": "extract",
-      "sublabel": "转写 → 候选",
+      "sublabel": "L0 转写 → ≤5 候选",
       "pos": [
-        1026,
-        280
+        800,
+        320
       ],
       "size": [
-        162,
+        140,
         66
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/pipeline/extract.ts",
+          "line": 1,
+          "label": "runExtractJob"
+        }
       ]
     },
     {
@@ -227,12 +357,19 @@
       "label": "reconcile",
       "sublabel": "去重 · supersede",
       "pos": [
-        1026,
-        400
+        800,
+        440
       ],
       "size": [
-        162,
+        140,
         66
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/pipeline/reconcile.ts",
+          "line": 1,
+          "label": "runReconcileJob"
+        }
       ]
     },
     {
@@ -241,26 +378,40 @@
       "label": "rebuild",
       "sublabel": "Packet 溢出才触发",
       "pos": [
-        1026,
-        580
+        800,
+        700
       ],
       "size": [
-        162,
+        140,
         66
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/pipeline/rebuild.ts",
+          "line": 208,
+          "label": "packetOverflows"
+        }
       ]
     },
     {
       "id": "decay",
       "type": "backend",
       "label": "decay",
-      "sublabel": "L1 休眠·归档·引文老化",
+      "sublabel": "休眠 · 归档 · 无 LLM",
       "pos": [
-        1026,
-        700
+        800,
+        560
       ],
       "size": [
-        162,
+        140,
         66
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/pipeline/decay.ts",
+          "line": 1,
+          "label": "runDecayJob"
+        }
       ]
     },
     {
@@ -269,46 +420,103 @@
       "label": "LLM 路由",
       "sublabel": "agentDefaultModel",
       "pos": [
-        1204,
-        180
+        1010,
+        440
       ],
       "size": [
-        104,
+        140,
         66
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/pipeline/llm-call.ts",
+          "line": 1,
+          "label": "callPipelineLlm"
+        }
+      ]
+    },
+    {
+      "id": "group",
+      "type": "security",
+      "label": "仓库组只读",
+      "sublabel": ".strataloom-group.json",
+      "pos": [
+        392,
+        970
+      ],
+      "size": [
+        150,
+        70
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/store/group.ts",
+          "line": 50,
+          "label": "GROUP_FILE"
+        }
+      ]
+    },
+    {
+      "id": "projection",
+      "type": "frontend",
+      "label": ".repo_memory 投影",
+      "sublabel": "只写出 · 密钥拦截",
+      "pos": [
+        392,
+        430
+      ],
+      "size": [
+        150,
+        70
+      ],
+      "sources": [
+        {
+          "path": "packages/memory/src/projection.ts",
+          "line": 105,
+          "label": "projectStore"
+        }
       ]
     }
   ],
   "boundaries": [
     {
       "kind": "region",
-      "label": "插件进程",
+      "label": "插件进程 · 单一 teardown",
       "wraps": [
         "capture",
         "tools",
         "inject",
+        "service",
         "render",
-        "service"
+        "projection",
+        "group"
       ]
     },
     {
       "kind": "region",
-      "label": "每仓 SQLite（schema v9）",
+      "label": "每仓 SQLite · schema v11",
       "wraps": [
         "l0",
         "l1",
-        "l2",
-        "l3"
+        "derived"
       ]
     },
     {
       "kind": "region",
-      "label": "异步管线",
+      "label": "global 私有库",
+      "wraps": [
+        "persona"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "异步管线 · 租约与围栏",
       "wraps": [
         "runner",
         "extract",
         "reconcile",
-        "rebuild",
-        "decay"
+        "decay",
+        "rebuild"
       ]
     }
   ],
@@ -323,19 +531,54 @@
     {
       "id": "agent-tools",
       "from": "agent",
-      "to": "tools"
+      "to": "tools",
+      "fromSide": "right",
+      "toSide": "left"
     },
     {
       "id": "inject-agent",
       "from": "inject",
       "to": "agent",
-      "label": "注入 ≤1400 tok"
+      "label": "≤1400 tok",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "left",
+      "via": [
+        [
+          12,
+          916.0
+        ],
+        [
+          12,
+          468.0
+        ]
+      ]
+    },
+    {
+      "id": "identity-tools",
+      "from": "identity",
+      "to": "tools",
+      "label": "限 principal",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "bottom"
+    },
+    {
+      "id": "identity-inject",
+      "from": "identity",
+      "to": "inject",
+      "label": "仅 principal",
+      "variant": "security",
+      "labelAt": [
+        174,
+        866
+      ]
     },
     {
       "id": "capture-l0",
       "from": "capture",
       "to": "l0",
-      "label": "写入调用与结果"
+      "label": "同事务写入"
     },
     {
       "id": "tools-service",
@@ -343,28 +586,45 @@
       "to": "service"
     },
     {
-      "id": "inject-render",
-      "from": "inject",
-      "to": "render",
-      "label": "1300 tok 预算"
+      "id": "service-l1",
+      "from": "service",
+      "to": "l1",
+      "label": "唯一写入口",
+      "labelAt": [
+        566,
+        410
+      ]
     },
     {
       "id": "tools-render",
       "from": "tools",
       "to": "render",
-      "label": "500 tok 预算"
+      "label": "≤500 tok"
     },
     {
-      "id": "service-l1",
-      "from": "service",
-      "to": "l1",
-      "label": "读写 · FTS"
+      "id": "inject-render",
+      "from": "inject",
+      "to": "render",
+      "label": "≤1300 tok"
+    },
+    {
+      "id": "render-derived",
+      "from": "render",
+      "to": "derived",
+      "label": "派生优先"
+    },
+    {
+      "id": "l0-service",
+      "from": "l0",
+      "to": "service",
+      "label": "sourceOf",
+      "variant": "dashed"
     },
     {
       "id": "l0-runner",
       "from": "l0",
       "to": "runner",
-      "label": "排队 extract"
+      "label": "入队"
     },
     {
       "id": "runner-extract",
@@ -374,38 +634,90 @@
     {
       "id": "extract-reconcile",
       "from": "extract",
-      "to": "reconcile"
+      "to": "reconcile",
+      "label": "候选",
+      "labelAt": [
+        870,
+        400
+      ]
     },
     {
       "id": "reconcile-l1",
       "from": "reconcile",
       "to": "l1",
       "label": "落库",
-      "variant": "emphasis"
+      "variant": "emphasis",
+      "labelAt": [
+        726,
+        470
+      ]
     },
     {
-      "id": "rebuild-l2",
+      "id": "decay-l1",
+      "from": "decay",
+      "to": "l1",
+      "label": "60 天休眠",
+      "labelAt": [
+        770,
+        600
+      ]
+    },
+    {
+      "id": "rebuild-derived",
       "from": "rebuild",
-      "to": "l2",
-      "label": "溢出时重建"
+      "to": "derived",
+      "label": "溢出重建"
+    },
+    {
+      "id": "rebuild-persona",
+      "from": "rebuild",
+      "to": "persona",
+      "label": "画像重写"
     },
     {
       "id": "extract-llm",
       "from": "extract",
+      "to": "llm",
+      "label": "严格 JSON"
+    },
+    {
+      "id": "reconcile-llm",
+      "from": "reconcile",
       "to": "llm"
     },
     {
-      "id": "l0-service",
-      "from": "l0",
-      "to": "service",
-      "label": "sourceOf 回溯",
+      "id": "rebuild-llm",
+      "from": "rebuild",
+      "to": "llm"
+    },
+    {
+      "id": "l1-derived",
+      "from": "l1",
+      "to": "derived",
+      "label": "D9 失效",
+      "variant": "dashed",
+      "labelAt": [
+        668,
+        410
+      ]
+    },
+    {
+      "id": "group-render",
+      "from": "group",
+      "to": "render",
+      "label": "只读 ≤220 tok",
       "variant": "dashed"
     },
     {
-      "id": "render-derived",
-      "from": "render",
-      "to": "l2",
-      "label": "读 L1/L2/L3"
+      "id": "service-projection",
+      "from": "service",
+      "to": "projection",
+      "label": "经批准",
+      "variant": "dashed",
+      "labelAt": [
+        467,
+        320
+      ]
     }
   ],
   "cards": [
@@ -413,27 +725,27 @@
       "dot": "cyan",
       "title": "两条正交的轴",
       "items": [
-        "L0→L3 是粒度轴，由管线逐层生长",
-        "fact/coding/preference/procedure 是用途轴，只在 L1 有意义",
-        "L2/L3 曾被初始规范否决（语义未定义），ADR 0002 补足边界后重开"
+        "derived 列 0/1/2/3 是粒度轴：raw → rollup → 场景块 → 画像",
+        "fact/coding/preference/procedure 是用途轴，只在 raw 层有意义",
+        "L2/L3 曾被初始规范三次否决，ADR 0002 定死边界后才重开"
       ]
     },
     {
       "dot": "violet",
       "title": "一条规则一个实现",
       "items": [
-        "三条读出口共用同一渲染器（D8）",
-        "prune 豁免与 sourceOf 可达共用同一个 status 谓词",
-        "派生层由 D9 触发器统一失效，不靠调用方记得清理"
+        "三条读出口共用 renderEntry，预算口径同源（D8）",
+        "派生层失效下沉为 schema v5 的三个触发器，不靠写入方记得清理（D9）",
+        "job 复活规则只写在唯一入队点，所有 kind 共享一条规则"
       ]
     },
     {
       "dot": "amber",
-      "title": "已登记未修（ADR 0009）",
+      "title": "边界与失败姿态",
       "items": [
-        "SOURCE_TURN_LIMIT 不绑定：token 预算先截断",
-        "sourceOf 兑现率 2.1%–4.3%（零使用实例，故登记不修）",
-        "90 天 L0 保留期尚未触发：豁免集恒等于全集"
+        "身份、scope 只从平台事实派生，模型与调用者不得声明（D1）",
+        "fencing 先于业务写入：租约丢失即零写入回滚（D6）",
+        "采集失败 fail open：绝不打断 turn 边界"
       ]
     }
   ]

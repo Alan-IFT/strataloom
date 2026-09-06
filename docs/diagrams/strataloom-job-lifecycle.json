@@ -1,0 +1,319 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Strataloom Job 生命周期状态机",
+    "output": "docs/diagrams/strataloom-job-lifecycle.html",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      920,
+      700
+    ]
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "主状态机 · job.state 的 4 个取值"
+    },
+    {
+      "id": "failure",
+      "label": "失败与复活"
+    },
+    {
+      "id": "terminal",
+      "label": "保留期清理"
+    }
+  ],
+  "states": [
+    {
+      "id": "absent",
+      "type": "start",
+      "label": "不存在",
+      "sublabel": "尚无 job 行",
+      "lane": "main",
+      "col": 0,
+      "step": "01",
+      "tag": "概念端点"
+    },
+    {
+      "id": "pending",
+      "type": "waiting",
+      "label": "pending",
+      "sublabel": "待认领",
+      "lane": "main",
+      "col": 1,
+      "step": "02",
+      "tag": "排队"
+    },
+    {
+      "id": "running",
+      "type": "active",
+      "label": "running",
+      "sublabel": "持租约执行",
+      "lane": "main",
+      "col": 2,
+      "step": "03",
+      "tag": "占租约"
+    },
+    {
+      "id": "done",
+      "type": "success",
+      "label": "done",
+      "sublabel": "成功终态",
+      "lane": "main",
+      "col": 4,
+      "step": "04",
+      "tag": "终态"
+    },
+    {
+      "id": "failed",
+      "type": "failure",
+      "label": "failed",
+      "sublabel": "失败终态",
+      "lane": "failure",
+      "col": 1,
+      "tag": "可复活"
+    },
+    {
+      "id": "removed",
+      "type": "neutral",
+      "label": "已删除",
+      "sublabel": "行被清除",
+      "lane": "terminal",
+      "col": 2,
+      "tag": "概念端点"
+    }
+  ],
+  "transitions": [
+    {
+      "id": "t-enqueue",
+      "from": "absent",
+      "to": "pending",
+      "label": "enqueueJob 建行",
+      "note": "attempts=0",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [
+        171,
+        105
+      ]
+    },
+    {
+      "id": "t-claim",
+      "from": "pending",
+      "to": "running",
+      "label": "claimNextJob CAS",
+      "note": "attempts+1，发租约 5 分钟",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "route": "straight",
+      "labelAt": [
+        325,
+        105
+      ]
+    },
+    {
+      "id": "t-commit",
+      "from": "running",
+      "to": "done",
+      "label": "commitClaimedJob",
+      "note": "CAS 后同事务内写入",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          402,
+          84
+        ],
+        [
+          710,
+          84
+        ]
+      ],
+      "labelAt": [
+        556,
+        105
+      ]
+    },
+    {
+      "id": "t-preempt",
+      "from": "running",
+      "to": "running",
+      "label": "租约过期被抢占",
+      "note": "lease_until < now，换 token，attempts+1",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "right",
+      "via": [
+        [
+          402,
+          212
+        ],
+        [
+          530,
+          212
+        ],
+        [
+          530,
+          157
+        ]
+      ],
+      "labelAt": [
+        590,
+        212
+      ]
+    },
+    {
+      "id": "t-retry",
+      "from": "running",
+      "to": "pending",
+      "label": "failClaimedJob 重试",
+      "note": "attempts ≤ 5，退避 60s×attempts",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          402,
+          240
+        ],
+        [
+          248,
+          240
+        ]
+      ],
+      "labelAt": [
+        300,
+        240
+      ]
+    },
+    {
+      "id": "t-dead",
+      "from": "running",
+      "to": "failed",
+      "label": "判毒 attempts > 5",
+      "note": "写 last_error，截断 500 字符",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          402,
+          258
+        ],
+        [
+          556,
+          258
+        ]
+      ],
+      "labelAt": [
+        500,
+        250
+      ]
+    },
+    {
+      "id": "t-revive",
+      "from": "failed",
+      "to": "pending",
+      "label": "复活：ON CONFLICT DO UPDATE",
+      "note": "WHERE jobs.state='failed'，全量重置",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "left",
+      "via": [
+        [
+          171,
+          307
+        ],
+        [
+          171,
+          157
+        ]
+      ],
+      "labelAt": [
+        340,
+        307
+      ]
+    },
+    {
+      "id": "t-done-gc",
+      "from": "done",
+      "to": "removed",
+      "label": "完成满 7 天",
+      "note": "DONE_RETENTION_MS = 7 天",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        790,
+        300
+      ],
+      "route": "straight"
+    },
+    {
+      "id": "t-failed-gc",
+      "from": "failed",
+      "to": "removed",
+      "label": "满 30 天或 rebuild 版本失配",
+      "note": "FAILED_RETENTION_MS 或版本不可达",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "left",
+      "via": [
+        [
+          556,
+          479
+        ]
+      ],
+      "labelAt": [
+        460,
+        420
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "关键常量",
+      "items": [
+        "MAX_CLAIMS = 5：认领上限，超出即判定为毒 job",
+        "LEASE_DURATION_MS = 5 分钟：单次认领的租约时长",
+        "JOB_TIMEOUT_MS = 4 分钟：小于租约，所以 worker 先被 abort",
+        "RETRY_BACKOFF_MS = 60s × attempts：线性退避",
+        "TICK_INTERVAL_MS = 30s；CLEANUP_INTERVAL_MS = 6 小时"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "三条不变式",
+      "items": [
+        "attempts 在认领时自增而非完成时：崩溃的 worker 也消耗预算，这是毒 job 防线",
+        "commitClaimedJob 是唯一成功出口；failClaimedJob 是唯一失败出口，也是 last_error 的唯一写点",
+        "所有出口 CAS 都带 state='running' AND lease_token=?；租约丢失则出口变 no-op"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "两类静默 no-op",
+      "items": [
+        "pending / running / done 遇同键重触发：被主键静默吸收，状态不变",
+        "running 遇 FencingError（租约丢失）：零业务写入、job 行不动、不消耗重试预算",
+        "FencingError 只由 runner 记一条 info 日志"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "四个 kind 共享同一状态机",
+      "items": [
+        "extract / reconcile / decay / rebuild 走完全相同的迁移规则",
+        "rebuild 多一条清理：kind='rebuild' 且 payload.expectedRevision ≠ 当前 store_revision",
+        "该清理与年龄无关，直接删除已不可达的 failed 行"
+      ]
+    }
+  ]
+}

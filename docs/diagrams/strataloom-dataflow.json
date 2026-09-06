@@ -1,0 +1,291 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "StrataLoom 记忆分层：L0→L1→派生层的血缘与失效",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1080,
+      820
+    ],
+    "views": [
+      {
+        "id": "main-lineage",
+        "label": "主链血缘",
+        "focus": [
+          "conv",
+          "cand",
+          "raw",
+          "scen",
+          "persona"
+        ],
+        "note": "L0 转写 → L1 候选 → L1 活跃 → L2 场景块与 L3 画像。"
+      },
+      {
+        "id": "invalidation",
+        "label": "失效边",
+        "focus": [
+          "raw",
+          "trig",
+          "scen",
+          "persona"
+        ],
+        "note": "任一 RAW 行写入即触发派生层整体退休——只删不入队。"
+      },
+      {
+        "id": "read-exits",
+        "label": "读出口",
+        "focus": [
+          "raw",
+          "scen",
+          "persona",
+          "inject",
+          "recall"
+        ],
+        "note": "注入优先读派生层，recall 走 FTS5，两者共用同一渲染器。"
+      }
+    ]
+  },
+  "stages": [
+    {
+      "label": "L0 原始层"
+    },
+    {
+      "label": "L1 候选"
+    },
+    {
+      "label": "L1 活跃"
+    },
+    {
+      "label": "派生层"
+    },
+    {
+      "label": "读出口"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "conv",
+      "type": "database",
+      "label": "conversations",
+      "sublabel": "captureTurn 写入",
+      "stage": 0,
+      "row": 1,
+      "tag": "不建 FTS"
+    },
+    {
+      "id": "cand",
+      "type": "database",
+      "label": "memories 候选",
+      "sublabel": "status='candidate'",
+      "stage": 1,
+      "row": 0,
+      "tag": "extract"
+    },
+    {
+      "id": "evid",
+      "type": "security",
+      "label": "evidence",
+      "sublabel": "kind='session'",
+      "stage": 1,
+      "row": 2,
+      "tag": "D3"
+    },
+    {
+      "id": "raw",
+      "type": "database",
+      "label": "L1 活跃 RAW",
+      "sublabel": "active · derived=0",
+      "stage": 2,
+      "row": 1,
+      "tag": "4 kinds"
+    },
+    {
+      "id": "dormant",
+      "type": "database",
+      "label": "休眠 dormant",
+      "sublabel": "60 天闲置 · 可复活",
+      "stage": 2,
+      "row": 3,
+      "tag": "decay"
+    },
+    {
+      "id": "scen",
+      "type": "database",
+      "label": "L2 场景块",
+      "sublabel": "derived=2 · ≤6 块",
+      "stage": 3,
+      "row": 0,
+      "tag": "溢出才建"
+    },
+    {
+      "id": "persona",
+      "type": "database",
+      "label": "L3 用户画像",
+      "sublabel": "derived=3 · 单条",
+      "stage": 3,
+      "row": 2,
+      "tag": "global 库"
+    },
+    {
+      "id": "trig",
+      "type": "security",
+      "label": "失效触发器 ×3",
+      "sublabel": "insert/update/delete",
+      "stage": 3,
+      "row": 4,
+      "tag": "D9"
+    },
+    {
+      "id": "inject",
+      "type": "frontend",
+      "label": "注入 packet",
+      "sublabel": "派生优先 · 无查询串",
+      "stage": 4,
+      "row": 0,
+      "tag": "≤1400 tok"
+    },
+    {
+      "id": "recall",
+      "type": "frontend",
+      "label": "memory_recall",
+      "sublabel": "FTS5 · 全 provenance",
+      "stage": 4,
+      "row": 2,
+      "tag": "≤500 tok"
+    },
+    {
+      "id": "project",
+      "type": "external",
+      "label": ".repo_memory 投影",
+      "sublabel": "人工批准才写盘",
+      "stage": 4,
+      "row": 4,
+      "tag": "唯一落盘"
+    }
+  ],
+  "flows": [
+    {
+      "id": "extract-cand",
+      "from": "conv",
+      "to": "cand",
+      "label": "extract 作业",
+      "classification": "≤5 候选",
+      "variant": "emphasis"
+    },
+    {
+      "id": "extract-evid",
+      "from": "conv",
+      "to": "evid",
+      "label": "写入证据",
+      "classification": "provenance 取最低信任"
+    },
+    {
+      "id": "reconcile",
+      "from": "cand",
+      "to": "raw",
+      "label": "reconcile 翻转",
+      "classification": "只改状态不改正文",
+      "variant": "emphasis"
+    },
+    {
+      "id": "decay-out",
+      "from": "raw",
+      "to": "dormant",
+      "label": "闲置 60 天",
+      "classification": "纯 SQL · 无 LLM",
+      "variant": "dashed",
+      "labelAt": [
+        530,
+        314
+      ]
+    },
+    {
+      "id": "rollup",
+      "from": "raw",
+      "to": "scen",
+      "label": "rebuild 作业",
+      "classification": "packet 溢出才触发"
+    },
+    {
+      "id": "persona-job",
+      "from": "raw",
+      "to": "persona",
+      "label": "persona 作业",
+      "classification": "模型可裁决 keep"
+    },
+    {
+      "id": "raw-write",
+      "from": "dormant",
+      "to": "trig",
+      "label": "任一 RAW 行写入",
+      "classification": "store_revision 自增",
+      "variant": "security"
+    },
+    {
+      "id": "kill-derived",
+      "from": "trig",
+      "to": "persona",
+      "label": "DELETE derived≠0",
+      "classification": "整层退休 · 不入队",
+      "variant": "security",
+      "labelAt": [
+        745,
+        656
+      ]
+    },
+    {
+      "id": "scen-inject",
+      "from": "scen",
+      "to": "inject",
+      "label": "派生优先",
+      "classification": "LIMIT 20",
+      "variant": "emphasis"
+    },
+    {
+      "id": "persona-recall",
+      "from": "persona",
+      "to": "recall",
+      "label": "共用 renderEntry",
+      "classification": "D8 唯一渲染器"
+    },
+    {
+      "id": "share-project",
+      "from": "trig",
+      "to": "project",
+      "label": "team-shareable",
+      "classification": "human_confirmed=1",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "血缘只有一个方向",
+      "items": [
+        "L0 无条件写入，且刻意不建 FTS——它不是第二个检索索引",
+        "extract 读的是本插件自己的 L0 副本，不依赖平台会话日志",
+        "reconcile 只翻转状态，从不改写正文"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "失效由数据承担（D9）",
+      "items": [
+        "三个触发器挂在 memories 上，条件是 derived != 0——整层一起退休",
+        "只删不入队：raw 集不再溢出时，L2 就再也不会回来",
+        "store_revision 自增，rebuild 在认领与提交两处各围栏一次"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "读出口互不相同",
+      "items": [
+        "注入是工作集 top-N，没有查询串；派生行优先于 raw",
+        "recall 走 FTS5，中文靠 cjk bigram 列而非更换分词器",
+        "复活只在 decay 批次发生，绝不在读路径上写权威状态"
+      ]
+    }
+  ]
+}
