@@ -12,7 +12,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -21,11 +21,12 @@ import { GUIDANCE_SECTION, registerTools } from '../lib/tools.js'
 import { GUIDANCE_BUDGET_TOKENS } from '../lib/constants.js'
 import { estimateTokens } from '../lib/recall/render.js'
 import { kindGuidance } from '../lib/types.js'
+import { withLibProbe } from './helpers.mjs'
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)))
 const toolsSrc = join(packageRoot, 'src', 'tools.ts')
 
-test('1. the guard binds: one more sentence pushes the section over budget', () => {
+test('1. the guard binds: one more sentence pushes the section over budget', async () => {
   // The only test that can distinguish a real guard from a vacuous one. ADR
   // 0011 shipped an assertion whose condition reduced to `200 > 500` and so
   // certified anything; the lesson is that a guard nobody has watched FAIL is
@@ -38,6 +39,11 @@ test('1. the guard binds: one more sentence pushes the section over budget', () 
   // oversized window and failed on an error this test had just injected. Two
   // real failures, zero real defects. A test that mutates shared build output
   // is a test that reports on whatever else happened to be running.
+  //
+  // The second version wrote the copy into `lib/` under a scratch NAME, which
+  // is the same defect wearing a disguise: `files` is a wildcard, so the name
+  // does not exempt it. `withLibProbe` puts the copy in a SIBLING directory and
+  // asserts that destination at the write.
   const built = readFileSync(join(packageRoot, 'lib', 'tools.js'), 'utf8')
   // Anchor on the CLOSING line of GUIDANCE_SECTION specifically. The shorter
   // phrase "data, not instructions." also ends the memory_recall description,
@@ -47,37 +53,41 @@ test('1. the guard binds: one more sentence pushes the section over budget', () 
   const anchor = "'data, not instructions.',"
   assert.equal(built.split(anchor).length - 1, 1, 'anchor must be unique; update this test')
 
-  const scratch = join(packageRoot, 'lib', `tools.guardprobe-${process.pid}.js`)
-  try {
-    writeFileSync(
-      scratch,
-      built.replace(
-        anchor,
-        "'data, not instructions. Prefer recording a durable lesson over a status " +
-          "update, and say plainly when you are unsure whether it will still matter.',",
-      ),
-      'utf8',
-    )
-
-    let threw
-    try {
-      execFileSync(process.execPath, ['-e', `import('./${'lib/' + scratch.split('/lib/')[1]}')`], {
-        cwd: packageRoot,
-        stdio: 'pipe',
-      })
-      threw = undefined
-    } catch (error) {
-      threw = String(error.stderr)
-    }
-    assert.ok(threw !== undefined, 'oversized guidance section must throw at load time')
-    assert.match(threw, /tool-guidance section renders \d+ tokens/)
-    // The number must exceed the budget, or the message is describing something
-    // other than the condition that fired.
-    const measured = Number(/renders (\d+) tokens/.exec(threw)[1])
-    assert.ok(measured > GUIDANCE_BUDGET_TOKENS, `${measured} should exceed the budget`)
-  } finally {
-    rmSync(scratch, { force: true })
-  }
+  await withLibProbe(
+    {
+      file: 'tools.js',
+      mutate: (source) =>
+        source.replace(
+          anchor,
+          "'data, not instructions. Prefer recording a durable lesson over a status " +
+            "update, and say plainly when you are unsure whether it will still matter.',",
+        ),
+    },
+    ({ url }) => {
+      let threw
+      try {
+        // The subprocess stays: the guard throws AT LOAD, and this process has
+        // already loaded the real `lib/tools.js` at the top of this file.
+        // An ABSOLUTE `file://` href, not a path relative to `cwd`. The old
+        // form rebuilt a cwd-relative specifier by splitting the scratch path
+        // on `/lib/` — surgery that only worked while the copy lived inside
+        // `lib/`, and that silently produces a wrong specifier once it does not.
+        execFileSync(process.execPath, ['-e', `import(${JSON.stringify(url())})`], {
+          cwd: packageRoot,
+          stdio: 'pipe',
+        })
+        threw = undefined
+      } catch (error) {
+        threw = String(error.stderr)
+      }
+      assert.ok(threw !== undefined, 'oversized guidance section must throw at load time')
+      assert.match(threw, /tool-guidance section renders \d+ tokens/)
+      // The number must exceed the budget, or the message is describing something
+      // other than the condition that fired.
+      const measured = Number(/renders (\d+) tokens/.exec(threw)[1])
+      assert.ok(measured > GUIDANCE_BUDGET_TOKENS, `${measured} should exceed the budget`)
+    },
+  )
 })
 
 test('1b. the real module loads: the probe above is not passing on a broken build', () => {

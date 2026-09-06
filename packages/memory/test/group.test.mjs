@@ -13,9 +13,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { MemoryService, MemoryInputError } from '../lib/service.js'
 import { clearRepoIdentityMemo, repoKeyFor } from '../lib/store/repo-key.js'
 import { GROUP_FILE, readGroupDeclaration, worktreeSources } from '../lib/store/group.js'
@@ -55,6 +54,7 @@ import {
   tempRoot,
   assertHonestRefusal,
   DERIVED_SENTENCE,
+  withLibProbe,
 } from './helpers.mjs'
 
 /** A real git repo with a real remote — repo-key derivation shells out to git. */
@@ -1458,54 +1458,53 @@ test('10c. the guard ITSELF throws on an over-sized member count (not merely the
   //
   // The copy is placed inside the package so `node_modules` still resolves
   // upward from it, and the mutation is applied to the built JS the same way a
-  // careless edit to the source would reach it.
-  const libDir = join(import.meta.dirname, '..', 'lib')
-  const original = readFileSync(join(libDir, 'constants.js'), 'utf8')
+  // careless edit to the source would reach it. `withLibProbe` owns that copy:
+  // it makes each variant a SIBLING of `lib/`, never a child of it and never
+  // nested inside another probe.
+  const original = readFileSync(join(import.meta.dirname, '..', 'lib', 'constants.js'), 'utf8')
   assert.match(
     original,
     /export const GROUP_MAX_MEMBERS = \d+;/,
     'the probe must find the constant it intends to raise',
   )
-  // Each variant is a SIBLING of lib/, never nested inside another probe, so
-  // `node_modules` still resolves upward from the package root.
-  const probes = []
-  try {
-    for (const raised of [GROUP_MAX_MEMBERS + 1, 100_000]) {
-      const dir = join(import.meta.dirname, '..', `lib-guard-probe-${process.pid}-${raised}`)
-      probes.push(dir)
-      cpSync(libDir, dir, { recursive: true })
-      writeFileSync(
-        join(dir, 'constants.js'),
-        original.replace(
-          /export const GROUP_MAX_MEMBERS = \d+;/,
-          `export const GROUP_MAX_MEMBERS = ${raised};`,
-        ),
-        'utf8',
-      )
-      await assert.rejects(
-        import(pathToFileURL(join(dir, 'tools.js')).href),
-        (error) => {
-          assert.match(
-            error.message,
-            /worst recall packet renders \d+ characters/,
-            `loading with GROUP_MAX_MEMBERS = ${raised} must throw the packet guard`,
-          )
-          return true
-        },
-        `GROUP_MAX_MEMBERS = ${raised} must be REJECTED AT LOAD. The previous guard accepted ` +
-          'it silently, because its condition reduced to `F > R` with the member count ' +
-          'cancelled out.',
-      )
-    }
-    // Control: the SAME copy machinery with the SHIPPED value must load
-    // cleanly, so the rejections above are the guard and not the scaffolding.
-    const control = join(import.meta.dirname, '..', `lib-guard-probe-${process.pid}-control`)
-    probes.push(control)
-    cpSync(libDir, control, { recursive: true })
-    await import(pathToFileURL(join(control, 'tools.js')).href)
-  } finally {
-    for (const dir of probes) rmSync(dir, { recursive: true, force: true })
+  for (const raised of [GROUP_MAX_MEMBERS + 1, 100_000]) {
+    // The mutation is in `constants.js`, but the module under test is
+    // `tools.js` — it is the importer that runs the load-time guard. Hence
+    // `url('tools.js')`: the whole copy is mutated, not a single file.
+    await withLibProbe(
+      {
+        file: 'constants.js',
+        mutate: (source) =>
+          source.replace(
+            /export const GROUP_MAX_MEMBERS = \d+;/,
+            `export const GROUP_MAX_MEMBERS = ${raised};`,
+          ),
+      },
+      async ({ url }) => {
+        await assert.rejects(
+          import(url('tools.js')),
+          (error) => {
+            assert.match(
+              error.message,
+              /worst recall packet renders \d+ characters/,
+              `loading with GROUP_MAX_MEMBERS = ${raised} must throw the packet guard`,
+            )
+            return true
+          },
+          `GROUP_MAX_MEMBERS = ${raised} must be REJECTED AT LOAD. The previous guard accepted ` +
+            'it silently, because its condition reduced to `F > R` with the member count ' +
+            'cancelled out.',
+        )
+      },
+    )
   }
+
+  // Control: the SAME copy machinery with the SHIPPED value must load
+  // cleanly, so the rejections above are the guard and not the scaffolding.
+  // `mutate: null` is what routes it through the same helper — a second,
+  // hand-rolled copy here would be controlling for different machinery than
+  // the one it is supposed to be controlling for.
+  await withLibProbe({ file: 'constants.js', mutate: null }, ({ url }) => import(url('tools.js')))
 })
 
 // --------------------------------------------------------------- 11 --------

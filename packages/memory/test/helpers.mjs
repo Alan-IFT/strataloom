@@ -5,9 +5,10 @@
  * model-facing string in this plugin must pass.
  */
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { after } from 'node:test'
 import { StoreRegistry } from '../lib/store/store.js'
 
@@ -704,3 +705,111 @@ export const DERIVED_SENTENCE = (id) =>
 export const RAW_SENTENCE = (id) =>
   `${id} is a stored memory, but no source conversation was recorded for it, so ` +
   'there is nothing to show. The memory itself is unaffected.'
+
+// ------------------------------------------------------------ lib probe ----
+
+const PKG_ROOT_PROBE = dirname(dirname(fileURLToPath(import.meta.url)))
+let probeSeq = 0
+
+/**
+ * Load-time guards can only be tested by RE-LOADING the built module with a
+ * constant pushed over the line. That needs a mutated copy of `lib/` — and the
+ * one place it must never be written is `lib/` itself.
+ *
+ * ⛔ `lib/` IS THE DELIVERABLE AND `files` IS A WILDCARD.
+ *
+ * `package.json` ships `files: ["lib/**\/*.js", ...]`. That pattern is not a
+ * list of names, so a scratch module dropped in `lib/` is not a scratch module
+ * — it is a shipped file, and `package.test.mjs` packs the tarball from the
+ * same directory while these probes are running. Under `node --test`'s
+ * FILE-LEVEL concurrency the two overlap, and the overlap is wrong in both
+ * directions:
+ *   - false RED: a real run failed `package.test.mjs` with a stray entry
+ *     `+ [ 'lib/tools.guardprobe-4162710.js' ]` — a probe mid-flight, no defect.
+ *   - false GREEN: the same window can close before `npm pack` reads the
+ *     directory, so a genuine leak goes unseen.
+ * Neither is a scheduling accident to be tuned away; the write itself is the
+ * defect. So every probe copy is a SIBLING of `lib/`, never a child.
+ *
+ * The check below is a WRITE-FACE guard: it runs at the write, on every call,
+ * against the destination this call actually computed. A static check over the
+ * test sources (`no test writes into lib/…` in `package.test.mjs`) covers the
+ * other face — that no test names `lib/` as a destination outside this helper.
+ *
+ * BOTH are load-bearing, and that is measured, not assumed. Each catches a
+ * mutant the other misses:
+ *   - a probe that makes an EXTRA write straight to `libDir`: the static check
+ *     names the offending line in this file, while this assertion fires 0
+ *     times. Not because `dir` was bypassed — that mutant still builds `dir`,
+ *     still copies to it and still imports from it, and all 5 of the tests that
+ *     use this helper pass. The assertion is silent because `dir` is genuinely
+ *     CORRECT; the leak is a second, additional write, and this assertion only
+ *     ever sees the one destination it is handed.
+ *   - a probe whose destination is COMPUTED (`['l','i','b'].join('')`) so the
+ *     text check cannot read it: this assertion fails 5 of those tests while
+ *     the static check reports 0 findings. Deleting this assertion revives that
+ *     mutant to a fully green 310/310/0.
+ *
+ * Counts, since three different ones are easy to confuse: this helper has 6
+ * textual call sites across 4 files, in 5 tests, and runs 7 times per suite —
+ * `group.test.mjs` loops its site twice and adds an unmutated control. Measured
+ * by instrumenting the helper: 7 invocations, and 5 tests fail when it throws.
+ * A static check reads text; text can be right while a computed path is wrong.
+ *
+ * The probe dir is deliberately NOT added to `.gitignore`. Measured: the
+ * repo's `packages/*\/lib/` rule does not match `lib-probe-*`
+ * (`git check-ignore` exits 1; `git status` shows `?? packages/memory/lib-probe-…`).
+ * A leftover from a crashed run SHOULD be visible — hiding it would turn a
+ * cleanup failure into a silent one.
+ *
+ * @param file    module inside `lib/` to rewrite, e.g. `'constants.js'`
+ * @param mutate  `(source) => patched`, or `null` for an UNMUTATED copy — the
+ *                control case, which must go through this same machinery or it
+ *                is not controlling for the machinery.
+ * @param use     receives `{ dir, url }`; `url(m = file)` is the absolute
+ *                `file://` href of module `m` inside the copy, so a test can
+ *                mutate `constants.js` and import `tools.js` from that copy.
+ */
+export const withLibProbe = async ({ file, mutate }, use) => {
+  const libDir = join(PKG_ROOT_PROBE, 'lib')
+  const source = readFileSync(join(libDir, file), 'utf8')
+  const patched = mutate === null ? source : mutate(source)
+  // A probe whose rewrite silently missed would assert nothing at all: the
+  // copy would load cleanly and "no throw" would read as "guard absent".
+  if (mutate !== null) {
+    assert.notEqual(patched, source, `the probe must actually rewrite ${file}`)
+  }
+
+  // A SIBLING of lib/ inside the package root, so `node_modules` still
+  // resolves upward from the copy and the module's relative imports resolve.
+  // pid + sequence: `node --test` runs files in separate processes, and one
+  // file may hold two probes at once.
+  const dir = join(PKG_ROOT_PROBE, `lib-probe-${process.pid}-${probeSeq++}`)
+
+  // WRITE-FACE GUARD. `relative()` then `startsWith('..')` rather than a string
+  // prefix test: it is the containment question asked of RESOLVED paths, so a
+  // sibling whose name merely starts with the same characters is not mistaken
+  // for a child — `lib-probe-…` does begin with `lib`, and a raw
+  // `startsWith(libDir)` would read it as inside. `lib/` itself relativises to
+  // `''`, which fails both branches below and is rejected with the children.
+  const rel = relative(libDir, resolve(dir))
+  assert.ok(
+    rel.startsWith('..') || isAbsolute(rel),
+    `WRITE-FACE: withLibProbe would write into lib/ (${dir}). lib/ is the deliverable and ` +
+      '`files: ["lib/**/*.js"]` is a WILDCARD, so anything written there is a shipped file ' +
+      'and races package.test.mjs, which packs that same directory concurrently. The probe ' +
+      'copy must be a SIBLING of lib/.',
+  )
+
+  cpSync(libDir, dir, { recursive: true })
+  try {
+    writeFileSync(join(dir, file), patched, 'utf8')
+    return await use({
+      dir,
+      url: (m = file) => pathToFileURL(join(dir, m)).href,
+    })
+  } finally {
+    // `finally`, so a failing assertion inside `use` still removes the copy.
+    rmSync(dir, { recursive: true, force: true })
+  }
+}

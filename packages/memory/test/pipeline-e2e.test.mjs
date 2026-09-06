@@ -25,6 +25,7 @@ import {
   userMessageEvent,
   assistantMessageEvent,
   sourcedMessageEvent,
+  withLibProbe,
 } from './helpers.mjs'
 
 /**
@@ -376,29 +377,31 @@ test('the extract INPUT is inside the exchange guard, not only its reply', async
   // with the transcript pushed over its own ceiling and require a throw —
   // otherwise this test would pass just as happily against a guard that had
   // been deleted.
-  const { readFileSync, writeFileSync, rmSync } = await import('node:fs')
-  const { join } = await import('node:path')
-  const libDir = join(import.meta.dirname, '..', 'lib')
-  const source = readFileSync(join(libDir, 'constants.js'), 'utf8')
+  //
   // `[\d_]+`, not `\d+`: tsc preserves the numeric separator in `7_000`, and a
-  // probe that silently fails to rewrite would assert nothing at all.
-  const patched = source.replace(
-    /export const EXTRACT_TRANSCRIPT_CHARS = [\d_]+;/,
-    `export const EXTRACT_TRANSCRIPT_CHARS = ${ceiling + 1};`,
+  // probe that silently fails to rewrite would assert nothing at all —
+  // `withLibProbe` asserts the rewrite landed, for exactly that reason.
+  //
+  // The copy lives in a SIBLING of `lib/`, never inside it: `files` is the
+  // wildcard `lib/**/*.js`, so a module written into `lib/` is a shipped file
+  // and races the concurrent `package.test.mjs` pack.
+  await withLibProbe(
+    {
+      file: 'constants.js',
+      mutate: (source) =>
+        source.replace(
+          /export const EXTRACT_TRANSCRIPT_CHARS = [\d_]+;/,
+          `export const EXTRACT_TRANSCRIPT_CHARS = ${ceiling + 1};`,
+        ),
+    },
+    async ({ url }) => {
+      await assert.rejects(import(url()), (error) => {
+        assert.match(error.message, /worst exchange/, 'names the rule it broke')
+        assert.match(error.message, /LLM_MAX_TOKENS \(\d+\)/, 'reports the cap')
+        return true
+      })
+    },
   )
-  assert.notEqual(patched, source, 'the probe must actually rewrite the transcript cap')
-
-  const probe = join(libDir, `constants.extract-probe.${randomUUID()}.js`)
-  writeFileSync(probe, patched)
-  try {
-    await assert.rejects(import(`file://${probe}`), (error) => {
-      assert.match(error.message, /worst exchange/, 'names the rule it broke')
-      assert.match(error.message, /LLM_MAX_TOKENS \(\d+\)/, 'reports the cap')
-      return true
-    })
-  } finally {
-    rmSync(probe, { force: true })
-  }
 })
 
 test('the derived layer must fit the packet it exists to produce', async () => {
@@ -418,13 +421,10 @@ test('the derived layer must fit the packet it exists to produce', async () => {
   // budget, a token count, or a solved ceiling — those live in constants.ts
   // and are free to move. What must never change is that raising a derived
   // target without raising the budget FAILS AT LOAD rather than in production.
-  const { readFileSync, writeFileSync, rmSync } = await import('node:fs')
-  const { join } = await import('node:path')
-  const libDir = join(import.meta.dirname, '..', 'lib')
-  const source = readFileSync(join(libDir, 'constants.js'), 'utf8')
-
-  // Patched in place inside lib/ so the module's own relative imports resolve.
-  // `[\d_]+` matches its sibling probe below: tsc preserves numeric separators,
+  // Patched in a SIBLING COPY of lib/, so the module's own relative imports
+  // resolve and `node_modules` still resolves upward — without writing into the
+  // deliverable, which `files: ["lib/**/*.js"]` would ship.
+  // `[\d_]+` matches its sibling probe above: tsc preserves numeric separators,
   // and eight constants in this file already carry one. This probe works today
   // only because `620` happens not to — one rule, one expression, rather than
   // two that agree by luck. (Both probes assert `notEqual` afterwards, so a
@@ -448,18 +448,17 @@ test('the derived layer must fit the packet it exists to produce', async () => {
   // to do. The message assertions below are what keep either value honest about
   // WHICH guard fired.
   const OVERSIZED = 640
-  const patched = source.replace(
-    /export const ROLLUP_TARGET_CHARS = [\d_]+;/,
-    `export const ROLLUP_TARGET_CHARS = ${OVERSIZED};`,
-  )
-  assert.notEqual(patched, source, 'the probe must actually rewrite the target')
-
-  const probe = join(libDir, `constants.guard-probe.${randomUUID()}.js`)
-  writeFileSync(probe, patched)
-  try {
-    await assert.rejects(
-      import(`file://${probe}`),
-      (error) => {
+  await withLibProbe(
+    {
+      file: 'constants.js',
+      mutate: (source) =>
+        source.replace(
+          /export const ROLLUP_TARGET_CHARS = [\d_]+;/,
+          `export const ROLLUP_TARGET_CHARS = ${OVERSIZED};`,
+        ),
+    },
+    async ({ url }) => {
+      await assert.rejects(import(url()), (error) => {
         // The message must carry the worst case AND the budget: a guard that
         // fails without showing both numbers cannot be acted on, and the next
         // person has to re-derive the ceiling by hand (which is how the
@@ -478,11 +477,9 @@ test('the derived layer must fit the packet it exists to produce', async () => {
           'the derived-layer guard must catch this, not the unrelated group-recall floor',
         )
         return true
-      },
-    )
-  } finally {
-    rmSync(probe, { force: true })
-  }
+      })
+    },
+  )
 
   // And the shipped configuration is on the right side of that same line —
   // otherwise the plugin would not load at all, which is the point of putting

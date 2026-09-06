@@ -96,6 +96,7 @@ import {
   assertNoFalseAdvice,
   DERIVED_SENTENCE,
   RAW_SENTENCE,
+  withLibProbe,
 } from './helpers.mjs'
 
 const makeRepo = () => {
@@ -3674,27 +3675,28 @@ test('the token ceilings are SOLVED, not chosen: one more token overflows the pa
   // A guard nothing can trip is not a guard (the lesson `10b` in group.test
   // records): without this, the ceilings could drift upward and the capacity
   // inequality would be a comment rather than a check.
-  const { readFileSync, writeFileSync, rmSync } = await import('node:fs')
-  const { join } = await import('node:path')
-  const libDir = join(import.meta.dirname, '..', 'lib')
-  const source = readFileSync(join(libDir, 'constants.js'), 'utf8')
-  const patched = source.replace(
-    /export const SCENARIO_MAX_TOKENS = [\d_]+;/,
-    'export const SCENARIO_MAX_TOKENS = 189;',
+  //
+  // The copy goes in a SIBLING of `lib/`, not inside it: `files` is the
+  // wildcard `lib/**/*.js`, so a probe module written there is a shipped file
+  // racing `package.test.mjs`. `withLibProbe` owns that destination and asserts
+  // it at the write.
+  await withLibProbe(
+    {
+      file: 'constants.js',
+      mutate: (source) =>
+        source.replace(
+          /export const SCENARIO_MAX_TOKENS = [\d_]+;/,
+          'export const SCENARIO_MAX_TOKENS = 189;',
+        ),
+    },
+    async ({ url }) => {
+      await assert.rejects(import(url()), (error) => {
+        assert.match(error.message, /derived layer cannot fit/, 'names the rule it broke')
+        assert.match(error.message, /INJECT_BODY_BUDGET_TOKENS \(\d+\)/, 'reports the budget')
+        return true
+      })
+    },
   )
-  assert.notEqual(patched, source, 'the probe must actually rewrite the ceiling')
-
-  const probe = join(libDir, `constants.ceiling-probe.${randomUUID()}.js`)
-  writeFileSync(probe, patched)
-  try {
-    await assert.rejects(import(`file://${probe}`), (error) => {
-      assert.match(error.message, /derived layer cannot fit/, 'names the rule it broke')
-      assert.match(error.message, /INJECT_BODY_BUDGET_TOKENS \(\d+\)/, 'reports the budget')
-      return true
-    })
-  } finally {
-    rmSync(probe, { force: true })
-  }
 })
 
 test('the truncation mark does not name a container it is not confined to', async () => {
