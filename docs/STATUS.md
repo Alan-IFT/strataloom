@@ -1,5 +1,214 @@
 # 当前状态
 
+> 最后更新：2026-09-06 · **本轮不发版，版本仍为 v0.4.17**（判据见本节末）：
+> **唯一一个「把 `lib/` 当交付物读」的测试，读的是它自己刚造出来的东西**。
+> `package.test.mjs` 跑 `npm pack` ⇒ npm 触发 `prepare: tsc` ⇒ **就地重写 `lib/**/*.js`**。
+> ⛔ **决定性读数（本 agent 独立复现，非引用）**：把 `lib/index.js` 的 `apply`
+> 改名 `apply_BROKEN`、`src/` 保持干净（`grep apply_BROKEN src/index.ts` = **0**），
+> 锚断言证明**交付物真的坏了**（`typeof m.apply === 'undefined'`）——
+> **HEAD 上该测试读 `pass 1 fail 0`，且跑完变异体被抹掉**（`grep` 由 1 变 0）。
+> 加 `--ignore-scripts` 后：**`pass 0 fail 1`，变异体跑完仍在（=1）**。
+> 该文件自己的头注释就写着这个失效面「is invisible to every other test here」——
+> **它是唯一的守卫，而它一直在给自己修被测对象。**
+> 第二个后果：`node --test` 并发跑的其他文件正从同一个 `lib/` import，
+> **变异实验被静默回退**——`echo "// MARK" >> lib/store/group.js` 跑完 `before=1 after=0`
+> （lead 7/7，本 agent 独立复现 1/1）。**任何「变异存活⇒无人守」的读法自此不可信。**
+> 修法**只有一个 flag**：`npm pack --ignore-scripts`。**交付物字节零变化**——
+> 改前／改后 tarball **sha256 全等** `4901c38b…`、`diff -r` 输出 0 行、59 文件，故**不发版**。
+> 🆕 **修正案 A：`files` 是通配符 `lib/**/*.js`，测试丢进 `lib/` 的临时文件会被发版给用户**。
+> 四个写入点（`guidance:50`、`layers:~3687`、`pipeline-e2e:~391/~457`）**一条性质断言全守**：
+> 打进任一形状的探针文件 ⇒ **4/4 全部 `pass 0 fail 1` 并点名该文件**，不打 ⇒ `pass 1 fail 0`。
+> **钉的是性质不是文件名**：`tsc` 每个源恰好产出一个 `.js` ＋一个 `.d.ts`，故断言「打包集合＝源集合的映射」。
+> ⛔ **本轮否决 copy-then-pack（唯一貌似合理的替代），且是实测否决不是嫌麻烦**：
+> 它在副本里从 `src/` 重建，**根本读不到交付物**——`lib/` 删空／`lib/index.js` 截成 0 字节／
+> `lib/` 整个不存在，**三种情况全部打出 59 条目的完整 tarball、`apply` 被 `prepare` 原样重建回来**。
+> 它还引入**手工维护的拷贝清单＝第二份真相**：给 `files` 加 `assets/**/*.json` 后，
+> 真实树打出 **60 条目含该文件**，副本打出 **59 条目、缺该文件**（详见本轮一节）。
+> 🟡 **残留缺口，明说不粉饰**：`--ignore-scripts` 打的是 `lib/` 的**当前**内容，
+> 故**陈旧的 `lib/` 会被发出去**。实测 `echo "// STALE_DIVERGENCE" >> lib/index.js`
+> ⇒ 该字节**出现在 tarball 里**（`src/` 中为 0）。新鲜度由**测试之前的构建**保证
+> （`npm run verify` ＝ `tsc && node --test`；`scripts/release.sh` 先 verify 后 pack），
+> **不由这个 flag 保证**——注释里已按此措辞写死。
+> ⛔ **不要再引用本页待办 1 的「≈11% 偶发失败」**：**今天没能复现**。
+> 本 agent HEAD 上 **6/6 全绿**（lead 14/14、审查 10/10 HEAD ＋ 10/10 修复版）。
+> **本轮的正当性完全不建立在 flake 频率上**，而建立在两条**确定性**读数上：
+> 坏交付物照样全绿、变异体被抹掉。窗口小的原因也已测明：本机 `tsc` 是
+> **原生 Go 7.0.2、约 0.08–0.21s**，不是 devDependencies 里那个 JS `typescript@^5.9.3`。
+> 测试 309 → **309 / 0 fail**（**未增删测试文件**，只在既有那一条测试里加断言）。
+> **每次工作结束时更新本页**，它是新会话的唯一入口。
+>
+> ⬇️ 以下 2026-09-05 一节及更早各节仍然有效（**其待办 1 由本轮结项**，v11 库不可被
+> 0.4.13 及更早打开的警告同样仍有效）。
+
+---
+
+## 🆕 2026-09-06（**未发版**，仍为 v0.4.17）：唯一读交付物的测试，读的是它自己刚重建的那份
+
+**本轮结项 2026-09-05 待办 1（`prepare: tsc` × `npm pack` × 并发 `node --test` 竞态）。**
+
+### 判据：不是「偶发红」，是**这个测试不可能红**
+
+上一轮把它记成**并发竞态**（别的文件读到写了一半的 `lib/`），那是**真的，但只是第二严重的后果**。
+更严重的是：`prepare` 在 pack 之前把 `lib/` **从 `src/` 重建**，于是
+**`package.test.mjs` 永远在检查一份刚刚被修好的交付物**。
+
+```
+lib/index.js:  export function apply -> apply_BROKEN      （src/ 干净：grep apply_BROKEN src/index.ts = 0）
+ANCHOR:        typeof (await import('./lib/index.js')).apply === 'undefined'   >>> 交付物确实坏了 <<<
+
+HEAD（带 prepare）        ℹ pass 1  ℹ fail 0    跑完 grep apply_BROKEN lib/index.js = 0   >>> 绿，且变异被抹 <<<
+--ignore-scripts         ℹ pass 0  ℹ fail 1    跑完 grep apply_BROKEN lib/index.js = 1   >>> 红，且变异保留 <<<
+```
+
+**同一份坏交付物、同一条测试，差异只可能来自 pack 前跑没跑 `prepare`。**
+
+### 变异实验被静默摧毁（上一轮已记，本轮独立复现并给出正确读法）
+
+```
+echo "// MARK" >> lib/store/group.js ; node --test "test/package.test.mjs" ; grep -c MARK lib/store/group.js
+HEAD:  before=1  after=0      （lead 7/7；本 agent 独立复现 1/1）
+修复后：before=1  after=1      （全量跑 3/3 保留，且 3 次均 309/309/0）
+```
+
+⚠️ **这条断言的边界必须说清，不可夸大**：lead 用本仓文档记载的 MD3 语义变异实测，
+suite 仍读 `309/289/20`——**故它不可靠地把语义变异变成假绿**。
+**正确说法是：变异状态被静默、非确定性地摧毁，因此任何「变异存活 ⇒ 无人守此处」的推论都不成立。**
+
+### ⛔ 证伪本页待办 1 的「≈11% 偶发失败」（原文保留在下方，勿改）
+
+| 待办 1 宣称 | 实测 |
+|---|---|
+| 18 跑 2 次失败 ≈ **11%** | ⛔ **今天未复现**。本 agent HEAD **6/6 全绿**；lead 14/14；审查 HEAD 10/10 ＋ 修复版 10/10 |
+| 机理是并发竞态 | ✅ **成立，但不完整**——它漏掉了「坏交付物照样全绿」这个**确定性**后果 |
+
+窗口为何这么小，审查已测明：本机 `tsc` 是**原生 Go 7.0.2**（`tsc -v` 实测，`npm run build` **0.21s**），
+不是 devDependencies 声明的 JS `typescript@^5.9.3`——重写 `lib/` 的时间窗口小到难以撞上。
+**本轮不据 flake 频率立论**，只据上面两条确定性读数。
+
+### 修法：一个 flag
+
+```js
+const output = run('npm', ['pack', '--ignore-scripts', '--pack-destination', staging], packageRoot)
+```
+
+### ⛔ copy-then-pack：**实测否决**，勿再提议（它在happy path 上看起来完全正确）
+
+把包拷到临时目录、在副本里带 scripts 打包——**最像样的替代方案，而且是空转的**：
+它在副本里从 `src/` 重建，**永远读不到真实树的交付物**。
+
+| 破坏真实交付物的方式 | copy-then-pack 读数 | 打出的 tarball |
+|---|---|---|
+| `lib/` 整个删除 | **RC=0，59 条目** | `apply` 被 `prepare` 重建回来（grep = 1） |
+| `lib/index.js` 截成 0 字节 | **RC=0，59 条目** | 同上，grep = 1 |
+| `lib/` 不存在（全缺） | **RC=0，59 条目** | 同上，grep = 1 |
+
+（审查独立测得同型：三种情况该测试全部 `pass 1 fail 0 skipped 0`。）
+
+**第二重问题：拷贝清单是第二份真相，会烂。** 给 `files` 加 `assets/**/*.json` 并新增该文件后：
+
+```
+真实树 npm pack  -> 60 条目，assets/thing.json 计数 = 1
+副本   npm pack  -> 59 条目，assets/thing.json 计数 = 0   >>> 新发的文件静默漏发 <<<
+```
+
+⚠️ **取数陷阱（本轮踩到，记下来）**：第一次跑这个对照时两边都读 `0`，
+差点被记成「无差异」——实为 `--pack-destination` 指向的目录不存在，**两次 pack 都失败了**，
+那两个 `0` 什么也没测量。**pack 的 RC 必须先看**。
+
+### 🆕 修正案 A：`files` 是通配符，测试丢进 `lib/` 的临时文件**会被发给用户**
+
+`lib/**/*.js` 不区分「编译产物」和「某个测试三秒前写进去的探针」。**四个写入点**：
+
+```
+test/guidance.test.mjs:50        lib/tools.guardprobe-${pid}.js
+test/layers.test.mjs:~3687       lib/constants.ceiling-probe.${uuid}.js
+test/pipeline-e2e.test.mjs:~391  lib/constants.extract-probe.${uuid}.js
+test/pipeline-e2e.test.mjs:~457  lib/constants.guard-probe.${uuid}.js
+```
+
+（审查实测泄漏形态：tarball **63 条目 vs 基线 59**。）
+
+**断言钉的是性质，不是那四个文件名**——「钉被拒的字节串而不是钉属性」是本仓已登记的反模式。
+`tsc` 配置为 `rootDir: src` / `outDir: lib` / `declarationDir: lib/types` 且不产 sourcemap，
+故**每个源恰好产出一个 `.js` ＋一个 `.d.ts`**（实测 28 源 ↔ 28 `.js` ↔ 28 `.d.ts`，`diff` 双向为空）。
+断言即：**打包集合 ＝ 源集合的映射**，双向。
+
+**空转验证（去掉前提必须翻红）——四个写入点形状逐一实测**：
+
+| 打进 `lib/` 的探针 | pack 条目数 | 读数 |
+|---|---|---|
+| `tools.guardprobe-12345.js` | 60 | **`pass 0 fail 1`**，点名该文件 |
+| `constants.ceiling-probe.aaaa-bbbb.js` | 60 | **`pass 0 fail 1`** |
+| `constants.extract-probe.cccc-dddd.js` | 60 | **`pass 0 fail 1`** |
+| `constants.guard-probe.eeee-ffff.js` | 60 | **`pass 0 fail 1`** |
+| **不打探针（对照）** | 59 | **`pass 1 fail 0 skipped 0`** |
+
+**反方向也守**（这是顺带查出来的，不是设计意图）：
+
+```
+删掉 src/metrics.ts（lib/metrics.js 残留，tsc 从不清理陈旧产物）
+  -> pass 0 fail 1   actual: [ 'lib/metrics.js', 'lib/types/metrics.d.ts' ]
+新增 src/newmod-probe.ts 而不重新构建
+  -> pass 0 fail 1   actual: [ 'lib/newmod-probe.js', 'lib/types/newmod-probe.d.ts' ]
+```
+
+⚠️ **第一版断言消息只写了「探针即将被发给用户」，被上面「孤儿产物」那次实测证明是错的**——
+同一条断言有两个成因，消息只说一个就是在对下一个 agent 说半句假话，已改写为两个成因都点名。
+
+**误报风险实测**（不是推理）：新增一个**只含 type 的** `src/typeonly-probe.ts`，
+`tsc` 仍产出 11 字节的 `lib/typeonly-probe.js` ＋ `.d.ts` ⇒ **`pass 1 fail 0`，不误报**。
+
+**数据源选择**：用 `tar -tzf` 的真实 tarball 清单，而**不是** `npm pack --dry-run --json`。
+理由是实测二者等价（`LC_ALL=C` 下 `diff` 输出 0 行、各 59 条），**既然等价就取更下游那个**——
+tarball 是真正发出去的东西，dry-run 只是对它的预测。
+⚠️ 顺带记一个取数陷阱：不设 `LC_ALL=C` 时这个 `diff` 会因**排序规则**报出 4 行假差异。
+
+### 🟡 残留缺口：`--ignore-scripts` 不保证新鲜度（明写，不粉饰）
+
+```
+echo "// STALE_DIVERGENCE" >> lib/index.js   （src/index.ts 中计数 = 0）
+npm pack --ignore-scripts
+tar -xzO ... package/lib/index.js | grep -c STALE_DIVERGENCE  ->  1   >>> 陈旧字节确实发出去了 <<<
+```
+
+修正案 A 的「缺失」方向**挡不住这个**：它比的是**文件名**，不是内容——
+名字齐全但内容陈旧的 `lib/` 照样通过。**这一点在测试注释里也是这么写的，没有写成「保证新鲜」。**
+现有缓解：`npm run verify` ＝ `tsc && node --test`（构建先于测试）、
+`scripts/release.sh` 先 `npm run verify` 再 `npm pack`。**ADR 0012 教训 6 复核：
+新失效模式（发陈旧字节，需先手工改坏 `lib/` 且绕开 verify）不比原缺陷
+（唯一的交付物守卫恒绿 ＋ 变异实验被摧毁）更坏。**
+
+### 硬约束复验（本轮实测，非引用）
+
+| 约束 | 结果 |
+|---|---|
+| 全量基线 | ✅ **309/309/0**，独立 3 跑（19.44s／19.37s／19.59s）＋ 定稿后第 4 跑 |
+| 交付物字节零变化 | ✅ 改前／改后 tarball **sha256 全等** `4901c38b…`，`diff -r` **exit 0**，**59 文件** |
+| 产品代码未动 | ✅ `git status --short` 仅 `M packages/memory/test/package.test.mjs` |
+| 工作树可构建 | ✅ `npm run build` **exit 0**；`lib/` 无残留探针（计数 0）；无残留变异标记（grep 计数 0） |
+| 变异体存活 | ✅ 全量跑 **3/3** `MARK_SURVIVAL` 保留（HEAD 上 7/7 被回退） |
+| `lib/` 缺失被点名 | ✅ **/tmp 副本上**删掉 `lib/` ⇒ `pass 0 fail 1`，报 `/package\/lib\/index\.js/` |
+| 未增删测试 | ✅ 仍 309，只在既有那一条测试内加断言 |
+
+### 本轮登记的待办
+
+| # | 事项 | 现状（实测 2026-09-06） | 处置判据 |
+|---|---|---|---|
+| 1 | 🟢 **四个 `lib/` 写入点：发版面已全守，工作树面未守** | 修正案 A 一条性质断言覆盖 **4/4 写入点**（上表）。但它守的是**「不许发出去」**，不是**「不许写进 `lib/`」**：这**三个文件的四个写入点**仍然往交付物目录里写文件，只是撞上 `package.test.mjs` 才会被发现。⛔ **判别式是「打包那一刻文件在不在」，不是「谁先谁后」**（QA 指出、lead 独立复现）：探针在整个 pack 期间存在 ⇒ **2/2 打进 tarball，60 条目**；而真实探针寿命约 **0.1s**、pack 约 **0.23–0.3s**，故这是一个**时间窗**——它既可能漏掉泄漏（lead 注入实验 0/5 未命中），也可能把并发写入的探针打进包里变成**假红**（QA 实测命中）。**两种失效都存在，措辞不可只写一种** | **登记而不修**。**明确记下这是「一条规则两个面，只守住一个」**：真正的修法是让探针写到 `lib/` **之外**（`group.test.mjs:1476` 已经是这么做的——它把副本放在 `lib-guard-probe-*` **同级目录**，实测 `npm pack --dry-run` **不打包**它，59 条目不变）。判据：下次动这**三个文件的四个写入点**时，改用同级目录而不是 `lib/` 内 |
+| 2 | 🟡 **`--ignore-scripts` 的陈旧交付物缺口** | 见上，实测陈旧字节进 tarball | **登记而不修**。修法候选：在 `package.test.mjs` 里比对 `lib/*.js` 与 `src/*.ts` 的 mtime，或直接跑一次 `tsc --noEmit` 之外的产物比对。**未做的理由：会把「测试读交付物」重新变成「测试自己造交付物」，正是本轮否决的形状** |
+| 3 | 🟢 **`makeRepo()` 的外层 `tempRoot()` 从不清理**（沿用上一轮待办 3） | `/tmp` 现存 **31.8 万** 个 `strataloom-test-*`（上一轮 29.6 万，**仍在增长**） | **登记而不修**。⚠️ 取数陷阱不变：必须 `ls -U /tmp \| grep -c`，`ls -d /tmp/strataloom-test-*` 会因 argv 溢出**静默返回 0** |
+
+> **⛔ 结项并部分作废 2026-09-05 待办 1（原文保留在下方，勿改）**：
+> 机理描述**正确但不完整**——它只登记了「并发竞态导致偶发红」，
+> 漏掉了**更严重且确定性**的那一半：**唯一读交付物的测试对坏交付物恒绿**。
+> 其「≈11%」的频率读数**今天不可复现**（本 agent 6/6、lead 14/14、审查 20/20 全绿），
+> **它当时是真读数，但把一个确定性失效面记成了概率事件**，
+> 从而使「等它再红一次再说」成了看似合理的拖延理由。
+> 其列出的三个修法候选中，`npm pack --ignore-scripts` 即本轮采用者；
+> **「先 `tsc` 到临时目录再打包」经实测否决**（见上 copy-then-pack 一节）。
+
+---
+
 > 最后更新：2026-09-05 · **本轮不发版，版本仍为 v0.4.17**（判据见本节末）：
 > **一次测试失败会被伪装成一次超时**。
 > 装载 memory 插件为活 fiber 的测试形如「`boot()` → 断言 → 尾部 `await shutdown()`」，
