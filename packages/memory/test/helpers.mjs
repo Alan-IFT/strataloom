@@ -5,14 +5,62 @@
  * model-facing string in this plugin must pass.
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
+import { after } from 'node:test'
 import { StoreRegistry } from '../lib/store/store.js'
 
 const quiet = { warn() {}, info() {}, error() {}, debug() {} }
 
-export const tempRoot = () => mkdtempSync(join(tmpdir(), 'strataloom-test-'))
+// ----------------------------------------------------- temp root ledger ----
+
+/**
+ * Roots handed out by `tempRoot()` that nothing has deleted yet, and every
+ * root it has EVER handed out. `live` drives the sweep; `created` drives the
+ * guard, which must still see a root after `cleanup()` forgot it (see below).
+ */
+const live = new Set()
+const created = new Set()
+
+/**
+ * ⛔ THE DISCRIMINANT IS "IS THE OUTER HANDLE RETAINED OR DISCARDED", NOT
+ * "DOES THE TEST CLEAN UP".
+ *
+ * `mkdtempSync` returns the ONLY handle to the directory it just made. Call
+ * sites of the shape `join(tempRoot(), 'repo')` or `cwd: tempRoot()` keep the
+ * inner path or pass the value straight through, and the outer
+ * `/tmp/strataloom-test-XXXXXX` name is never bound to anything — so no
+ * `cleanup()` written at that call site CAN name it. The failure is not
+ * negligence at the call site; it is unreachability.
+ *
+ * That is why cleaning up is not the discriminant: `store.test.mjs` calls
+ * `tempRoot()` 20 times and leaks 0, because it writes `const root =
+ * tempRoot()` and later `cleanup(root)` — the handle is retained. Measured at
+ * HEAD, per file, `node --test <file>` with a sorted-snapshot `comm -13` diff
+ * of `/tmp`:
+ *
+ * ```
+ * group=102  layers=83  service=11  e2e=7  inject=6  command=2
+ * auto-extract=2   (the other 9 test files: 0)           sum = 213
+ * ```
+ * (16 test files, 7 of them leak, so 9 leak nothing: guidance, jobs,
+ * lifecycle, package, pipeline, pipeline-e2e, repo-key, resilience, store.)
+ * and the full suite leaks exactly 213 per run, deterministic across three
+ * independent runs, always 309 pass / 0 fail. At a measured mean of 43.4
+ * inodes per leaked root that is ~9,270 inodes per run, and `/tmp` is on the
+ * same filesystem as `/`, so it grows without bound against the machine's
+ * global inode budget.
+ *
+ * The fix is to retain the handle HERE, at the single acquisition point,
+ * instead of asking 15 call sites to retain something they never received.
+ */
+export const tempRoot = () => {
+  const dir = mkdtempSync(join(tmpdir(), 'strataloom-test-'))
+  live.add(dir)
+  created.add(dir)
+  return dir
+}
 
 export const cleanup = (dir) => {
   try {
@@ -20,7 +68,347 @@ export const cleanup = (dir) => {
   } catch {
     // best effort
   }
+  // Drop it from the sweep set, NOT from `created`: the guard below must still
+  // check this path on disk. `cleanup()` is best-effort and swallows its own
+  // failure, so "cleanup was called" is not evidence the directory is gone.
+  live.delete(dir)
 }
+
+/**
+ * The late sweep. It only ADDS a last resort — it moves no existing
+ * `cleanup(root)` call, and every one of them still runs exactly where it runs
+ * today.
+ *
+ * ⛔ WHY `node:test`'s FILE-LEVEL `after()` AND NOT `process.on('exit')` —
+ * AND THE TWO ARE NOT ORDERED. `after()` IS NOT A SUPERSET OF `exit`.
+ * An earlier draft of this comment said an `exit` handler "does cover
+ * assertion failure, uncaught exception and an explicit `process.exit()`",
+ * which is true of `exit` but, sitting under this heading, invited the reader
+ * to conclude `after()` is at least as good everywhere. It is not. Full
+ * matrix, two helpers differing ONLY in the teardown mechanism, three
+ * independent runs per cell under a private TMPDIR, reported as rc/leak:
+ *
+ * ```
+ * failure mode                       after()      process.on('exit')
+ * assertion failure                  1/0          1/0
+ * RC=124 hang (live 30s interval)    124/0  <==   124/1
+ * uncaught async rejection           1/0          1/0
+ * process.exit() mid-test            1/1     ==>  1/0
+ * SIGTERM mid-test                   1/1          1/1
+ * SIGKILL mid-test                   137/1        137/1
+ * ```
+ * They TRADE wins. `after()` runs when the file's tests finish, so it fires
+ * before a stuck process is killed — that is the RC=124 row. `process.exit()`
+ * tears the process down without ever finishing the tests, so the `after()`
+ * hook never runs — that is the row `after()` loses.
+ *
+ * `after()` is still the right choice here, and the reason is a property of
+ * THIS repository rather than a general ranking: the RC=124 hang is a
+ * documented, actually-observed shape in this test suite, whereas
+ * `process.exit()` does not occur in this package at all. Verified, not
+ * assumed — the only hit in the whole package is this very comment:
+ * ```
+ * grep -rn 'process\.exit' packages/memory/{src,lib,test}
+ *   -> test/helpers.mjs: (this comment)     and nothing else
+ * ```
+ * If someone later introduces `process.exit()` into a test or into `src/`,
+ * this trade-off flips and this comment must be revisited.
+ *
+ * ⛔ WHAT THIS STILL LEAKS, STATED HONESTLY — THREE MODES, NOT ONE.
+ * Measured above, each leaks exactly 1 (the root held by the running test):
+ *   - SIGKILL mid-test (rc=137) — irreducible; no in-process handler can beat
+ *     it, and neither mechanism does.
+ *   - SIGTERM mid-test (rc=1) — BOTH mechanisms leak; `node --test` does not
+ *     drain file-level `after()` hooks on the signal path.
+ *   - `process.exit()` mid-test — `after()` leaks 1 where an `exit` handler
+ *     would not; accepted only because this package contains no such call.
+ * This sweep closes the deterministic 213-per-run leak and the RC=124 hang. It
+ * does NOT promise total coverage, and it is not a superset of the mechanism
+ * it replaces.
+ *
+ * ⛔ THE DELETION PREDICATE IS IDENTITY, NEVER A PATTERN. Only values
+ * `mkdtempSync` returned in THIS process are deleted. It never scans `/tmp`,
+ * never globs, never prefix-matches `strataloom-test-*` — that is exactly what
+ * would delete a CONCURRENT run's live directories. `node --test` runs one
+ * process per file, so this Set is naturally isolated to one file's roots.
+ */
+after(() => {
+  for (const dir of live) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // best effort; the guard below reports whatever survives
+    }
+  }
+  live.clear()
+})
+
+/**
+ * The regression guard, registered automatically beside the sweep.
+ *
+ * ⛔ IT IS AN `after()` HOOK, NOT A `test()`. File-level `after()` hooks —
+ * including the sweep above — run AFTER every test in the file. A guard
+ * written as a `test()` therefore observes the state BEFORE the sweep and goes
+ * RED on correctly-fixed code. Measured on a two-module probe: hooks run FIFO
+ * in registration order ACROSS modules, so the helper's sweep (registered at
+ * import) runs first and this guard reads post-sweep state:
+ * `HELPER SWEEP, size=1` then `GUARD after, size=0`, 1 pass / 0 fail.
+ *
+ * ⛔ IT ASKS THE DISK, NOT THE SET. Asserting `live.size === 0` measures only
+ * that the sweep ran its loop, and a sweep that clears the set without
+ * deleting anything passes it. Measured on the probe with a deliberately
+ * broken `live.clear()`-only sweep:
+ *
+ * ```
+ * broken sweep, `live.size` guard   -> pass 1 / fail 0   (guard fooled)
+ * broken sweep, on-disk guard       -> pass 1 / fail 1   (guard fires)
+ * missing sweep, either guard       -> pass 1 / fail 1
+ * correct sweep, either guard       -> pass 1 / fail 0
+ * ```
+ * So the guard checks `existsSync` on every root ever handed out. That is why
+ * `cleanup()` removes a root from `live` but leaves it in `created`.
+ *
+ * ⛔ IT IS REGISTERED HERE, NOT ONE LINE PER TEST FILE. This repo already
+ * registers "one rule, N execution points, only some guarded" as its recurring
+ * defect ("e2e probes: three files, three implementations"). A per-file line
+ * is a per-file line somebody can forget, and it needs a completeness grep to
+ * police it. Registering in the module that OWNS the acquisition point makes
+ * the guard unmissable by construction: a file can only leak a
+ * `strataloom-test-` root by calling `tempRoot()`, calling it requires
+ * importing this module, and importing this module registers both hooks.
+ * There is no enumeration to keep in sync — 11 execution points collapse to 1.
+ *
+ * ⛔ AND A PER-FILE LINE WOULD ALREADY BE INCOMPLETE, which is measured, not
+ * predicted. `tempRoot()` is not the only acquisition path a test file uses:
+ * `openRegistry()` below calls it internally, and three files (`jobs`,
+ * `pipeline`, `pipeline-e2e`) use `openRegistry` while never writing the word
+ * `tempRoot`. The natural completeness grep for a per-file guard —
+ * `grep -l 'tempRoot' test/*.test.mjs` — does not list them, so it would have
+ * certified a file set that omits a real acquisition path. Probed directly
+ * with a scratch test that calls only `openRegistry()`, with the sweep
+ * disabled: `pass 1 / fail 1`, `zz-probe.test.mjs leaked 1 temp root(s)`. The
+ * helper-registered guard covers it; a `tempRoot`-keyed enumeration would not.
+ *
+ * The completeness criterion for THIS design is that no test file may reach
+ * `mkdtempSync` for a `strataloom-test-` root except through here:
+ * ```
+ * grep -l 'strataloom-test-' test/*.test.mjs   # must print nothing
+ * ```
+ * Note that "grep -c mkdtempSync test/*.mjs must be 1" is NOT the criterion and
+ * is NOT true of this tree: `package.test.mjs` calls `mkdtempSync` directly for
+ * a `strataloom-pack-` staging dir, retains that handle, removes it itself, and
+ * leaks 0 (measured). It is a correct call site, not an unfixed one.
+ *
+ * A passing hook is not a test and does not change the reported test count
+ * (measured: 309 before, 309 after). A FAILING hook is reported as an extra
+ * failing item, which is the point: with the sweep deliberately disabled the
+ * suite reported `tests 316 / pass 309 / fail 7` — the same 309 passes, plus
+ * one failure for each of the seven leaking files, with counts 102, 83, 11, 7,
+ * 6, 2, 2 that sum to the measured 213.
+ *
+ * ⛔ THE MESSAGE NAMES THE TEST FILE AND CAPS THE LIST, because the first draft
+ * did neither and both were measured to hurt. `node --test` attributes a
+ * helper-registered hook failure to the file the hook was REGISTERED in, so
+ * every one of those seven failures printed as
+ * `✖ .../test/helpers.mjs` — seven identical labels, none naming the file that
+ * actually leaked. `process.argv[1]` is the file under test, so the message
+ * carries it. And the `group.test.mjs` failure dumped 102 absolute paths into
+ * the diff, burying the number that matters; the count is what a reader acts
+ * on, so the list is truncated to the first few as a sample.
+ */
+const GUARD_SAMPLE = 5
+
+/**
+ * THE GUARD'S PREDICATE, named so the self-check below can exercise the very
+ * function the guard calls. Inlining it would leave the self-check testing a
+ * copy of the rule instead of the rule.
+ */
+const leakedRoots = () => [...created].filter((dir) => existsSync(dir))
+
+after(() => {
+  const survivors = leakedRoots()
+  if (survivors.length === 0) return
+  const where = process.argv[1] ? basename(process.argv[1]) : 'this file'
+  const sample = survivors.slice(0, GUARD_SAMPLE).join(', ')
+  const more = survivors.length > GUARD_SAMPLE ? `, ... (+${survivors.length - GUARD_SAMPLE} more)` : ''
+  assert.fail(
+    `${where} leaked ${survivors.length} temp root(s) under ${tmpdir()}: ${sample}${more}. ` +
+      'Each was created by tempRoot() and still exists after the sweep in test/helpers.mjs.',
+  )
+})
+
+/**
+ * THE GUARD'S OWN NEGATIVE CONTROL — a third `after()` hook that proves, on
+ * every single test file, that the guard above is still CAPABLE of firing.
+ *
+ * ⛔ WHY THIS EXISTS: TWO MUTATIONS SURVIVED THE SUITE FULLY GREEN.
+ * Code review mutated the shipped helper and measured 309/309/0, rc=0, delta=0
+ * for BOTH — the fix kept working, and the guard went permanently deaf:
+ *
+ * ```
+ * D2  delete `created.add(dir)` from tempRoot()          309 pass / 0 fail   SURVIVED
+ * D3  guard reads `[...live]` instead of the disk        309 pass / 0 fail   SURVIVED
+ * ```
+ * (Both independently re-measured here under a private TMPDIR before writing
+ * this hook.) Neither breaks the sweep, so nothing goes red; they only destroy
+ * the DETECTOR. A guard whose failure mode is silence needs a control.
+ *
+ * ⛔ WHY IT IS AN END-TO-END NEGATIVE CONTROL AND NOT A LEDGER-SHAPE ASSERTION.
+ * Review proposed
+ * `if (created.size > 0 && [...created].every((d) => live.has(d))) assert.fail(...)`
+ * and explicitly asked whether it kills both. MEASURED: IT KILLS NEITHER —
+ * it never fires on anything, including correct code:
+ *
+ * ```
+ * candidate + correct helper   309 pass / 0 fail       (does not fire)
+ * candidate + D2               309 pass / 0 fail       SURVIVED
+ * candidate + D3               309 pass / 0 fail       SURVIVED
+ * ```
+ * The reason is structural: hooks are FIFO, so the sweep has already run
+ * `live.clear()` by the time any later hook looks. `live` is therefore ALWAYS
+ * empty here, so `every((d) => live.has(d))` is false whenever `created` is
+ * non-empty, and the `created.size > 0` term short-circuits when it is empty.
+ * The predicate is unsatisfiable in both directions — a dead assertion. It was
+ * offered as an untested candidate and it is recorded here as falsified.
+ *
+ * What both mutations actually break is the same thing: THE GUARD CAN NO
+ * LONGER SEE A ROOT THAT IS REALLY ON DISK. So this control asserts exactly
+ * that capability, by construction rather than by inspection:
+ *
+ *   A. make a real directory through `tempRoot()` — the acquisition point the
+ *      guard trusts — and assert `leakedRoots()` reports it;
+ *   B. remove it from `live` WITHOUT deleting it, and assert `leakedRoots()`
+ *      STILL reports it;
+ *   C. delete it for real and assert `leakedRoots()` goes quiet.
+ *
+ * ⛔ STEP B IS THE WHOLE POINT, AND THE COMMENT THAT USED TO STAND HERE WAS
+ * FALSE. THE FALSIFIED TEXT IS KEPT VERBATIM, PER HOUSE RULE:
+ *
+ *     "D3 (predicate = live) -> STEP 3 PASSES ... STEP 4 fires instead: after
+ *      the rmSync the probe is still in `live`. ... So step 4 is not merely a
+ *      symmetry nicety — it is the ONLY step that catches a predicate reading
+ *      the wrong ledger."
+ *
+ * That is wrong, and it was a FABRICATED REASON FOR A REAL ASSERTION — the
+ * repository's signature defect, caught here for the fourth time (three times
+ * by review, once by me). What went wrong is worth stating exactly, because it
+ * is a measurement error, not a typo:
+ *
+ * I mutated the predicate to a bare `[...live]`, DROPPING the `existsSync`
+ * filter, and that mutant does die at the old step 4. But the realistic
+ * mutant keeps the filter — `[...live].filter((d) => existsSync(d))` — and
+ * that one SURVIVED the old control completely. Both readings are real; they
+ * are simply different mutants, and I generalised from the weaker one:
+ *
+ * ```
+ * predicate = [...live]                            -> rc=1  fail 14   (dies)
+ * predicate = [...live].filter(d => existsSync(d)) -> rc=0  309/0     SURVIVED
+ * ```
+ * The old step 4 CANNOT distinguish them, and that is arithmetic rather than
+ * opinion: it ran after `rmSync(probe)`, so `existsSync(probe)` is false, so
+ * BOTH predicates filter the probe out and BOTH pass. Isolated:
+ *
+ * ```
+ * old step3   good=true  bad=true      <- both pass, no discrimination
+ * old step4   good=true  bad=true      <- both pass, no discrimination
+ * step B      good=true  bad=FALSE     <- separates them
+ * ```
+ * Step A cannot catch it either: right after `tempRoot()` the probe is in
+ * `live` AND in `created` AND on disk, so every predicate reports it.
+ *
+ * The ONLY state in which reading `live` differs from reading `created` is
+ * "on disk, but already removed from `live`" — which is precisely the state
+ * `cleanup()` creates, and precisely the state a broken sweep leaves behind.
+ * Step B constructs that state deliberately. This shape was proposed by
+ * review as an unverified candidate; it is used here because it measured red
+ * on the surviving mutant, not because it was suggested.
+ *
+ * ⛔ WHICH OF A/B/C ARE ACTUALLY LOAD-BEARING — MEASURED, AND ONLY ONE IS.
+ * Do not read the three steps as three independent guards; that is exactly the
+ * kind of overclaim this comment was rewritten to stop making. Dropping each
+ * step and re-running the mutant it supposedly catches:
+ *
+ * ```
+ * drop STEP B, apply D3 -> rc=0  309/0    SURVIVES  => B is load-bearing
+ * drop STEP A, apply D2 -> rc=1  fail 14  still dies => A is not the only catch
+ * drop STEP C, predicate that never filters by existsSync
+ *                       -> rc=1  fail 14  still dies => C is not the only catch
+ * ```
+ * With step A removed, D2 is still caught — by step B, which also requires the
+ * probe to be reported. With step C removed, a predicate that never filters is
+ * still caught, but by the MAIN GUARD above rather than by this control: it
+ * reports the file's own cleaned-up roots and fails with "...leaked 2 temp
+ * root(s)...". So step C has no mutant of its own in this suite.
+ *
+ * A and C are kept anyway, and the honest reason is DIAGNOSIS, NOT DETECTION:
+ * they split one "the detector is broken" failure into three distinct
+ * messages, so a reader learns which property broke instead of bisecting. They
+ * cost one mkdir and one rmdir. If a later round enforces one-assertion-one-
+ * mutant, STEP B is the one that may not be deleted.
+ *
+ * The 14 failures are one per test file that imports this module
+ * (`grep -l "from './helpers.mjs'" test/*.test.mjs` = 14), which is the
+ * intended blast radius: the detector is broken everywhere at once.
+ *
+ * ⛔ FULL MUTANT MATRIX AGAINST THIS CONTROL — every row re-measured after the
+ * step-B rewrite, each under its own private TMPDIR, each with the mutation
+ * verified to have LANDED (the earlier round reported a row that had been
+ * applied to a stale code shape, which is how the false claim above survived):
+ *
+ * ```
+ * correct code                                        rc=0  309/0     leak 0
+ * D2  drop `created.add(dir)`                         rc=1  fail 14   leak 0    "gone deaf"
+ * D3  predicate [...live].filter(existsSync)          rc=1  fail 14   leak 0    "wrong ledger"
+ * C1  drop `created.add` + sweep returns early        rc=1  fail 14   leak 213  "gone deaf"
+ * C2  sweep clear-only + predicate [...live].filter   rc=1  fail 14   leak 213  "wrong ledger"
+ * ```
+ * C1 and C2 still leak 213 under the mutant because their sweep really is
+ * broken; what this control changes is that the suite now SAYS SO instead of
+ * reporting a clean 309/309/0.
+ *
+ * It runs LAST (FIFO) and leaves the ledger exactly as it found it, so it
+ * cannot make the guard above fire. It costs one mkdir + one rmdir per file.
+ */
+after(() => {
+  const probe = tempRoot()
+  try {
+    // STEP A — the predicate sees a root that is registered and on disk.
+    assert.ok(
+      leakedRoots().includes(probe),
+      'the temp-root guard has gone deaf: a directory that exists on disk and was handed out by ' +
+        'tempRoot() is NOT reported by the guard predicate. Check that tempRoot() still records ' +
+        'into `created` — without that record the guard can never report anything.',
+    )
+    // STEP B — THE DISCRIMINATING STATE: still on disk, but no longer in
+    // `live`. This is exactly what `cleanup()` produces, and it is the ONLY
+    // state in which reading `live` differs from reading `created`.
+    live.delete(probe)
+    assert.ok(
+      leakedRoots().includes(probe),
+      'the temp-root guard reads the wrong ledger: a directory that is STILL ON DISK stopped ' +
+        'being reported as soon as it left the `live` set. `live` is emptied by cleanup() and by ' +
+        'the sweep, so a predicate built on it goes silent precisely when a real leak survives ' +
+        'a broken sweep. The predicate must filter `created` by existsSync, not `live`.',
+    )
+    // STEP C — and it stops reporting once the directory is really gone, so it
+    // cannot fire on correct code.
+    rmSync(probe, { recursive: true, force: true })
+    assert.ok(
+      !leakedRoots().includes(probe),
+      'the temp-root guard reports a directory that is no longer on disk, so it cannot ' +
+        'distinguish a leak from a cleaned-up root and would fire on correct code.',
+    )
+  } finally {
+    // Leave no trace: this control must not itself become a leak, and must not
+    // leave the probe in `created` where the guard above would see it.
+    rmSync(probe, { recursive: true, force: true })
+    live.delete(probe)
+    created.delete(probe)
+  }
+})
+
+/** The roots this process created that are still on disk. Exported for diagnosis. */
+export const survivingRoots = () => leakedRoots()
 
 /** Open a registry over a temp root; returns { root, registry }. */
 export const openRegistry = () => {
