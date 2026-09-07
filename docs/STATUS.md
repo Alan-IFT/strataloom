@@ -1,6 +1,58 @@
 # 当前状态
 
-> 🆕 **最后更新：2026-09-07（第五节，已发版 **v0.5.1**）：A4 已落地，320 → 324 全绿。**
+> 🆕 **最后更新：2026-09-07（第六节，已发版 **v0.5.2**）：B4-b 被打回，改做 B4-b′，324 → 325 全绿。**
+> **ADR 0015 第 4 步完成**（形态与原裁定不同，见下）。走完整五步。
+> ⛔ **原方案（新增 `rejected` 状态值）被方案审查打回，主 agent 独立复现确认**：
+> 只往 `MEMORY_STATUSES` 加一个值、其余一字不改 ⇒ **`BUILD_EXIT=0`（tsc 零信号）**，
+> 而真实生产库副本 `INSERT status='rejected'` **REFUSED**、新建库 **ACCEPTED**。
+> 存量库的 reconcile 一执行 `drop` 就 CHECK 失败，而 drop 在单事务里（D6）⇒
+> **整批候选连坐回滚 → 烧光重试 → dead-letter**。
+> 根因：**SQLite 无法就地扩宽 CHECK**，每次枚举扩展都是一次 `rebuildMemories` 全表重建，
+> 而 `evidence.memory_id` 是 `ON DELETE CASCADE`。**这是 ADR 0015 教训 6 的精确重演**
+> ——教训 6 讲触发器 SQL，**CHECK 是同一持久化边界上更硬的一个**（触发器可 DROP+CREATE，CHECK 只能重建整表）。
+> 且**存量 66 行改写与 schema 迁移绑死**（新状态写不进旧 CHECK），
+> 所以「改写用户真实记忆库」在这里**无法被单独确认**——这一条本身就否掉了原形态。
+> ✅ **一处正面证据：B4-a 的表驱动测试按设计生效**——加入新状态后 `recall exclusion table` 变红并报出
+> `+ 'recall-rejected'`。它的注释写的正是「a status added to the enum with no thought given to
+> recall lands here as a failure instead of passing unnoticed」——**兑现了**。
+> ⚠️ **但没有任何测试抓住 schema 分叉**：`CHECK constraints enforce the domain enums` 只测
+> 「非法值被拒」，**不测「合法值集合等于枚举」**——唯一能抓住它的测试恰好不问那个问题。
+> ⭐ **改做 B4-b′（零迁移）修掉唯一已证实的真实损害**：全仓需要区分 A/B 类的代码**只有 1 处**
+> ——`metrics.ts` 的 `overturnRate`。它声明用途是 `continuous trust (real misjudgements)`，
+> 实现却把「系统正确拒收噪声」（健康信号）计入「误判」（故障信号）：
+> **pooled 0.179 → 0.086，虚高 2.08×**（2.27× / 2.04× / 1.41×，六库无变化）。
+> ⛔ **失败方向最坏：系统 drop 掉越多噪声（越健康），这个「误判率」读数越高。**
+> **主 agent 那次误判是它的人类版本**——ADR 0015 §零第 2 条登记的「把 13 条 A 类当成被收敛掉的偏好」，
+> 和 `overturnRate` 犯的是同一个错误，**一个在人脑里，一个固化在代码里且每周期输出错误的数**。
+> ✅ 谓词 `status='superseded' AND superseded_by IS NULL` **穷尽且不过宽**（7 条 `SET status` 语句逐条判定，
+> B 类两条写路径都在**同一条 UPDATE** 里写状态与指针，不存在半成品）；
+> `archived` 无需加项是**结构性**的——全包只有 1 个写入点，且它是必写指针那条 UPDATE 的实参。
+> ✅ 新测试 fixture 由**真实 `runReconcileJob`** 产出，三种实现给出三个不同的数（0.6 / 0.5 / 0.333）；
+> **分子分母双向锁死**（只改一半即变红）。
+> ⛔ **我又犯了两处「单库读数当全样本」**（本轮第 2、3 次，ADR 0014 开篇明令禁止的同型）：
+> 把 B 类 `procedure:13` 写成全是 `superseded`（实测 12 条是 `archived`）；
+> 把 A 类寿命写成「11–41 秒」（那是单库单 kind 读数，实测 max **9318 秒**、12/66 超过 41 秒）。
+> 🆕 **下一轮真实待办 B4-c：`retrievedRate` 有完全同型的缺陷**（已实测）——
+> 分母 `byStatus('active')` **含 derived 行**，而 derived 行几乎从不进分子，
+> 实测 `3e857510` 0.818→1.000、`ec2636fc` 0.762→1.000、`edf7a686` 0.800→1.000。
+> **失败方向同样最坏：派生层建得越多（系统越努力），「召回信噪比」读数越低**，而这个数正是 §12 用来决定 dormant/decay 的。
+> ⚠️ **成因要按返工的复核为准，不是代码审查说的那个**：审查称「usage 只记 raw 行」，
+> **实测证伪**——`queryRecallRows` **不过滤 derived**，derived 行结构上能进 usage；
+> 真正机制是 `usage.memory_id` 的 **`ON DELETE CASCADE`** 叠加 rebuild 每次 `DELETE FROM memories WHERE derived != RAW`，
+> **每次重建清零**。**照审查原文去修只会修掉一半。**
+> 🟡 **顺带登记（未修）**：`propose({replaces})` 无条件写 `superseded`，而 reconcile 有
+> `procedure ? 'archived' : 'superseded'` 分支——**这条规则今天有两个实现且不一致**
+> （实测佐证：那 1 条 `procedure/superseded` 的 provenance 正是 propose 独占的 `principal-explicit`）。
+> ⚠️ **顺序结论**：即便将来要做枚举拆分，也应排在第 5 步**之后**——v13 全表重建会在 9 个生产库上
+> 执行 `DROP TABLE memories`，而**第 5 步重估依赖的正是这些库的历史数据**。
+>
+> **下一步**：ADR 0015 第 5 步 **重估 C4/C5b/C2**（注意：该库 derived 层当前为空，重估须在层存在时进行）。
+>
+> ⬇️ 以下 2026-09-07（第五节）及更早各节仍然有效。
+
+---
+
+> **2026-09-07（第五节，已发版 **v0.5.1**）：A4 已落地，320 → 324 全绿。**
 > **ADR 0015 第 3 步完成**，走完整五步（方案审查 → 执行 → 代码审查 → 返工）。
 > **净删 1 行代码**（`reconcile.ts` 的 `oldRow.kind !== 'preference' &&`），
 > 提示词由**按 kind**改为**按关系**陈述：判据是**可满足性**（「能不能同时遵守这两条」而非语义相似），
