@@ -1,8 +1,13 @@
 /**
  * Batch reconcile job (spec §3.4/§5.2): one extract's whole candidate batch,
- * one LLM call, one commit. Decisions per kind: fact — fresh evidence wins
- * (old superseded); procedure — versioned (old archived); preference — both
- * stay. The job decides keep/drop/replace only; content is the extract's.
+ * one LLM call, one commit. The job decides keep/drop/replace only; content is
+ * the extract's.
+ *
+ * Whether a candidate replaces an existing memory is decided by their
+ * RELATION, not by their kind — the prompt asks whether both could be followed
+ * at once. Kind survives in exactly one place downstream: a replaced
+ * `procedure` becomes `archived` rather than `superseded`, because the old
+ * sequence still describes what used to work.
  * @module @strataloom/dsh-memory/pipeline/reconcile
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -177,13 +182,53 @@ export const runReconcileJob = async (
           .get(decision.supersedes) as
           | { kind: MemoryKind; status: string; derived: number }
           | undefined
-        // Three rules, stated so a new kind inherits one rather than needing a
-        // branch: a `preference` is never superseded (only the user resolves
-        // conflicting preferences, spec §3.4); a DERIVED target is not a
-        // memory to supersede at all (it is a generated restatement of rows
-        // already in this list, and `forget`/`share` refuse one by name for the
-        // same reason); and a vanished or inactive target degrades to plain
-        // activation — durable state outranks the reply.
+        // TWO eligibility rules, stated so a new kind inherits both rather than
+        // needing a branch. Neither asks what KIND the target is: a DERIVED
+        // target is not a memory to supersede at all (it is a generated
+        // restatement of rows already in this list, and `forget`/`share` refuse
+        // one by name for the same reason); and a vanished or inactive target
+        // degrades to plain activation — durable state outranks the reply.
+        //
+        // WHAT IS NOT HERE, AND WHY. A third clause `oldRow.kind !==
+        // 'preference'` used to stand between these two, so a supersede
+        // decision naming a preference silently degraded to activation. It was
+        // removed (A4) because it made the code answer a SEMANTIC question —
+        // "is this new wording a replacement or a rival?" — with a syntactic
+        // one, and it answered wrong by construction. Measured across the nine
+        // stores on this machine before the removal: `preference` 57 rows with
+        // `superseded_by` non-null in 0 of them, against 593 non-preference
+        // rows with 49 hits. A structural zero, not a rate.
+        //
+        // Those same 49 pointers also settle what the removed clause implied
+        // about kind generally: 45 join rows of the SAME kind and 4 cross it
+        // (`procedure -> coding` ×3, `procedure -> fact` ×1). So kind was never
+        // a fence around supersede — this pipeline had already crossed it four
+        // times, and only `preference` was walled off. The cross-kind cases all
+        // carry pipeline provenance rather than the `principal-explicit` that
+        // `propose({replaces})` writes, so they came through here, not by hand.
+        //
+        // The model was not failing to SEE the duplicates. One store holds 13
+        // `preference` rows in status `superseded`, every one of them with
+        // `superseded_by IS NULL` and a lifetime of 11-41 seconds between
+        // `created_at` and `updated_at` — i.e. each was a CANDIDATE the model
+        // chose to drop, never an active row that was replaced. The model
+        // recognised the restatement 13 times and had only two outcomes
+        // available: discard the new wording, or store a second copy beside the
+        // old one. "Replace the old with the new" was the outcome the code
+        // withheld.
+        //
+        // This is not a safety rule being relaxed. `service.propose({replaces})`
+        // supersedes with `WHERE id = ? AND status = 'active' AND derived =
+        // RAW` and NO kind clause, so an explicit save has always been able to
+        // supersede a preference. The removal makes the two writers agree
+        // instead of leaving the guarantee true on one path and false on the
+        // other.
+        //
+        // The judgement itself now lives entirely in `reconcileSystemPrompt`,
+        // which asks whether both memories could be FOLLOWED AT ONCE (a
+        // contradiction keeps both; a restatement replaces) and breaks a tie
+        // toward "activate". Code cannot decide that question, and the branch
+        // it replaced only looked like it could.
         //
         // The `derived` clause is an eligibility test, NOT a second copy of the
         // v11 `guard_derived_status` trigger. The trigger states an INVARIANT —
@@ -220,11 +265,7 @@ export const runReconcileJob = async (
         // row leaving 'active', pointing at a row entering 'active' from
         // 'candidate', and nothing ever transitions back INTO 'candidate'.
         // Every id is written at most once, so the graph cannot close a loop.
-        if (
-          oldRow?.status === 'active' &&
-          oldRow.kind !== 'preference' &&
-          oldRow.derived === LAYER.RAW
-        ) {
+        if (oldRow?.status === 'active' && oldRow.derived === LAYER.RAW) {
           supersedeOld.run(
             oldRow.kind === 'procedure' ? 'archived' : 'superseded',
             candidate.id,

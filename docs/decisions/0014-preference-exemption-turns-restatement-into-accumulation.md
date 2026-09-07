@@ -273,8 +273,17 @@ preference 写入 29 条 ⇒ 3.11 条/天，其中 24 条属同一族
 
 与 ADR 0010 §五同型，且更直接——**测试正在锁定这个行为**：
 
-1. `prompts.ts` 的规则被提示词测试锁定为「never supersede a preference」；
-2. `reconcile.ts:222` 的 `kind !== 'preference'` 分支有单元测试覆盖；
+1. ⛔ **本条为假，已于 2026-09-07 实测证伪，原文保留**：这里原写
+   「`prompts.ts` 的规则被提示词测试锁定为『never supersede a preference』」。
+   **把整条 preference 规则从提示词里删掉，`npm run verify` 仍 320/320 全绿**
+   （编译退出码 0，测试确实执行）。全仓唯一的提示词断言是
+   `pipeline.test.mjs` 的 `assert.equal(seen.system, reconcileSystemPrompt())`
+   ——**函数和它自己比，恒真**，对内容零约束。
+   **提示词那一半处于零防护状态**，不是被锁定。
+   > 这是本 ADR 教训 5「没变红与没跑长得很像」的第三个变体：
+   > 前两次是**没跑**（编译失败）与**没执行到**（游走退化），
+   > 这次是**没人在看**——断言存在、会跑、永远为真。
+2. `reconcile.ts` 的 `kind !== 'preference'` 分支确有单元测试覆盖（属实）。
 3. **没有任何测试断言「同一条偏好复述 N 次后，库里该有几条」**——两个端点
    各自被覆盖，中间的乘积无人测量。
 

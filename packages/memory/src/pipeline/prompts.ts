@@ -32,8 +32,13 @@ import { kindGuidance, MEMORY_KINDS } from '../types.ts'
  * v2: the extract input became a JSON object (`{"events":[{seq,label,text}]}`)
  * instead of joined `[seq N] <label>: <text>` lines, so the contract for where
  * `sourceSeqs` come from changed with it.
+ *
+ * v3: the reconcile rules stopped being indexed BY KIND and became indexed by
+ * the RELATION between a candidate and an existing memory. The decision a
+ * given input yields genuinely changes: a restated preference used to be told
+ * to keep both copies and is now told to supersede.
  */
-export const PROMPT_VERSION = 2
+export const PROMPT_VERSION = 3
 
 /** Current job payload schema version. */
 export const PAYLOAD_VERSION = 1
@@ -77,20 +82,42 @@ Rules:
  * Reconcile: dedupe/conflict/absorb one extract batch against existing
  * active memories (spec §3.4). The model decides per candidate:
  * activate / drop / supersede an existing id.
+ *
+ * The rules are stated as RELATIONS rather than per kind, so a kind added to
+ * `MEMORY_KINDS` inherits them instead of arriving unmentioned and defaulting
+ * to whatever the list's last line happens to say.
+ *
+ * The discriminating question is SATISFIABILITY — could both memories be
+ * followed at the same time? — rather than textual similarity, because the two
+ * inputs this must tell apart look alike: a rephrasing of a rule and a reversal
+ * of it are both "the same topic, different words".
+ *
+ * The tie-break leans to "activate" because the two errors do not cost the
+ * same. Mistaking a contradiction for a restatement deletes a rule the user
+ * still holds; mistaking a restatement for a contradiction leaves one redundant
+ * line in a context packet. Only the first is unrecoverable in the sense that
+ * matters, and even it is recoverable by hand — `superseded_by` keeps the
+ * pointer and the old row keeps its own words and evidence.
  */
 export const reconcileSystemPrompt = (): string =>
   `You reconcile candidate memories against existing active memories of the same repository.
 
 Return STRICT JSON: {"decisions":[{"candidateIndex":number,"action":"activate"|"drop"|"supersede","supersedes"?:string}]}
 
-Rules (by kind):
-- exact/near duplicates of an existing memory => "drop";
-- fact conflicting with an older fact and carrying fresher evidence =>
-  "supersede" with the existing memory id in "supersedes";
-- procedure that replaces an older procedure => "supersede" (versioning);
-- preference conflicting with an existing preference => "activate" BOTH stay
-  (the user resolves preferences; never supersede a preference);
+Rules (by RELATION to an existing memory, not by kind — a new kind inherits these):
+- adds nothing an existing memory does not already say => "drop";
+- restates or refines an existing memory — the SAME rule in better or fuller
+  wording, such that following ONLY the new one loses nothing => "supersede"
+  with the existing memory id in "supersedes";
+- CONTRADICTS an existing memory — following BOTH at once is impossible, or the
+  user changed their mind, or each applies in a different situation => "activate";
+  both stay, and only the user resolves a contradiction;
 - otherwise useful and new => "activate";
+- the test between the last two is whether both could be followed at the same
+  time, NOT how similar the wording looks;
+- when genuinely torn between "supersede" and "activate", choose "activate":
+  one entry too many costs a line of context, while replacing a rule the user
+  still wants loses their intent;
 - every candidateIndex from the input MUST appear exactly once;
 - output the JSON object only — no markdown fence, no commentary.`
 

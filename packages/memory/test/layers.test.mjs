@@ -23,6 +23,7 @@ import { GLOBAL_STORE_KEY } from '../lib/store/store.js'
 import { captureTurn, readTurn, pruneConversations } from '../lib/store/conversations.js'
 import { collectTurnEvents, QUOTE_LABEL, QUOTE_SEQ } from '../lib/transcript.js'
 import { runExtractJob } from '../lib/pipeline/extract.js'
+import { runReconcileJob } from '../lib/pipeline/reconcile.js'
 import {
   buildContextProvider,
   countEntries,
@@ -294,9 +295,20 @@ const textStream = (text) => ({
  * @param sessionId - the session the memory will cite.
  * @param entries - raw session events for turn 1.
  * @param sourceSeqs - the seqs the scripted model cites.
+ * @param candidate - what the scripted extract model returns. Defaults to the
+ *   `fact` the drill-down tests below have always used; the supersede test
+ *   overrides it to reach a `preference`, so both travel this one writer
+ *   instead of the second one a copy would create.
  * @returns the store, the memory id, and the excerpt bytes as stored.
  */
-const memoryWithExcerpt = async (service, principal, sessionId, entries, sourceSeqs) => {
+const memoryWithExcerpt = async (
+  service,
+  principal,
+  sessionId,
+  entries,
+  sourceSeqs,
+  candidate = { title: 'cited memory', body: 'cited body', kind: 'fact' },
+) => {
   const store = service.storeFor(principal, true)
   store.tx(() => captureTurn(store, sessionId, 1, collectTurnEvents(turnEvents(1, entries), 1)))
   const payload = {
@@ -308,9 +320,7 @@ const memoryWithExcerpt = async (service, principal, sessionId, entries, sourceS
     payloadVersion: 1,
   }
   enqueueJob(store, 'extract', `e-${sessionId}`, payload, 0)
-  const reply = JSON.stringify({
-    candidates: [{ title: 'cited memory', body: 'cited body', kind: 'fact', sourceSeqs }],
-  })
+  const reply = JSON.stringify({ candidates: [{ ...candidate, sourceSeqs }] })
   const ctx = fakeCtx({ services: { llm: { stream: () => textStream(reply) } } })
   const now = Date.now()
   await runExtractJob(
@@ -413,6 +423,101 @@ test('sourceOf marks a quote as a quote, and conversation as conversation', asyn
     fallbackTurns[0].label,
     'an auditor can separate evidence from context using only what was returned',
   )
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * A SUPERSEDED MEMORY IS STILL RECOVERABLE — the premise A4 rests on.
+ *
+ * A4 lets reconcile supersede a `preference`, and deliberately adds NO code
+ * safety net for a model that gets the call wrong. That decision is only
+ * defensible if a wrong call is repairable by a human, so this asserts the
+ * three things repair needs, against the real writers:
+ *
+ *   1. the retired row still says exactly what it said — `supersede` writes
+ *      `status` and `superseded_by`, never `title` or `body`;
+ *   2. its evidence survives, so it is still possible to see WHERE it came
+ *      from rather than merely that it existed;
+ *   3. `sourceOf` still answers for it — a superseded row is not a forgotten
+ *      one, and only `tombstone` disappears (D5).
+ *
+ * arXiv 2605.12978 states the design rule as "consolidate without overwriting
+ * the evidence". This is that sentence turned into something that can fail:
+ * every byte compared here was written by `runExtractJob`, and the comparison
+ * is `equal` on the whole string, not a `match` on a fragment, so a supersede
+ * that rewrote content in passing cannot slip through as "close enough".
+ */
+test('a superseded preference keeps its words and its evidence, and sourceOf still answers', async () => {
+  const { root, registry, principal, service } = setup()
+  const words = 'always answer me in Chinese, and keep code comments in English'
+  const older = { title: 'answer in Chinese', body: words, kind: 'preference' }
+
+  // Round 1: the real extract writer stores the preference, and the reconcile
+  // job it enqueued activates it. Nothing here is hand-INSERTed — the point of
+  // the test is what the production writers leave behind.
+  const { store, id: oldId, excerpt } = await memoryWithExcerpt(
+    service,
+    principal,
+    'sess-pref-1',
+    [userMessageEvent(words)],
+    [2],
+    older,
+  )
+  const runReconcile = async (decision) => {
+    const job = claimNextJob(store, Date.now(), Date.now() + 60_000)
+    assert.equal(job.kind, 'reconcile', 'extract must have enqueued exactly one reconcile')
+    const payload = JSON.parse(job.payload)
+    const ctx = fakeCtx({
+      services: {
+        llm: {
+          stream: () =>
+            textStream(JSON.stringify({ decisions: [{ candidateIndex: 0, ...decision }] })),
+        },
+      },
+    })
+    await runReconcileJob(ctx, store, job, payload, new AbortController().signal)
+  }
+  await runReconcile({ action: 'activate' })
+  const before = store.db.prepare(`SELECT title, body, status FROM memories WHERE id = ?`).get(oldId)
+  assert.equal(before.status, 'active', 'the row really is active before it is superseded')
+
+  // Round 2: a fuller restatement of the SAME rule supersedes it — the A4 path.
+  const { id: newId } = await memoryWithExcerpt(
+    service,
+    principal,
+    'sess-pref-2',
+    [userMessageEvent(`${words}, including in commit messages`)],
+    [2],
+    { ...older, body: `${words}, including in commit messages` },
+  )
+  await runReconcile({ action: 'supersede', supersedes: oldId })
+
+  const after = store.db
+    .prepare(`SELECT title, body, status, superseded_by FROM memories WHERE id = ?`)
+    .get(oldId)
+  assert.equal(after.status, 'superseded')
+  assert.equal(after.superseded_by, newId, 'the retired row names its replacement')
+
+  // (1) CONTENT UNTOUCHED, byte for byte. A supersede that rewrote the old row
+  // in place would leave the same status and the same pointer and pass every
+  // other assertion in this suite.
+  assert.equal(after.title, before.title, 'superseding must not rewrite the old title')
+  assert.equal(after.body, before.body, 'superseding must not rewrite the old body')
+  assert.equal(after.body, words, 'and the words are still the ones the extractor stored')
+
+  // (2) THE EVIDENCE IS STILL THERE, and still the extractor's own bytes.
+  const kept = store.db.prepare(`SELECT excerpt FROM evidence WHERE memory_id = ?`).get(oldId)
+  assert.equal(kept.excerpt, excerpt, 'the cited passage survives the supersede unmodified')
+
+  // (3) AND IT IS REACHABLE THROUGH THE READ PATH A PERSON ACTUALLY USES —
+  // not merely present in a table this test queried directly. That distinction
+  // is ADR 0012's: a row can be intact in SQLite and still unreachable through
+  // `sourceOf`, which is the surface that answers 核对原话.
+  const turns = await service.source(oldId, principal, SOURCE_TURN_LIMIT)
+  assert.equal(turns.length, 1, 'a superseded memory still drills down to its quote')
+  assert.equal(turns[0].label, QUOTE_LABEL)
+  assert.equal(turns[0].text, excerpt, 'returned byte-for-byte, exactly as for an active row')
   registry.dispose()
   cleanup(root)
 })
@@ -1918,12 +2023,40 @@ test('propose surfaces near-duplicates so the model can collapse them', async ()
   assert.equal(second.similar.length, 1)
   assert.equal(second.similar[0].id, first.id)
 
-  // Different kind ⇒ not offered (a fact never supersedes a preference).
+  // `querySimilarRows` filters by kind, so an overlapping title of a DIFFERENT
+  // kind is not offered back. This is about the `similar` list `propose`
+  // RETURNS — a hint the caller may act on with `replaces` — and says nothing
+  // about which rows are eligible to be superseded. Those are different
+  // questions with different answers: `propose({replaces})` has never had a
+  // kind clause, and since A4 neither has reconcile. Cross-kind supersede is
+  // not merely permitted but is what production already does — measured across
+  // the nine stores on this machine, 4 of 49 supersede pointers cross kinds
+  // (`procedure -> coding` ×3, `procedure -> fact` ×1), every one written by
+  // the reconcile pipeline.
+  //
+  // Asserted TWICE because the obvious call is OVER-DETERMINED: omitting
+  // `scope` also sends the row to the repo store instead of the global one, so
+  // an empty `similar` there is equally explained by the two rows never sharing
+  // a store (measured: still empty with the kind filter removed).
   const other = await service.propose(
     { title: 'Chinese docs live in docs/zh', body: 'translations', kind: 'fact' },
     principal,
   )
-  assert.deepEqual(other.similar, [])
+  assert.deepEqual(other.similar, [], 'a row in another store offers nothing back')
+
+  // The same probe with the STORE HELD FIXED: `scope: 'personal'` puts this
+  // `fact` in the very store holding the preferences above, and the title is
+  // copied verbatim from `first`, so kind is the only difference left and the
+  // empty result isolates the filter this comment claims exists.
+  const sameStore = await service.propose(
+    { title: 'reply in Chinese', body: 'translations', kind: 'fact', scope: 'personal' },
+    principal,
+  )
+  assert.deepEqual(
+    sameStore.similar,
+    [],
+    'same store, same words, different kind ⇒ the kind filter is what excludes it',
+  )
   registry.dispose()
   cleanup(root)
 })

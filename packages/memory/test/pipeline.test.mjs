@@ -1375,7 +1375,7 @@ const reconcilePayload = (ids) => ({
   payloadVersion: 1,
 })
 
-test('reconcile: activate/drop/supersede in ONE commit; fact superseded, procedure archived, preference kept', async () => {
+test('reconcile: activate/drop/supersede in ONE commit; fact superseded, procedure archived, preference converged', async () => {
   const { root, registry } = openRegistry()
   const store = registry.open('k1')
   store.tx(() => {
@@ -1384,14 +1384,21 @@ test('reconcile: activate/drop/supersede in ONE commit; fact superseded, procedu
     insertActive(store, 'old-pref', 'preference', 'old preference')
     insertCandidate(store, 'c0', 'fact', 'new fact')
     insertCandidate(store, 'c1', 'procedure', 'new procedure')
-    insertCandidate(store, 'c2', 'preference', 'conflicting preference')
+    // "restated", not "conflicting": the decision below is `supersede`, which
+    // under the A4 prompt is what a RESTATEMENT earns. A true contradiction
+    // would earn `activate` and is covered by its own test.
+    insertCandidate(store, 'c2', 'preference', 'restated preference')
     insertCandidate(store, 'c3', 'fact', 'dup')
   })
   const reply = JSON.stringify({
     decisions: [
       { candidateIndex: 0, action: 'supersede', supersedes: 'old-fact' },
       { candidateIndex: 1, action: 'supersede', supersedes: 'old-proc' },
-      { candidateIndex: 2, action: 'supersede', supersedes: 'old-pref' }, // must degrade: prefs keep both
+      // A4: no kind is exempt from being superseded. A supersede decision on a
+      // `preference` is carried out like any other, and the replaced row takes
+      // the same `superseded` status a `fact` does — only `procedure` differs,
+      // and only in which status it lands in.
+      { candidateIndex: 2, action: 'supersede', supersedes: 'old-pref' },
       { candidateIndex: 3, action: 'drop' },
     ],
   })
@@ -1411,9 +1418,316 @@ test('reconcile: activate/drop/supersede in ONE commit; fact superseded, procedu
   assert.equal(status('c1'), 'active')
   assert.equal(status('old-proc'), 'archived') // procedure versioning
   assert.equal(status('c2'), 'active')
-  assert.equal(status('old-pref'), 'active') // both stay
+  assert.equal(status('old-pref'), 'superseded')
+  // The pointer, not just the status: a preference leaves 'active' the same
+  // BITEMPORAL way every other kind does — the old row stays readable and names
+  // its replacement — rather than being overwritten or dropped on the floor.
+  // Before A4 this decision degraded to plain activation and both rows stayed
+  // active, which is why the assertion above changed with it.
+  assert.equal(
+    store.db.prepare(`SELECT superseded_by FROM memories WHERE id = 'old-pref'`).get().superseded_by,
+    'c2',
+  )
   assert.equal(status('c3'), 'superseded') // drop
   assert.equal(store.db.prepare(`SELECT state FROM jobs WHERE id = 'r1'`).get().state, 'done')
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * THE ARITHMETIC OF CONVERGENCE — what N repetitions of one preference leave
+ * behind.
+ *
+ * ADR 0014 §7 names the gap this fills: the suite asserted what ONE reconcile
+ * does to ONE row, and what the store looks like at rest, but nothing asserted
+ * the PRODUCT — how many rows the same preference, restated N times, leaves in
+ * the store. Both endpoints were covered and the multiplication between them
+ * was measured by no one. Production answered it instead: 12 restatements of
+ * one preference, 12 active rows, an injection packet of 9 entries with 8 from
+ * that one family and not a single `procedure` or `fact`.
+ *
+ * WHY THIS IS NOT A STUB ASSERTING ITSELF. The stub decides only what a MODEL
+ * decides — "this candidate restates that existing id" — and it is not even
+ * told which id that is: it reads the `existing` window out of the prompt the
+ * job actually built, exactly as a model would. What is asserted is nothing the
+ * stub says. It is the store's STEADY-STATE CARDINALITY after the same input is
+ * applied twelve times: one active row, eleven superseded, every one of them
+ * carrying a pointer, no cycles, and the survivor being the NEWEST wording
+ * rather than the oldest. Before A4 the identical stub and the identical twelve
+ * rounds left twelve active rows — the ratchet ran the other way — so the
+ * number this pins is a property of the code under test, not of the fixture.
+ *
+ * THE BYSTANDER IS A NEGATIVE CONTROL, and it is load-bearing. "One active row"
+ * is satisfied just as well by convergence that is too EAGER — an
+ * implementation that, having superseded its target, swept every other active
+ * `preference` along with it would leave one active row too, and every
+ * assertion below about cardinality, pointers and the chain would still hold.
+ * The unrelated preference distinguishes the two: it is never named by any
+ * decision, so nothing in a correct run may touch it. Measured: an
+ * over-convergent mutant that adds a same-kind sweep beside `supersedeOld`
+ * compiles clean and passes the whole suite at 324/324 WITHOUT this control,
+ * and is caught by it.
+ */
+test('reconcile: N restatements of ONE preference converge to ONE active row', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  const ROUNDS = 12
+
+  // An unrelated preference, active before the first round and belonging to no
+  // family being converged. It shares `kind` with the twelve — that is the
+  // point, since the failure it guards against is indexed by kind — but shares
+  // no wording, so the stub below can tell them apart the way a model would.
+  store.tx(() => insertActive(store, 'pref-bystander', 'preference', 'use tabs, not spaces'))
+
+  // The model's side, and ONLY the model's side: given the window the job
+  // built, name the existing preference this candidate restates. Round 1 finds
+  // none and activates; every later round supersedes whatever is active now.
+  // The id is read from the prompt rather than from the test's own bookkeeping,
+  // so a change that stopped offering the row would break this here instead of
+  // silently making the fixture agree with itself.
+  //
+  // It matches on the WORDING shared by the family, which is also what keeps
+  // the bystander out of every decision: it is offered in the same window and
+  // passed over, exactly as a model judging relatedness would pass over it.
+  const ctx = fakeCtx({
+    services: {
+      llm: {
+        stream: (options) => {
+          const sent = JSON.parse(
+            options.messages.map((m) => m.content.map((c) => c.text).join('')).join(''),
+          )
+          const target = sent.existing.find(
+            (row) => row.kind === 'preference' && row.title.startsWith('answer in Chinese'),
+          )
+          return textStream(
+            JSON.stringify({
+              decisions: [
+                target === undefined
+                  ? { candidateIndex: 0, action: 'activate' }
+                  : { candidateIndex: 0, action: 'supersede', supersedes: target.id },
+              ],
+            }),
+          )
+        },
+      },
+    },
+  })
+
+  for (let round = 0; round < ROUNDS; round += 1) {
+    const id = `pref-${round}`
+    store.tx(() => insertCandidate(store, id, 'preference', `answer in Chinese, revision ${round}`))
+    const payload = reconcilePayload([id])
+    enqueueJob(store, 'reconcile', `r-${round}`, payload, 0)
+    await runReconcileJob(ctx, store, claim(store), payload, new AbortController().signal)
+  }
+
+  // The converged family only — the bystander is asserted separately below, and
+  // folding it in here would let its fate hide inside these counts.
+  const rows = store.db
+    .prepare(
+      `SELECT id, status, title, superseded_by FROM memories
+       WHERE kind = 'preference' AND id != 'pref-bystander'`,
+    )
+    .all()
+  assert.equal(rows.length, ROUNDS, 'every restatement was stored — nothing is being hidden')
+
+  // (1) THE CARDINALITY. One rule the user stated twelve ways occupies ONE
+  // slot in the working set, not twelve.
+  const active = rows.filter((row) => row.status === 'active')
+  assert.equal(
+    active.length,
+    1,
+    `${ROUNDS} restatements of one preference must leave ONE active row, not ${ROUNDS}`,
+  )
+
+  // (2) NOTHING WAS DESTROYED TO GET THERE. The other eleven are superseded and
+  // every one names its replacement — a `superseded_by IS NULL` here would mean
+  // the row was discarded rather than replaced, which is precisely the shape
+  // production shows on the unfixed code (13 such rows in the main store).
+  const retired = rows.filter((row) => row.status === 'superseded')
+  assert.equal(retired.length, ROUNDS - 1)
+  assert.equal(
+    retired.filter((row) => row.superseded_by === null).length,
+    0,
+    'a replaced preference must point at what replaced it, not merely leave "active"',
+  )
+
+  // (3) THE CHAIN IS WELL FORMED: no id is claimed by two rows, and following
+  // the pointers terminates. Asserted rather than argued from the code comment
+  // that says it cannot happen.
+  const targets = retired.map((row) => row.superseded_by)
+  assert.equal(new Set(targets).size, targets.length, 'no row may be superseded by two others')
+  const byId = new Map(rows.map((row) => [row.id, row]))
+  let cursor = rows.find((row) => row.id === 'pref-0')
+  for (let steps = 0; cursor?.superseded_by != null; steps += 1) {
+    assert.ok(steps < ROUNDS, 'following superseded_by must terminate — the chain has no cycle')
+    cursor = byId.get(cursor.superseded_by)
+  }
+
+  // (4) THE RATCHET POINTS FORWARD. The survivor is the LAST wording, not the
+  // first: convergence that kept the oldest phrasing would satisfy (1)-(3) and
+  // still be the wrong behaviour, since the user's latest words are the ones
+  // they meant.
+  assert.equal(active[0].id, `pref-${ROUNDS - 1}`)
+  assert.match(active[0].title, /revision 11$/)
+  assert.equal(
+    cursor.id,
+    active[0].id,
+    'the chain from the oldest restatement ends at the one row still active',
+  )
+
+  // (5) THE NEGATIVE CONTROL. Convergence must be SCOPED to the family it was
+  // told about. No decision in any of the twelve rounds ever named this row, so
+  // a correct run leaves it exactly as inserted — still active, still
+  // pointerless, still its own words. This is the assertion that separates
+  // "converged" from "collapsed everything of this kind": an implementation
+  // that swept same-kind rows alongside its actual target satisfies (1)-(4) and
+  // fails only here.
+  const bystander = store.db
+    .prepare(`SELECT status, title, superseded_by FROM memories WHERE id = 'pref-bystander'`)
+    .get()
+  assert.deepEqual(
+    [bystander.status, bystander.superseded_by, bystander.title],
+    ['active', null, 'use tabs, not spaces'],
+    'an unrelated preference must survive the whole convergence untouched — ' +
+      'supersede applies to the row a decision NAMED, never to its kind',
+  )
+  // And stated once more as a count, because that is the form the defect takes:
+  // the working set holds the survivor AND the bystander, two rows, not one.
+  assert.equal(
+    store.db
+      .prepare(`SELECT count(*) AS n FROM memories WHERE kind = 'preference' AND status = 'active'`)
+      .get().n,
+    2,
+    'convergence collapses one family, not the whole kind',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * The `activate` branch's BOOKKEEPING when a decision keeps both rows.
+ *
+ * ⚠️ WHAT THIS IS NOT EVIDENCE OF. It does NOT show that a real contradiction
+ * is recognised as one. The stub returns `activate` because this test told it
+ * to, so the test author is also the classifier: the only thing being checked
+ * is that the code, HAVING BEEN TOLD both memories must stay, keeps both — no
+ * status change on the old row, no pointer written, nothing lost.
+ *
+ * Whether a model tells them apart is a property of `reconcileSystemPrompt` and
+ * the model reading it, and no unit test in this suite can reach it. Recorded
+ * here rather than implied, because a test named for a semantic property it
+ * cannot observe is how the exemption this round removed survived for so long.
+ */
+test('reconcile: an activate decision keeps BOTH rows and writes no pointer', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  store.tx(() => {
+    insertActive(store, 'old-pref', 'preference', 'always use pnpm', { at: 1000 })
+    insertCandidate(store, 'c0', 'preference', 'use npm in this repo — pnpm breaks the native build')
+  })
+  const ctx = fakeCtx({
+    services: {
+      llm: {
+        stream: () =>
+          textStream(JSON.stringify({ decisions: [{ candidateIndex: 0, action: 'activate' }] })),
+      },
+    },
+  })
+  const payload = reconcilePayload(['c0'])
+  enqueueJob(store, 'reconcile', 'r1', payload, 0)
+  await runReconcileJob(ctx, store, claim(store), payload, new AbortController().signal)
+
+  const rows = store.db
+    .prepare(`SELECT id, status, superseded_by FROM memories WHERE kind = 'preference' ORDER BY id`)
+    .all()
+  assert.deepEqual(
+    rows.map((row) => [row.id, row.status, row.superseded_by]),
+    [
+      ['c0', 'active', null],
+      ['old-pref', 'active', null],
+    ],
+    'both stay active and neither points at the other',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
+/**
+ * CROSS-KIND SUPERSEDE READS THE OLD ROW'S KIND, NOT THE CANDIDATE'S.
+ *
+ * `supersedeOld` chooses its status with `oldRow.kind === 'procedure' ?
+ * 'archived' : 'superseded'`, and that expression is the ONLY place kind still
+ * decides anything after A4. Every other reconcile test pairs a candidate with
+ * an existing row of the SAME kind, which makes `oldRow.kind` and
+ * `candidate.kind` indistinguishable: an implementation reading either one
+ * passes all of them. This test is the case that separates them.
+ *
+ * NOT A HYPOTHETICAL. Cross-kind supersede is what the nine production stores
+ * already do, and did before A4: of 49 rows carrying a `superseded_by` pointer,
+ * 45 are same-kind and 4 are cross-kind — `procedure -> coding` three times and
+ * `procedure -> fact` once. All four carry pipeline provenance
+ * (`tool-output`/`parent-agent`), never the `principal-explicit` that
+ * `propose({replaces})` writes, so all four came through THIS function. The
+ * fixture below is the `procedure -> fact` case, reproduced.
+ *
+ * WHAT IT PINS, stated as the two ways the expression can be broken:
+ *   - drop the ternary and always write 'superseded' — the old procedure would
+ *     land in the wrong status, losing the "this sequence used to work"
+ *     distinction `archived` exists to carry;
+ *   - read `candidate.kind` instead of `oldRow.kind` — the candidate here is a
+ *     `fact`, so the old procedure would again land in 'superseded'. That
+ *     mutation survived the full suite at 323/323 before this test existed, and
+ *     it would silently rewrite the three real `procedure -> coding` rows.
+ * Both are caught by the single `archived` assertion, which is why the status
+ * is asserted by value rather than merely as "not active".
+ */
+test('reconcile: a fact superseding a procedure archives it — the status follows the OLD row', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  store.tx(() => {
+    insertActive(store, 'old-proc', 'procedure', 'rebuild with tsc then run node --test')
+    insertCandidate(store, 'c0', 'fact', 'the suite runs against lib/, so a build must precede it')
+  })
+  const ctx = fakeCtx({
+    services: {
+      llm: {
+        stream: () =>
+          textStream(
+            JSON.stringify({
+              decisions: [{ candidateIndex: 0, action: 'supersede', supersedes: 'old-proc' }],
+            }),
+          ),
+      },
+    },
+  })
+  const payload = reconcilePayload(['c0'])
+  enqueueJob(store, 'reconcile', 'r1', payload, 0)
+  await runReconcileJob(ctx, store, claim(store), payload, new AbortController().signal)
+
+  const old = store.db
+    .prepare(`SELECT kind, status, superseded_by FROM memories WHERE id = 'old-proc'`)
+    .get()
+  // The discriminating assertion. The replaced row is a `procedure` and the
+  // replacement is a `fact`: 'archived' can only come from reading the OLD
+  // row's kind, and 'superseded' here would mean the code read the candidate's.
+  assert.equal(
+    old.status,
+    'archived',
+    "a superseded procedure is archived even when its replacement is a fact — the status reads oldRow.kind, not candidate.kind",
+  )
+  assert.equal(old.kind, 'procedure', 'and the old row keeps its own kind — supersede never rewrites it')
+  assert.equal(old.superseded_by, 'c0', 'the archived procedure names the fact that replaced it')
+  assert.equal(
+    store.db.prepare(`SELECT status FROM memories WHERE id = 'c0'`).get().status,
+    'active',
+    'the replacement is active regardless of the kinds involved',
+  )
+  assert.equal(
+    store.db.prepare(`SELECT state FROM jobs WHERE id = 'r1'`).get().state,
+    'done',
+    'a cross-kind supersede settles the job like any other',
+  )
   registry.dispose()
   cleanup(root)
 })
@@ -1768,9 +2082,12 @@ test('reconcile: a supersede naming a derived row degrades instead of destroying
     `the job must settle, not abort into a retry (layer ${layer})`,
   )
   // c0's own decision degraded to plain activation — it named a target that
-  // cannot be superseded, which is the same path a vanished or `preference`
-  // target already took. Its row left 'candidate' mid-job, so `activate`
-  // matched nothing and it stays where the outside write put it.
+  // cannot be superseded, which is the same path a vanished or already-inactive
+  // target takes. Those two and `derived` are the whole list: after A4 no KIND
+  // is ineligible, so a `preference` target no longer degrades here and this
+  // branch is reached only by what the durable state says, never by what the
+  // row is about. Its row left 'candidate' mid-job, so `activate` matched
+  // nothing and it stays where the outside write put it.
   assert.equal(
     store.db.prepare(`SELECT status FROM memories WHERE id = 'c0'`).get().status,
     'tombstone',

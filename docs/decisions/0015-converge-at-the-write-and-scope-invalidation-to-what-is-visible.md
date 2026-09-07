@@ -367,6 +367,81 @@ fencing 表   作业层：job 在调用模型前被 revision 栅栏挡下、烧 
 **A 与 B 必须成对**——已实测：M4（完全不改）下 **A 保持绿、B 变红**。
 过度失效的实现永远不会陈旧，所以 A 单独存在时是假绿。
 
+## 四·七、A4 实施结果（2026-09-07）
+
+**320/320 → 324/324 全绿。** 净删 1 行代码，提示词由**按 kind**改为**按关系**陈述。
+
+### 两条把 A4 重新定性的发现（都推翻了立项时的说法）
+
+1. ⛔ **「preference 永不被 supersede」今天就已经是假话。**
+   `service.ts` 的 `propose({replaces})` 的 UPDATE 谓词是
+   `WHERE id = ? AND status = 'active' AND derived = RAW`——**没有任何 kind 判断**。
+   preference 在那条路径上早已可被 supersede。**所谓不变量只是 reconcile 的局部怪癖**，
+   A4 是**消除两条写路径的不一致**，不是放宽一条安全规则。
+2. ⛔ **kind 对 supersede 从来就没有约束力。** 跨 9 库实测 49 个真实 supersede 指针中
+   **4 个跨 kind**（`procedure → coding` ×3、`procedure → fact` ×1），
+   而旧提示词的两条 supersede 条款字面上都是同 kind 闭合的
+   （"fact conflicting with an older **fact**"、"**procedure** that replaces an older procedure"），
+   `coding` 更是**一次都没被提到**。按 provenance 追查，**4 例全部出自 reconcile 管线**
+   （`tool-output`/`parent-agent`），无一来自 `propose({replaces})`（那条独占 `principal-explicit`）。
+   > **模型早就在按关系判断了，只是规则文本假装它在按 kind 判断。**
+   > A4 之后规则说的和模型做的第一次是同一件事。
+
+### 提示词的两个关键设计
+
+- **判据是可满足性**——「能不能**同时遵守**这两条」，而非语义相似度。
+  把相似度问题换成行为可满足性问题，可执行得多。
+- **平局倒向 `activate`**——代价不对称：把冲突误判成改写 ⇒ 丢失用户意图（严重）；
+  反之只多一条冗余（轻微）。
+
+### 安全论证兑现为可证伪断言
+
+本仓 supersede 是 bitemporal：旧行留存、**内容永不覆写**、`superseded_by` 指向新行、
+`sourceOf` 谓词 `status != 'tombstone'` 故可召回。这正是 arXiv 2605.12978 的
+"consolidate without overwriting the evidence"。**新增用例把它变成断言**：
+被 supersede 的 preference 内容**逐字节相同**、evidence 完好、`sourceOf` 仍返回原文。
+实测变异 M3（supersede 时覆写 title/body）**仅**被这条杀死。
+
+### 三条新测试与它们各自独占杀死的变异
+
+```
+收敛用例（12 轮复述 → active 恒为 1）   杀 M1 撤销 A4、M2 不写指针、M5 反转棘轮
+可恢复性用例（内容逐字节未变）          独占杀 M3 覆写内容
+跨 kind 用例（fact supersede procedure） 独占杀 N2 三元读错行
+既有 ONE-commit 用例（未删除）          独占杀 M4 永远写 superseded
+阴性对照（无关 preference 不受影响）     独占杀 N7 过度收敛
+```
+
+⚠️ **`oldRow.kind === 'procedure' ? 'archived' : 'superseded'` 读的是旧行**，这是对的：
+`archived`（"旧序列仍描述曾经可行的做法"）描述的是**被退休的那一行**，
+取代者是什么 kind 不改变该陈述的真假。**零覆盖的是「读哪一行的 kind」这个维度**
+——旧用例全是同 kind 配对，两种读法恰好同值，故 N2 曾在 323/323 全绿下存活。
+
+### ⛔ 两处「注释为假」之外的新形态：断言空转
+
+`layers.test.mjs` 那条 `// Different kind ⇒ not offered (a fact never supersedes a preference)`
+不仅注释过期，**该断言当时根本测不到 kind 过滤**——它漏了 `scope: 'personal'`，
+两行落在不同的库里，所以**把 kind 过滤整个删掉它依然通过**（已实测）。
+> **过期注释往往伴生一条失效断言。只审注释不够。**
+> 已补一条 store 固定、只有 kind 不同的断言；实测删掉 kind 过滤即变红。
+
+### 明确不做
+
+**不对跨 kind supersede 加任何约束**（代码或提示词）。A4 的全部要点就是删掉一个按 kind
+的判断，删完立刻加回另一个按 kind 的判断是自相矛盾；且跨 kind 在生产中已发生 4 次、
+**零已知损害**（4 例旧行全部完好 `archived`、指针有效、可召回）。
+**给一个没有实证损害的行为新建守卫，就是「为维持重复而新建的机制」。**
+
+### 🟡 如实记录：提示词侧零防护
+
+实测 **M7**（删掉新提示词的整条冲突规则 + 平局条款）→ **323/323 全绿存活**。
+全仓唯一的提示词断言 `assert.equal(seen.system, reconcileSystemPrompt())` 是**自比恒真**。
+**未为此添加断言**——那会制造一条钉住当前措辞的新负债，与本次要拆的东西同型。
+「真冲突会两存」同样无法由单测证明（stub 就是分类器）。
+**这一半的正确性目前只由 code review 与生产观测承担，不伪装成别的东西。**
+观测手段免费可得：`superseded_by IS NOT NULL AND kind='preference'` 今天恒为 0，
+A4 后若异常飙升即为误判信号。
+
 ## 五、遗留与限定
 - 🟡 **C5a 收益无法从历史数据反推**：`memories` 不存历史 status，C 组的近似算出
   105.2% 的荒谬值，**该读数已作废**。其 76.3% → 62.9% 的自我更正同样只是估计。
@@ -375,8 +450,15 @@ fencing 表   作业层：job 在调用模型前被 revision 栅栏挡下、烧 
 - 🟡 **存量清理是独立第二件事**：主库 34 条 preference（9 条 active 同族，
   独占 1350 tok，超过整个正文预算）不会被 A4 追溯收敛。
   **会改写用户真实记忆库，须单独出方案并经用户确认**（ADR 0010 §六先例）。
-- 🟡 **测试会红**：prompt 测试锁定 "never supersede a preference"、
-  `reconcile.ts:222` 分支有单测。**它们钉的是当前实现形状**，按本仓判据处置。
+- 🟡 **测试会红**：`reconcile.ts` 的 `kind !== 'preference'` 分支有单测
+  （`pipeline.test.mjs` 的 `assert.equal(status('old-pref'), 'active') // both stay`）。
+  **它钉的是当前实现形状**，按本仓判据处置——已用两步判据实测闭合：
+  **抽掉它杀伤力不下降**（其余变异 N3/N4/N5 照常变红），
+  **而装上正当修复时它以红拒绝修复**（A4 应用后该用例 40/41 失败）。
+  ⛔ **这里原写「prompt 测试锁定 never supersede a preference」——该句为假，已证伪**：
+  删掉整条提示词规则仍 320/320 全绿；唯一的提示词断言
+  `assert.equal(seen.system, reconcileSystemPrompt())` 是**自比恒真**。
+  **提示词那一半零防护**，详见 ADR 0014 §七的更正。
 - ⚠️ **清单勘误（务必记下）**：Awesome-Agent-Memory 第 9 条 Letta 指向的
   `letta-ai/letta` **现仅为落地页**（README 原文："This repository now serves as
   a landing page"），源码在 `letta-ai/letta-code`。且 `MemTensor/MemOS` 与
@@ -427,7 +509,19 @@ fencing 表   作业层：job 在调用模型前被 revision 栅栏挡下、烧 
    因为它的 900 对**全部由 UPDATE 驱动**。而看起来最粗的随机游走 D9/A，
    是唯一同时发 INSERT/UPDATE/DELETE 的用例。
    **一个断言的覆盖面 = 它实际执行的语句种类，与它的精确度无关。**
-11. **让审计者去证伪自己的推荐方案，比让他论证它更有价值。** 本轮 C 组自行推翻了
+11. ⛔ **「没变红」的第三种形态：没人在看。** 前两次是**没跑**（变异导致 tsc 失败、
+    测试根本没执行）与**没执行到**（随机游走退化，断言对着空集合空转）。
+    这次是**断言存在、会跑、永远为真**——`assert.equal(seen.system, reconcileSystemPrompt())`
+    把函数和它自己比。**我在两篇 ADR 里据此写过「提示词规则被测试锁定」，是假的。**
+12. ⛔ **过期注释往往伴生一条失效断言。** `// a fact never supersedes a preference`
+    不仅描述已被推翻的语义，**它所在的那条断言当时也测不到自己声称的东西**
+    （漏了 `scope`，两行不在同一个库，删掉 kind 过滤依然通过）。
+    **只把注释改准确，会得到「注释正确、断言依然空转」——恰是要根除的那类问题换个形式留下。**
+13. **一条规则「有约束力」与「被写下来」是两回事，可以用数据分辨。** 旧提示词的
+    kind 措辞被模型越过了 4 次（4/49 ≈ 8%），而 `preference` 那条禁令一次都没被越过
+    ——因为**只有它有代码兜底**。**同一份文档里的两条规则，一条是法律一条是建议，
+    区别不在措辞而在有没有执行点。**
+14. **让审计者去证伪自己的推荐方案，比让他论证它更有价值。** 本轮 C 组自行推翻了
    「写期收敛能修好 rollup 覆盖率」（28.6% → 25.0%）和自己 13.4 个百分点的收益估计，
    A 组和 B 组各推翻了主 agent 的一条前提。**四份报告里最有用的部分，
    全都是「我原来说错了」那几段。**
