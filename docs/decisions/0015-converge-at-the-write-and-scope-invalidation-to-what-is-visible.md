@@ -442,6 +442,105 @@ fencing 表   作业层：job 在调用模型前被 revision 栅栏挡下、烧 
 观测手段免费可得：`superseded_by IS NOT NULL AND kind='preference'` 今天恒为 0，
 A4 后若异常飙升即为误判信号。
 
+## 四·八、B4-b 被打回，改做 B4-b′（2026-09-07）
+
+**原方案（新增 `rejected` 状态值拆分 `superseded`）经方案审查打回，主 agent 独立复核确认。**
+
+### ⛔ 决定性证据：新增枚举值会造成静默的 schema 分叉
+
+只往 `MEMORY_STATUSES` 加一个 `'rejected'`、其余一字不改，用**真实生产库副本**实测：
+
+```
+BUILD_EXIT=0                                          ← tsc 零信号
+EXISTING store (5ed2b4d2 副本) uv=12 → INSERT 'rejected': REFUSED: CHECK constraint failed
+FRESH store                    uv=12 → INSERT 'rejected': ACCEPTED
+```
+
+**同为 v12，新库接受、9 个存量库拒收。** 落地后存量库的 reconcile 一执行 `drop` 就 CHECK 失败，
+而 drop 在 `commitClaimedJob` 的单事务里（D6）⇒ **整批候选连坐回滚 → 烧光重试 → dead-letter**。
+
+根因：SQLite 无法扩宽 CHECK，**每次枚举扩展都是一次 `rebuildMemories` 全表重建**，
+而 `evidence.memory_id` 是 `ON DELETE CASCADE`。这是本轮第一个要动 `memories` 表本身的改动——
+**与 C5a 的 trigger-only 迁移风险等级完全不同，而原方案一个字都没提这件事。**
+
+> **这是 ADR 0015 教训 6 的精确重演**：「凡是会进 `sqlite_master` 的字符串，
+> 都必须从唯一常量插值而来……改 `types.ts` 永远改不到已建库，且没有任何编译期信号」。
+> 教训 6 讲的是触发器 SQL，**而 CHECK 是同一持久化边界上更硬的一个**——
+> 触发器可 `DROP+CREATE`，CHECK 只能整表重建。
+
+**且存量 66 行改写与 schema 迁移绑死**（新状态写不进旧 CHECK），
+所以「改写用户真实记忆库」在这里**无法被单独确认**——这一条本身就足以否掉原形态。
+
+### ✅ 一处正面证据：B4-a 的表驱动测试按设计生效了
+
+加入新状态后实测 `tests 324 / pass 321 / fail 3`，其中
+`recall exclusion table` 变红并报出 `+ 'recall-rejected'`——**它遍历 `MEMORY_STATUSES` 建行，
+新状态自动入表，而 `EXCLUDED_STATUSES` 没跟上 ⇒ 被拒候选会出现在 recall 结果里。**
+B4-a 那条测试的注释写的正是「a status added to the enum with no thought given to recall
+lands here as a failure instead of passing unnoticed」——**兑现了。**
+
+⚠️ **但没有任何测试抓住 schema 分叉**：`CHECK constraints enforce the domain enums` 只测
+「非法值被拒」，**不测「合法值集合等于枚举」**——唯一能抓住它的那个测试恰好不问那个问题。
+
+### 我的三处事实错误（审查指出，已复核证实）
+
+```
+①  B 类 kind 分解：我写 {coding:7, fact:30, procedure:13}
+    实测 {coding/superseded:7, fact/superseded:30, procedure/archived:12, procedure/superseded:1}
+    ⇒ procedure 那 13 条里 12 条是 archived。B 类今天已被部分拆分过
+      （reconcile 的 `procedure ? 'archived' : 'superseded'` 早就做了一半）
+②  A 类寿命：我写「11–41 秒」
+    实测 min 8.0s / p50 20.3s / max 9318.5s，且 12/66 超过 41 秒
+    ⇒ 那个区间是单库单 kind（5ed2b4d2 的 13 条 preference）的读数
+③  漏记 propose 路径不写 archived（见下）
+```
+
+> ⛔ **第 ② 条是 ADR 0014 开篇明令禁止、ADR 0015 §四·六刚抓过一次的同型错误**
+> ——**把单库读数当全样本**。同一轮里第二次犯。
+
+### 改做 B4-b′：零迁移，修掉唯一已证实的真实损害
+
+**实测：全仓需要区分 A/B 类的代码位置只有 1 处**——`metrics.ts` 的 `overturnRate`。
+它声明的用途是 `continuous trust (real misjudgements)`，实现却把 66 条
+「系统正确拒收噪声」（健康信号）计入了「误判」（故障信号）：
+
+```
+5ed2b4d2  now=0.232 → fixed=0.102 (rejected=48)
+94394b03  now=0.204 → fixed=0.100 (rejected=17)
+TOTAL     now=0.179 → fixed=0.086  虚高 2.08×
+（口径：由两个大库主导，4 个库为 0——在有实际管线流量的库上虚高约 2.3 倍，流量小的库不显著）
+```
+
+**失败方向最坏：系统 drop 掉越多噪声（越健康），这个「误判率」读数越高。**
+一个把健康读成故障的指标比没有指标更危险。
+
+> **主 agent 那次误判是这个缺陷的人类版本**：ADR 0015 §零第 2 条登记的
+> 「把 13 条 A 类当成被收敛掉的偏好」，和 `overturnRate` 犯的是同一个错误
+> ——**一个发生在人脑里，一个固化在代码里，且代码那个至今每周期输出错误的数。**
+
+**B4-b′ 的形态**：一个具名谓词（`status='superseded' AND superseded_by IS NULL`）单点化 +
+修 `overturnRate` + 补成对断言（N1 退回旧实现须变红、N2 谓词判反须变红）+
+`drop` 语句上方注释说明它不写指针。**零迁移、零新枚举值、不碰 `memories` 表。**
+
+🟡 **诚实的取舍**：这比 CHECK 约束弱——若有人给 drop 写指针，判别力会消失，
+只有 N1/N2 会变红而他可以同时改测试。**比现状强，代价是零迁移。**
+schema 层强制应单独立项，且届时应**一次把 `superseded`/`archived`/`rejected` 三态关系定清**，
+而不是分两次重建表。
+
+### 🟡 顺带登记（本轮不修）：`propose` 与 `reconcile` 对 archived 不一致
+
+`service.ts` 的 `propose({replaces})` **无条件写 `superseded`**，而 `reconcile.ts` 有
+`oldRow.kind === 'procedure' ? 'archived' : 'superseded'`。
+**「procedure 被取代记为 archived」这条规则今天有两个实现且不一致**——
+实测佐证：生产库那 1 条 `procedure/superseded` 的 B 类行 provenance 正是
+`principal-explicit`（propose 独占），其余 12 条 procedure B 类都是 `archived`。
+
+### ⚠️ 顺序结论：即便将来要做枚举拆分，也应排在第 5 步之后
+
+v13 全表重建会在 9 个生产库上执行一次 `DROP TABLE memories`，
+而**第 5 步「重估 C4/C5b/C2」依赖的正是这些库的历史数据**。
+在重估之前动被测对象，与「C5a 必须在 A4 之前因为它改变验证基线」是同一条道理，方向相反。
+
 ## 五、遗留与限定
 - 🟡 **C5a 收益无法从历史数据反推**：`memories` 不存历史 status，C 组的近似算出
   105.2% 的荒谬值，**该读数已作废**。其 76.3% → 62.9% 的自我更正同样只是估计。

@@ -161,6 +161,28 @@ export const runReconcileJob = async (
       `UPDATE memories SET status = 'active', updated_at = ?
        WHERE id = ? AND status = 'candidate'`,
     )
+    // ⚠️ WRITES NO `superseded_by`, AND THAT ABSENCE IS LOAD-BEARING.
+    //
+    // A dropped candidate goes `candidate -> superseded` WITHOUT ever having
+    // been active: nothing replaced it, so there is no id to point at. That
+    // makes the null pointer the only thing distinguishing these rows from the
+    // ones `supersedeOld` below writes, which DID leave 'active' and DO carry a
+    // pointer. `metrics.ts`'s `REJECTED_CANDIDATE_SQL` reads exactly that
+    // difference, so `overturnRate` counts real overturns and not the pipeline
+    // correctly refusing noise — before it did, the metric rose as the system
+    // got healthier (measured across the nine live stores: 2.0-2.3x too high on
+    // the two with real pipeline traffic, 1.4x on a third holding one such row,
+    // and unchanged on the six that hold none).
+    //
+    // So: giving this statement a pointer is not a cosmetic addition. It would
+    // merge the two populations back together and silently restore that
+    // inversion. Stated as a comment rather than a CHECK constraint because
+    // widening the status enum needs a full-table rebuild of `memories` — see
+    // `REJECTED_CANDIDATE_SQL` for why that was rejected. ONE mutation-covered
+    // test in `test/layers.test.mjs` pins the shape ("overturnRate counts
+    // overturned memories…", measured: giving this statement a pointer turns
+    // that one test red and leaves the other 324 green); nothing in the schema
+    // does.
     const drop = store.db.prepare(
       `UPDATE memories SET status = 'superseded', updated_at = ?
        WHERE id = ? AND status = 'candidate'`,

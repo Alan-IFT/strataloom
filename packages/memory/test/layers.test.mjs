@@ -2148,6 +2148,137 @@ test('metrics snapshot reports the §12 trigger indicators from the store', asyn
   cleanup(root)
 })
 
+/**
+ * THE ONE THING `overturnRate` MUST NOT COUNT.
+ *
+ * `metrics.ts` says this field measures "real misjudgements" and §12 spends it
+ * on "should we enable continuous trust". But `status = 'superseded'` is
+ * written by two writers meaning two unrelated things, and only one is an
+ * overturn:
+ *
+ *   A. reconcile's `drop` — a CANDIDATE refused. Never active, never seen by
+ *      any reader, no `superseded_by`. The system working.
+ *   B. reconcile's `supersedeOld` / `propose({replaces})` — a row that WAS
+ *      active and got replaced, always carrying `superseded_by`.
+ *
+ * Counting A made the metric fail in its worst direction: the more noise the
+ * pipeline correctly refused, the higher its own "misjudgement rate" read.
+ *
+ * ⚠️ WHY THIS TEST EXISTS AT ALL. This consumer had NO guard. Measured before
+ * writing it: rewriting `overturnRate` to count B alone left the whole suite at
+ * 324/324 green — the pre-existing metrics test only asserts `> 0 && < 1`, a
+ * band both formulas sit inside. So the fix and its test arrive together, and
+ * the assertions below are pinned to EXACT values for that reason.
+ *
+ * THE FIXTURE IS BUILT BY THE REAL WRITERS. Both populations come out of one
+ * `runReconcileJob` commit — the same statements production runs — rather than
+ * from hand-written INSERTs that would merely restate the shape this test is
+ * supposed to be checking.
+ *
+ * PAIRED ON PURPOSE, because a single assertion here is satisfiable by a wrong
+ * implementation. `0.6` is what the old conflating formula returns and `0.5` is
+ * what an INVERTED predicate (`superseded_by IS NOT NULL`) returns, so the
+ * three formulas give three different numbers on this one fixture and no two
+ * can be confused. Verified as mutations: reverting the formula and inverting
+ * the predicate each turn this test red on its own.
+ */
+test('overturnRate counts overturned memories, never candidates the pipeline refused', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  store.tx(() => {
+    const active = store.db.prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+       VALUES (?, 'fact', 'repo-local', 'active', ?, 'body', 'human', 0, 0)`,
+    )
+    const candidate = store.db.prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+       VALUES (?, 'fact', 'repo-local', 'candidate', ?, 'body', 'human', 0, 0)`,
+    )
+    active.run('keeper', 'untouched fact')
+    active.run('old-fact', 'the fact that gets replaced')
+    candidate.run('c-new', 'the better wording of that fact')
+    candidate.run('c-dup1', 'duplicate one')
+    candidate.run('c-dup2', 'duplicate two')
+  })
+
+  // One real reconcile commit produces one B row and two A rows.
+  const payload = {
+    sessionId: 'sess-overturn',
+    turn: 1,
+    candidateIds: ['c-new', 'c-dup1', 'c-dup2'],
+    provider: 'p',
+    model: 'm',
+    promptVersion: 1,
+    payloadVersion: 1,
+  }
+  enqueueJob(store, 'reconcile', 'r-overturn', payload, 0)
+  const job = claimNextJob(store, Date.now(), Date.now() + 60_000)
+  const ctx = fakeCtx({
+    services: {
+      llm: {
+        stream: () =>
+          textStream(
+            JSON.stringify({
+              decisions: [
+                { candidateIndex: 0, action: 'supersede', supersedes: 'old-fact' },
+                { candidateIndex: 1, action: 'drop' },
+                { candidateIndex: 2, action: 'drop' },
+              ],
+            }),
+          ),
+      },
+    },
+  })
+  await runReconcileJob(ctx, store, job, payload, new AbortController().signal)
+
+  // THE DISCRIMINANT ITSELF, asserted before the metric that rests on it: all
+  // three rows share `status = 'superseded'` and only the pointer tells them
+  // apart. If a future `drop` started writing a pointer, this is the assertion
+  // that says so in words rather than as an unexplained number moving.
+  const row = (id) =>
+    store.db.prepare(`SELECT status, superseded_by FROM memories WHERE id = ?`).get(id)
+  for (const id of ['old-fact', 'c-dup1', 'c-dup2']) {
+    assert.equal(row(id).status, 'superseded', `${id}: all three share one status`)
+  }
+  assert.equal(row('old-fact').superseded_by, 'c-new', 'B: overturned, names its replacement')
+  assert.equal(row('c-dup1').superseded_by, null, 'A: refused candidate, no pointer')
+  assert.equal(row('c-dup2').superseded_by, null, 'A: refused candidate, no pointer')
+
+  const m = collectMetrics(store, Date.now())
+  assert.equal(m.activeCount, 2, 'keeper + the activated replacement')
+
+  // 2 active, 3 superseded (1 overturn + 2 refusals), 0 archived.
+  //   conflated (the defect): (1 + 2) / (2 + 1 + 2)     = 0.6
+  //   inverted predicate:     (3 - 1) / (5 - 1)         = 0.5
+  //   correct:                (3 - 2) / (5 - 2)         = 0.333
+  assert.equal(m.overturnRate, 0.333, 'only the row that was actually overturned counts')
+
+  // Stated as the PROPERTY, so the number above cannot be read as arbitrary:
+  // refusing more noise must never raise the misjudgement rate. Two more
+  // dropped candidates arrive; under the old formula this rises to 0.714.
+  store.tx(() => {
+    store.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, superseded_by)
+         VALUES (?, 'fact', 'repo-local', 'superseded', ?, 'body', 'human', 0, 0, NULL)`,
+      )
+      .run('c-dup3', 'duplicate three')
+    store.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, superseded_by)
+         VALUES (?, 'fact', 'repo-local', 'superseded', ?, 'body', 'human', 0, 0, NULL)`,
+      )
+      .run('c-dup4', 'duplicate four')
+  })
+  assert.equal(
+    collectMetrics(store, Date.now()).overturnRate,
+    0.333,
+    'a healthier store (more noise refused) does not read as more misjudged',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
 test('metrics: the recall miss rate is read from L0, not from a counter', () => {
   // This number prices the deferred retrieval-fusion work. It is computed from
   // the recall tool's own recorded output, so there is no counter to maintain

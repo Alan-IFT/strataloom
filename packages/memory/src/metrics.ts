@@ -36,6 +36,87 @@ const one = (store: OpenStore, sql: string, ...params: unknown[]): number => {
 }
 
 /**
+ * A REJECTED CANDIDATE: a row the pipeline refused to admit, which therefore
+ * was never active and which no reader ever saw.
+ *
+ * `status = 'superseded'` carries two unrelated populations, and only one of
+ * them is an overturn:
+ *
+ *   A. rejected — `runReconcileJob`'s `drop` marks a CANDIDATE `superseded`
+ *      and writes NO pointer. The row went `candidate -> superseded` without
+ *      ever passing through `active`. This is the system correctly refusing
+ *      noise: a HEALTH signal, not a misjudgement.
+ *   B. overturned — a row that WAS active and has been replaced. Both writers
+ *      that produce it write `superseded_by` in the same UPDATE as the status:
+ *      `runReconcileJob`'s `supersedeOld` (`SET status = ?, superseded_by = ?`)
+ *      and `service.propose({replaces})` (`SET status = 'superseded',
+ *      superseded_by = ?`). There is no third writer of either column — grep
+ *      `SET status` across `src/` returns seven `UPDATE memories` statements,
+ *      and only those two set the pointer.
+ *
+ * So the pointer separates them, and nothing else in the row does: kind,
+ * provenance and timestamps are all shared between the two populations.
+ *
+ * WHY THIS IS A PREDICATE AND NOT A STATUS VALUE. Splitting the two with a new
+ * `'rejected'` member of `MEMORY_STATUSES` was implemented and rejected. The
+ * status column carries a CHECK listing the enum, SQLite cannot widen a CHECK
+ * in place, and so a new member only takes effect on stores built AFTER the
+ * change: with the enum widened, a store created fresh at the current head
+ * (`user_version = 12`) ACCEPTS `status = 'rejected'`, while all nine live
+ * stores — which sit at `user_version = 11` and were built before it — REFUSE
+ * it with `CHECK constraint failed: status IN (...)`, and `tsc` reports nothing
+ * either way. Migrating them to 12 does NOT help: `migrateV12` rewrites the
+ * derived-layer invalidation and never touches the status CHECK, so a fresh
+ * v12 store WITHOUT that widening refuses the value exactly as v11 does. The first write to
+ * reach a live store would be reconcile's `drop`, inside the single batch
+ * commit — so one refused candidate would roll back every other candidate in
+ * the batch and burn the job to a dead letter. Making it work needs a full
+ * `rebuildMemories` of the one table `evidence.memory_id` cascades from. This
+ * predicate buys the same distinction with zero migration.
+ *
+ * MEASURED, ACROSS THE NINE LIVE STORES. A and B are a complete, unambiguous
+ * partition of `status IN ('superseded', 'archived')`: 66 A-rows and 50 B-rows
+ * (38 `superseded` + 12 `archived`), with 0 dangling pointers, 0 `active` rows
+ * carrying a pointer, and 0 `tombstone`/`dormant`/`candidate` rows carrying
+ * one.
+ *
+ * WHY `archived` NEEDS NO TERM — a property of the write path, not of the data.
+ * The reading agrees (12 of 12 archived rows carry a pointer), but a reading
+ * only says what happened to be true when it was taken. The structural reason
+ * is stronger: `grep -n "'archived'" src/` shows the whole package has ONE
+ * writer of that status, `reconcile.ts`'s `oldRow.kind === 'procedure' ?
+ * 'archived' : 'superseded'` — and that expression is the FIRST ARGUMENT of
+ * `supersedeOld.run(...)`, whose UPDATE writes `SET status = ?, superseded_by =
+ * ?` unconditionally. Status and pointer are set by one statement in one call,
+ * so an `archived` row without a pointer cannot be constructed at all. No
+ * INSERT writes the status either (the four `INSERT INTO memories` sites write
+ * `'candidate'` or `'active'`), and `decay.ts` writes only `dormant`/`active`.
+ *
+ * That is also why adding an `AND status = 'superseded'`-style archived term to
+ * this predicate is an IDENTITY rather than a tightening: the rows it would
+ * exclude do not exist by construction.
+ *
+ * ⚠️ HONEST LIMIT — THIS IS WEAKER THAN A CONSTRAINT. Nothing in the schema
+ * forbids a future writer from giving `drop` a pointer, and if one did, this
+ * predicate would silently stop discriminating. What stands behind it is the
+ * comment on `drop` itself plus the ONE test that pins the shape
+ * ("overturnRate counts overturned memories…" in `test/layers.test.mjs`,
+ * measured: giving `drop` a pointer turns that test red and leaves the other
+ * 324 green) — and an author who changed the writer could change that test in
+ * the same edit. It is strictly better than the status quo (which conflates the two
+ * populations unconditionally, with nothing recording that it does), and it is
+ * not a barrier anyone is prevented from walking around.
+ *
+ * Deliberately NOT hoisted into `types.ts` beside `MEMORY_STATUSES`. It drives
+ * ONE metric, and a lifecycle constant parked in the shared vocabulary reads as
+ * a rule every read surface should honour — the exact over-claim
+ * `EXCLUDED_STATUSES`'s own comment there warns against. `reconcile.ts` names
+ * this symbol in prose rather than importing it, because the pipeline must not
+ * take a dependency on observability to write a row.
+ */
+export const REJECTED_CANDIDATE_SQL = `status = 'superseded' AND superseded_by IS NULL`
+
+/**
  * Snapshot one store. Every field answers a decision someone actually makes
  * — corpus size drives decay, packet cost drives the derived layer, overturn
  * drives the trust question, and the job fields say whether work is stuck.
@@ -95,6 +176,8 @@ export const collectMetrics = (store: OpenStore, now: number) => {
   const active = byStatus('active')
   const superseded = byStatus('superseded')
   const archived = byStatus('archived')
+  // Excluded from BOTH sides of `overturnRate` below — see the field.
+  const rejected = one(store, `SELECT count(*) AS n FROM memories WHERE ${REJECTED_CANDIDATE_SQL}`)
   const retrieved = one(
     store,
     `SELECT count(*) AS n FROM usage u JOIN memories m ON m.id = u.memory_id
@@ -157,10 +240,49 @@ export const collectMetrics = (store: OpenStore, now: number) => {
     // §六(c) records.
     injectableTokens: packetTokens(injectable),
     retrievedRate: active === 0 ? 0 : Number((retrieved / active).toFixed(3)),
+    // REAL misjudgements — memories that reached a reader and were then
+    // overturned — which is what the §12 trust question asks and what this
+    // module's own header promises ("real misjudgements").
+    //
+    // Rejected candidates (`REJECTED_CANDIDATE_SQL`) leave BOTH sides. They
+    // share the `superseded` status with genuine overturns but nothing else:
+    // they were never active, no reader ever saw them, and dropping one is the
+    // pipeline WORKING. Counting them made the metric fail in its worst
+    // possible direction — the more noise the system correctly refused, the
+    // higher its own "misjudgement rate" read. A number that reports health as
+    // failure is worse than no number, and §12 spends these on "should we
+    // enable X".
+    //
+    // They leave the DENOMINATOR too, not just the numerator. Left below the
+    // line they would still dilute the rate by an amount that varies with how
+    // much noise the extractor happened to emit, which is a different reading
+    // of the same accident rather than a fix.
+    //
+    // Measured across the nine live stores: the inflation is concentrated where
+    // there is real pipeline traffic and absent where there is not. The two
+    // busiest stores read 0.232 -> 0.102 (48 rejected, 2.27x) and 0.204 ->
+    // 0.100 (17 rejected, 2.04x) — 2.0-2.3x too high, quoted as a RANGE because
+    // the two are not the same number. SIX stores hold no rejected candidates
+    // at all and do not move (0.091, 0.059, 0.079, and three at 0.000); the
+    // ninth holds a single one and shifts 0.176 -> 0.125 (1.41x).
+    //
+    // Pooled over all nine the shift is 0.179 -> 0.086, i.e. 2.08x — a POOLED
+    // figure, computed once over the summed populations, not an average of the
+    // per-store ratios and not a rate any single store carries. It is DRIVEN BY
+    // those two stores, which hold 65 of the 66 rejected rows. The honest
+    // statement is "2.0-2.3x too high on the two stores with real pipeline
+    // traffic, not measurably wrong on the six without any"; quoting the 2.08x
+    // as though every store were inflated twofold would be the read-the-whole-
+    // sample-off-the-busiest-store error this comment exists to prevent.
     overturnRate:
-      active + superseded + archived === 0
+      active + superseded + archived - rejected === 0
         ? 0
-        : Number(((superseded + archived) / (active + superseded + archived)).toFixed(3)),
+        : Number(
+            (
+              (superseded + archived - rejected) /
+              (active + superseded + archived - rejected)
+            ).toFixed(3),
+          ),
     pendingJobs: one(store, `SELECT count(*) AS n FROM jobs WHERE state = 'pending'`),
     oldestPendingJobAgeMs: oldestPending.n === null ? 0 : now - oldestPending.n,
     deadLettered: one(store, `SELECT count(*) AS n FROM jobs WHERE state = 'failed'`),
