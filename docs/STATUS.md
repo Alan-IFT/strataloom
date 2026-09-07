@@ -1,6 +1,46 @@
 # 当前状态
 
-> 🆕 **最后更新：2026-09-07（第四节，已发版 **v0.5.0**）：B4-a + C5a 已落地，310 → 320 全绿。**
+> 🆕 **最后更新：2026-09-07（第五节，已发版 **v0.5.1**）：A4 已落地，320 → 324 全绿。**
+> **ADR 0015 第 3 步完成**，走完整五步（方案审查 → 执行 → 代码审查 → 返工）。
+> **净删 1 行代码**（`reconcile.ts` 的 `oldRow.kind !== 'preference' &&`），
+> 提示词由**按 kind**改为**按关系**陈述：判据是**可满足性**（「能不能同时遵守这两条」而非语义相似），
+> **平局倒向 `activate`**（代价不对称：冲突误判为改写会丢失用户意图，反之只多一条冗余）。
+> ⛔ **两条把 A4 重新定性的发现，都推翻了立项时的说法**：
+> ①**「preference 永不被 supersede」今天就已是假话**——`service.ts` 的 `propose({replaces})`
+> 谓词 `WHERE id=? AND status='active' AND derived=RAW` **没有任何 kind 判断**，
+> 那条路径上早就能 supersede preference。**所谓不变量只是 reconcile 的局部怪癖**，
+> A4 是**消除两条写路径的不一致**，不是放宽安全规则。
+> ②**kind 对 supersede 从来没有约束力**——49 个真实 supersede 指针中 **4 个跨 kind**
+> （`procedure→coding` ×3、`procedure→fact` ×1），而旧提示词两条 supersede 条款字面同 kind 闭合、
+> `coding` 一次都没提。按 provenance 追查，**4 例全部出自 reconcile 管线**，无一来自 `propose`。
+> **模型早就在按关系判断，只是规则文本假装它在按 kind 判断。**
+> ✅ **安全论证兑现为断言**：supersede 是 bitemporal（旧行留存、**内容永不覆写**、`sourceOf` 可召回），
+> 新用例断言**逐字节相同**——这正是 arXiv 2605.12978 的 "consolidate without overwriting the evidence"。
+> 变异 M3（覆写 title/body）**仅**被这条杀死。
+> ⛔ **补上一个零覆盖维度**：`oldRow.kind === 'procedure' ? 'archived' : 'superseded'` **读的是旧行**，
+> 而旧用例全是同 kind 配对、两种读法同值，故变异 N2（改读 `candidate.kind`）曾在 **323/323 全绿下存活**；
+> 新增跨 kind 用例（fact supersede procedure）独占杀死它。
+> ⛔ **发现「注释为假」之外的新形态：断言空转**——`layers.test.mjs` 那条
+> `// a fact never supersedes a preference` 不仅注释过期，**该断言当时根本测不到 kind 过滤**
+> （漏了 `scope`，两行不在同一个库，**删掉 kind 过滤依然通过**）。
+> **过期注释往往伴生一条失效断言，只审注释不够。**
+> ⛔ **明确不做**：不对跨 kind supersede 加任何约束——A4 的要点就是删掉一个按 kind 的判断，
+> 删完加回另一个是自相矛盾；且生产中 4 例**零已知损害**。
+> 🟡 **如实记录：提示词侧零防护**。变异 M7（删掉新提示词整条冲突规则+平局条款）→ **323/323 全绿存活**；
+> 唯一的提示词断言 `assert.equal(seen.system, reconcileSystemPrompt())` **自比恒真**。
+> **未为此加断言**（会制造钉住当前措辞的新负债）。「真冲突会两存」同样无法由单测证明（stub 就是分类器）。
+> 观测手段免费可得：`superseded_by IS NOT NULL AND kind='preference'` 今天恒为 0，异常飙升即误判信号。
+> ⚠️ **A4 不改善当前注入包**：它**封顶不缩减**（同族 13 条 active 不会被追溯收敛，而包只装 9 条）。
+> 收益是**止血**（1.63 条/天，30 天避免 49 条）与**棘轮方向反转**（新措辞取代旧措辞，而非早期措辞永久沉淀）。
+> **存量清理是独立第二件事，会改写用户真实记忆库，须单独出方案并经用户确认。**
+>
+> **下一步**：ADR 0015 第 4 步 **B4-b**（拆开 `drop` 与 `supersede` 的状态语义）。
+>
+> ⬇️ 以下 2026-09-07（第四节）及更早各节仍然有效。
+
+---
+
+> **2026-09-07（第四节，已发版 **v0.5.0**）：B4-a + C5a 已落地，310 → 320 全绿。**
 > 走完整五步（方案审查 → 执行 → 代码审查 → 返工 → QA → 返工）。**ADR 0015 的第 1、2 步完成。**
 > **D9 三条触发器加源集合判据**：insert 用 NEW、delete 用 OLD、**update 用 `OLD ∪ NEW`**；
 > `INJECTABLE` 由 `sqlEnum(INJECTABLE_PROVENANCE)` 插值——**触发器文本会被固化进每个库的
