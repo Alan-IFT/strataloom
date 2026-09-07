@@ -2279,6 +2279,162 @@ test('overturnRate counts overturned memories, never candidates the pipeline ref
   cleanup(root)
 })
 
+/**
+ * THE `archived` TERM OF `overturnRate`, WHICH HAD NO GUARD AT ALL.
+ *
+ * ⚠️ WHY THIS TEST EXISTS. `overturnRate` carries `archived` on BOTH sides of
+ * the fraction, and until this test nothing touched it. Measured before writing
+ * it: deleting `archived` from the numerator AND the denominator left the whole
+ * suite exactly at its baseline (327 tests, 320 pass, 6 pre-existing
+ * platform-only failures on Windows) — not one assertion moved. On the nine
+ * live stores that silent deletion drops the twelve `archived` rows that
+ * `metrics.ts` counts under "MEASURED, ACROSS THE NINE LIVE STORES" out of the
+ * trust metric — every one of them a real retirement — because `archived` is
+ * what reconcile writes when the row it replaces is a `procedure`
+ * (`reconcile.ts`'s `oldRow.kind === 'procedure' ? 'archived' : 'superseded'`,
+ * the sole writer of that status in the package).
+ *
+ * SEPARATE FROM "overturnRate counts overturned memories…" ABOVE, DELIBERATELY.
+ * That test's fixture holds ZERO archived rows — it cannot see this term no
+ * matter what is asserted about it — and its `0.333` is a load-bearing payload
+ * that `src/metrics.ts` and `src/pipeline/reconcile.ts` both name in prose.
+ * Widening it in place would have moved that number and falsified two product
+ * comments; it owns the rejected-candidate predicate, this one owns the
+ * archived term.
+ *
+ * THE FIXTURE IS BUILT BY THE REAL WRITERS, for the same reason as above: two
+ * real `runReconcileJob` commits, not hand-written INSERTs that would restate
+ * the shape under test.
+ *
+ * THE THIRD DROPPED CANDIDATE IS NOT PADDING. It exists to make `active` (3)
+ * differ from `superseded` (4). With only two drops the two counts are equal,
+ * and a denominator that mistypes `active` as `superseded` reads the SAME 0.4
+ * — the mutation would stay green. Do not "simplify" `c-dup3` away.
+ *
+ * SEVEN FORMULAS, SEVEN DIFFERENT NUMBERS on this one fixture (3 active,
+ * 4 superseded, 1 archived, 3 rejected):
+ *   correct                          (4+1-3)/(3+4+1-3) = 0.4
+ *   archived dropped from both sides (4-3)  /(3+4-3)   = 0.25   ← the target
+ *   archived kept in denominator only(4-3)  /(3+4+1-3) = 0.2
+ *   archived kept in numerator only  (4+1-3)/(3+4-3)   = 0.5
+ *   old conflating formula           (4+1)  /(3+4+1)   = 0.625
+ *   inverted rejected predicate      (4+1-1)/(3+4+1-1) = 0.571
+ *   denominator's `active` mistyped  (4+1-3)/(4+4+1-3) = 0.333
+ *
+ * REMAINING BLIND SPOTS, REGISTERED HONESTLY rather than implied away:
+ *   - `dormant` and `tombstone` are 0 here, so a mutation that ADDS a term for
+ *     either is invisible to this test.
+ *   - Widening `REJECTED_CANDIDATE_SQL` to `status IN ('superseded','archived')
+ *     AND superseded_by IS NULL` does not move this reading. That is not a gap
+ *     in the fixture: `metrics.ts`'s "WHY `archived` NEEDS NO TERM" argues the
+ *     widened clause is an IDENTITY, because an `archived` row without a
+ *     pointer cannot be constructed — status and pointer come from one UPDATE
+ *     in one call.
+ *   - The cross-kind archiving rule ("the replaced procedure is archived even
+ *     when its replacement is a fact") is NOT asserted here. It is owned by
+ *     `test/pipeline.test.mjs`'s "a superseded procedure is archived even when
+ *     its replacement is a fact…"; a second copy would be a second owner.
+ */
+test('overturnRate counts an archived procedure as an overturn, not as a row that vanished', async () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+  const insert = (status, kind) =>
+    store.db.prepare(
+      `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at)
+       VALUES (?, '${kind}', 'repo-local', '${status}', ?, 'body', 'human', 0, 0)`,
+    )
+  store.tx(() => {
+    const activeFact = insert('active', 'fact')
+    const activeProc = insert('active', 'procedure')
+    const candidate = insert('candidate', 'fact')
+    activeFact.run('keeper', 'untouched fact')
+    activeFact.run('old-fact', 'the fact that gets replaced')
+    // A `procedure`, because that kind alone routes supersede to `archived`.
+    activeProc.run('old-proc', 'the procedure that gets versioned')
+    candidate.run('c-fact', 'the better wording of that fact')
+    candidate.run('c-proc', 'the newer procedure')
+    candidate.run('c-dup1', 'duplicate one')
+    candidate.run('c-dup2', 'duplicate two')
+    // See the header: `c-dup3` is what makes active (3) ≠ superseded (4).
+    candidate.run('c-dup3', 'duplicate three')
+  })
+
+  const reconcile = async (jobId, sessionId, candidateIds, decisions) => {
+    const payload = {
+      sessionId,
+      turn: 1,
+      candidateIds,
+      provider: 'p',
+      model: 'm',
+      promptVersion: 1,
+      payloadVersion: 1,
+    }
+    enqueueJob(store, 'reconcile', jobId, payload, 0)
+    const job = claimNextJob(store, Date.now(), Date.now() + 60_000)
+    const ctx = fakeCtx({
+      services: { llm: { stream: () => textStream(JSON.stringify({ decisions })) } },
+    })
+    await runReconcileJob(ctx, store, job, payload, new AbortController().signal)
+  }
+
+  await reconcile('r-archived', 'sess-archived', ['c-fact', 'c-proc', 'c-dup1', 'c-dup2', 'c-dup3'], [
+    { candidateIndex: 0, action: 'supersede', supersedes: 'old-fact' },
+    { candidateIndex: 1, action: 'supersede', supersedes: 'old-proc' },
+    { candidateIndex: 2, action: 'drop' },
+    { candidateIndex: 3, action: 'drop' },
+    { candidateIndex: 4, action: 'drop' },
+  ])
+
+  // THE DISCRIMINANT FIRST, then the number that rests on it. Three
+  // populations now share the retired half of the table and only status +
+  // pointer tell them apart.
+  const row = (id) =>
+    store.db.prepare(`SELECT status, superseded_by FROM memories WHERE id = ?`).get(id)
+  assert.equal(row('old-proc').status, 'archived', 'a versioned procedure retires as archived')
+  assert.equal(row('old-proc').superseded_by, 'c-proc', 'and it names its replacement')
+  assert.equal(row('old-fact').status, 'superseded', 'a replaced fact retires as superseded')
+  assert.equal(row('old-fact').superseded_by, 'c-fact', 'and it names its replacement')
+  for (const id of ['c-dup1', 'c-dup2', 'c-dup3']) {
+    assert.equal(row(id).status, 'superseded', `${id}: a refused candidate, not an overturn`)
+    assert.equal(row(id).superseded_by, null, `${id}: refused candidates carry no pointer`)
+  }
+
+  assert.equal(collectMetrics(store, Date.now()).activeCount, 3, 'keeper + two replacements')
+
+  // 3 active, 4 superseded, 1 archived, 3 rejected. The header lists the seven
+  // formulas this value separates; 0.25 is the term-deletion it exists to kill.
+  const before = collectMetrics(store, Date.now()).overturnRate
+  assert.equal(before, 0.4, 'the archived procedure is counted as the overturn it is')
+
+  // THE PROPERTY, so 0.4 cannot be read as an arbitrary constant: retiring one
+  // more procedure must RAISE the misjudgement rate. Under the term deletion it
+  // FALLS instead (0.25 -> 0.2), so direction alone separates them too.
+  //
+  // ⚠️ THIS PROPERTY IS ONLY DISCRIMINATING BECAUSE A REAL WRITER PRODUCES IT.
+  // `reconcile.ts`'s `activate.run` runs on every supersede decision, so
+  // archived+1 ALWAYS arrives with active+1 — that pairing is what makes the
+  // mutated formula move the other way. Replacing this second commit with a
+  // hand-written UPDATE that flips one active row to `archived` WITHOUT adding
+  // an active row makes the mutated reading rise too (0.25 -> 0.333), the
+  // property passes under the mutation, and this assertion stops discriminating
+  // anything. Keep it a real `runReconcileJob`.
+  store.tx(() => {
+    insert('active', 'procedure').run('old-proc2', 'a second procedure to version')
+    insert('candidate', 'procedure').run('c-proc2', 'its newer sequence')
+  })
+  await reconcile('r-archived-2', 'sess-archived-2', ['c-proc2'], [
+    { candidateIndex: 0, action: 'supersede', supersedes: 'old-proc2' },
+  ])
+  assert.equal(row('old-proc2').status, 'archived', 'the second procedure retires the same way')
+
+  // 4 active, 4 superseded, 2 archived, 3 rejected → (4+2-3)/(4+4+2-3).
+  const after = collectMetrics(store, Date.now()).overturnRate
+  assert.equal(after, 0.429, 'a second real retirement is counted')
+  assert.ok(after > before, `retiring a procedure raises the rate: ${before} -> ${after}`)
+  registry.dispose()
+  cleanup(root)
+})
+
 test('metrics: the recall miss rate is read from L0, not from a counter', () => {
   // This number prices the deferred retrieval-fusion work. It is computed from
   // the recall tool's own recorded output, so there is no counter to maintain

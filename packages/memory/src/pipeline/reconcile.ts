@@ -178,11 +178,16 @@ export const runReconcileJob = async (
     // merge the two populations back together and silently restore that
     // inversion. Stated as a comment rather than a CHECK constraint because
     // widening the status enum needs a full-table rebuild of `memories` — see
-    // `REJECTED_CANDIDATE_SQL` for why that was rejected. ONE mutation-covered
-    // test in `test/layers.test.mjs` pins the shape ("overturnRate counts
-    // overturned memories…", measured: giving this statement a pointer turns
-    // that one test red and leaves the other 324 green); nothing in the schema
-    // does.
+    // `REJECTED_CANDIDATE_SQL` for why that was rejected. TWO mutation-covered
+    // tests in `test/layers.test.mjs` pin the shape ("overturnRate counts
+    // overturned memories…" and "overturnRate counts an archived procedure…"):
+    // measured, giving this statement a pointer moves the suite from its
+    // baseline failure count to BASELINE + 2, and those two names are the whole
+    // of the addition — each dies on its `superseded_by === null` discriminant
+    // before the rate is read. Stated as a delta rather than as "the other N
+    // stayed green" because the machine it was measured on (Windows) carries
+    // six platform-only failures in its baseline and so has no all-green count
+    // to quote. Nothing in the schema does any of this.
     const drop = store.db.prepare(
       `UPDATE memories SET status = 'superseded', updated_at = ?
        WHERE id = ? AND status = 'candidate'`,

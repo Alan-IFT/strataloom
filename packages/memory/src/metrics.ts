@@ -96,16 +96,34 @@ const one = (store: OpenStore, sql: string, ...params: unknown[]): number => {
  * this predicate is an IDENTITY rather than a tightening: the rows it would
  * exclude do not exist by construction.
  *
+ * READ THAT AS A STATEMENT ABOUT THIS PREDICATE AND NOTHING ELSE. It says an
+ * archived clause buys this SQL nothing; it says nothing whatever about the
+ * `+ archived` terms in `overturnRate`'s own arithmetic, which are load-bearing
+ * and whose deletion no baseline catches. Before removing any occurrence of
+ * `archived` from this file, read the comment on the `overturnRate` field
+ * below — it owns that question, and answers it the other way.
+ *
  * ⚠️ HONEST LIMIT — THIS IS WEAKER THAN A CONSTRAINT. Nothing in the schema
  * forbids a future writer from giving `drop` a pointer, and if one did, this
  * predicate would silently stop discriminating. What stands behind it is the
- * comment on `drop` itself plus the ONE test that pins the shape
- * ("overturnRate counts overturned memories…" in `test/layers.test.mjs`,
- * measured: giving `drop` a pointer turns that test red and leaves the other
- * 324 green) — and an author who changed the writer could change that test in
- * the same edit. It is strictly better than the status quo (which conflates the two
- * populations unconditionally, with nothing recording that it does), and it is
- * not a barrier anyone is prevented from walking around.
+ * comment on `drop` itself plus the TWO tests in `test/layers.test.mjs` that
+ * pin the shape — "overturnRate counts overturned memories…" and "overturnRate
+ * counts an archived procedure…". Measured as a mutation: giving `drop` a
+ * pointer moves the suite from its baseline failure count to BASELINE + 2, and
+ * the two added names are exactly those tests (both die on their
+ * `superseded_by === null` discriminant, before the rate is read at all).
+ * Quoted as a DELTA rather than as "the other N stayed green" because the
+ * machine this was measured on has no all-green baseline to quote: it carries
+ * six platform-only failures before any change of ours, none of them touching
+ * this predicate or anything this module computes. They are deliberately NOT
+ * enumerated here — which six they are is a property of one OS and one
+ * filesystem, so a list written down on this machine would be wrong for the
+ * next reader; running the unmodified suite once prints whichever baseline is
+ * local, and the delta is what this note claims. Two tests are no more a
+ * barrier than one was — an author who changed the writer could change both in
+ * the same edit. It is strictly better than the status quo (which conflates the
+ * two populations unconditionally, with nothing recording that it does), and it
+ * is not a barrier anyone is prevented from walking around.
  *
  * Deliberately NOT hoisted into `types.ts` beside `MEMORY_STATUSES`. It drives
  * ONE metric, and a lifecycle constant parked in the shared vocabulary reads as
@@ -274,6 +292,28 @@ export const collectMetrics = (store: OpenStore, now: number) => {
     // traffic, not measurably wrong on the six without any"; quoting the 2.08x
     // as though every store were inflated twofold would be the read-the-whole-
     // sample-off-the-busiest-store error this comment exists to prevent.
+    //
+    // ⚠️ `archived` IS LOAD-BEARING HERE — and that does NOT contradict
+    // "WHY `archived` NEEDS NO TERM" above, which is the sentence in this file
+    // most likely to be misread as licence to delete the three occurrences
+    // below. The two talk about different objects. THAT section is about the
+    // PREDICATE, and says adding an archived clause to it would be an IDENTITY,
+    // because an archived row without a pointer cannot be constructed. THIS is
+    // about the POPULATION: an archived row IS a real overturn — a `procedure`
+    // versioned by reconcile — so deleting the term deletes those rows from
+    // both sides of the fraction. Measured before its test existed: removing
+    // `+ archived` from numerator and denominator left the whole suite at its
+    // baseline, unmoved, while silently dropping every real retirement that
+    // carries that status out of the nine live stores' trust reading — the
+    // twelve `archived` rows already counted by the `38 superseded + 12
+    // archived` split under "MEASURED, ACROSS THE NINE LIVE STORES" above, not
+    // a second reading taken here. The population is quoted once, up there, so
+    // the two cannot drift apart. It is exactly the `archived` rows and no
+    // others: an overturn `propose` wrote, or one whose replaced row was not a
+    // `procedure`, is `superseded` and survives this deletion untouched.
+    // Pinned now by "overturnRate counts an archived procedure as an overturn,
+    // not as a row that vanished" in `test/layers.test.mjs`, which reads 0.25
+    // instead of 0.4 under exactly that deletion.
     overturnRate:
       active + superseded + archived - rejected === 0
         ? 0
