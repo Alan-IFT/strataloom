@@ -97,14 +97,17 @@ export const runReconcileJob = async (
   //   drop      — a summary legitimately restates the memory it summarizes, so
   //               a candidate matching one looks like a duplicate. The
   //               candidate is marked `superseded`, and the D9 invalidation
-  //               trigger then deletes the summary on the very next raw write,
+  //               trigger then deletes the summary on the very next write to
+  //               the layer's source set (`active` + INJECTABLE provenance),
   //               so the thing it was judged a duplicate OF does not survive
   //               either. Measured end to end against the unfixed query: the
   //               candidate's own wording is left in no active row at all
   //               (`workspaces`: 1 row, status `superseded`). Decay makes this
   //               strictly worse rather than better: its UPDATE of raw rows to
-  //               `dormant` is itself a raw write, so the D9 trigger
-  //               `invalidate_derived_update` deletes the whole derived layer
+  //               `dormant` moves them OUT of the source set, and D9's UPDATE
+  //               trigger tests OLD as well as NEW, so at v12 that DEPARTURE
+  //               still fires it — `invalidate_derived_update` deletes the
+  //               whole derived layer
   //               in the same statement (measured: 1 derived row before, 0
   //               after a decay that slept 55 raw rows). The summary is
   //               therefore never a lasting carrier of anything — which is

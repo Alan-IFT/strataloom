@@ -634,12 +634,23 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
       // sends the model looking for one. Same defect shape as the v0.4.13
       // "forget's note is an untrue statement" round, one layer further out.
       //
-      // "dropped ... whenever that repository is written" and NOT "rebuilt":
-      // D9 deletes the derived layer and enqueues nothing, and a rebuild is
-      // queued only while the raw set still overflows its packet — so a
-      // summary may simply never return. The first draft of this clause said
-      // "rebuilt rather than deleted", which is precisely backwards. Measured
-      // in service.ts's derived branch comment.
+      // "dropped ... whenever a memory that FEEDS it is written" and NOT
+      // "rebuilt": D9 deletes the derived layer and enqueues nothing, and a
+      // rebuild is queued only while the raw set still overflows its packet —
+      // so a summary may simply never return. The first draft of this clause
+      // said "rebuilt rather than deleted", which is precisely backwards.
+      // Measured in service.ts's derived branch comment.
+      //
+      // The TRIGGER half of that sentence is narrower than it used to be, and
+      // the narrowing is a correction, not a refinement. Through v11 this read
+      // "whenever that repository is WRITTEN", which was then true: D9 fired on
+      // any raw write. v12 scoped D9 to the derived layer's SOURCE SET
+      // (`status = 'active' AND provenance IN (INJECTABLE)`), which made the
+      // old sentence FALSE for the commonest write there is — `tool-output` is
+      // 86.1% of active raw rows on the main store, and writing one now leaves
+      // the layer standing. A description that overstates when a layer dies
+      // teaches every agent to expect a drop that will not happen, so the
+      // clause names what actually fires it: a memory that feeds the layer.
       description:
         'Act on one stored memory by id (from memory_recall). By default it is ' +
         'permanently tombstoned; pass share:true to instead request the user\'s ' +
@@ -650,7 +661,8 @@ export const registerTools = (ctx: Context, memory: MemoryService): void => {
         'stored entry recalled from a repo-group member is refused, naming the ' +
         'repository to run it in; a generated summary recalled from one is refused ' +
         'as forgettable by no session at all, since the whole derived layer is ' +
-        'dropped whenever that repository is written rather than deleted row by row.',
+        'dropped whenever a memory that feeds it is written, rather than deleted ' +
+        'row by row.',
       parameters: {
         id: { type: 'string', required: true, description: 'The memory id to act on.' },
         share: {

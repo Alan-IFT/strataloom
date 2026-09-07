@@ -161,13 +161,32 @@ export const PROVENANCE_PRIORITY: Readonly<Record<Provenance, number>> = {
   derived: 0,
 }
 
-/** Statuses excluded from every read surface (spec §3.3 排除规则). */
+/**
+ * The statuses `queryRecallRows` excludes (`store/fts.ts`) — the ONE
+ * read surface this list drives, not a global rule. All five DO take effect
+ * there (measured: a row in each status is matched by FTS and filtered out).
+ *
+ * Every other read surface reaches a similar outcome through its OWN
+ * predicate, with no causal link to this list — so "excluded from every read
+ * surface" (spec §3.3) is a statement about the outcome, never about this
+ * constant. Two of them deliberately disagree with it:
+ *   - `service.share` is NARROWER: it admits `active` only.
+ *   - `service.source` is WIDER: `status != 'tombstone'`, so a superseded row
+ *     keeps an auditable path back to what it quoted.
+ *
+ * Guarded unevenly, and knowingly: deleting `superseded` or `dormant` here
+ * turns a test red; deleting `tombstone`, `archived`, or `candidate` does
+ * not, because each is masked by a second mechanism (`forget` blanks
+ * title/body; `archived` is written only for superseded `procedure` rows;
+ * `candidate` is normally reconciled away before any read). The mask is not
+ * the rule — see the recall-exclusion table test.
+ */
 export const EXCLUDED_STATUSES: readonly MemoryStatus[] = [
   'superseded',
   'tombstone',
   'archived',
   'candidate',
-  // Dormant entries stay stored and revivable but leave every read surface —
+  // Dormant entries stay stored and revivable but leave this read surface —
   // that removal IS the point of decay. Revival happens in the decay batch,
   // never on a read (D4).
   'dormant',

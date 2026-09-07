@@ -14,6 +14,7 @@ import { APPLICATION_ID, TARGET_USER_VERSION } from '../constants.ts'
 import {
   DERIVED_LAYERS,
   DERIVED_PROVENANCE,
+  INJECTABLE_PROVENANCE,
   LAYER,
   MEMORY_KINDS,
   MEMORY_STATUSES,
@@ -139,6 +140,120 @@ const recreateFtsTriggers = (db: DatabaseSync): void => {
   `)
 }
 
+/** Render a string enum as a SQL `IN (...)` list, quoted. */
+const sqlEnum = (values: readonly string[]): string =>
+  values.map((value) => `'${value}'`).join(',')
+
+/**
+ * D9's SOURCE SET: the rows that actually feed the derived layer.
+ *
+ * Read from `INJECTABLE_PROVENANCE`, the same symbol `fts.ts` builds
+ * `INJECTABLE_LIST` from, so "what feeds the derived layer" and "what write
+ * invalidates it" cannot come to disagree — a provenance added to §2.3's
+ * injectable set starts feeding the layer and starts invalidating it in the
+ * same edit, and one removed stops doing both.
+ */
+const INJECTABLE = sqlEnum(INJECTABLE_PROVENANCE)
+
+/**
+ * Membership of the source set, word for word the predicate
+ * `queryInjectableSet` and `queryPersonaSources` select on. `derived` is NOT
+ * part of it: the `derived = RAW` half is stated by each trigger's own WHEN,
+ * which is what keeps a rebuild from fencing itself.
+ *
+ * ⚠️ Depends on `status` and `provenance` both being NOT NULL, which
+ * `MEMORY_COLUMNS` declares several hundred lines below. In a trigger WHEN
+ * clause a NULL makes the condition unknown, and unknown does NOT fire — the
+ * classic hole in a narrowing trigger, and it fails OPEN here: a NULL-status
+ * row would silently stop invalidating the layer instead of erroring. The
+ * column constraints are what close it (measured: a NULL status is refused at
+ * insert), so this predicate and those two NOT NULLs are one mechanism. Do not
+ * relax either column to nullable without giving these triggers an explicit
+ * IS NULL arm.
+ */
+const inSourceSet = (ref: 'OLD' | 'NEW'): string =>
+  `${ref}.status = 'active' AND ${ref}.provenance IN (${INJECTABLE})`
+
+/**
+ * The D9 invalidation body: retire the WHOLE derived layer and bump the
+ * revision.
+ *
+ * `!= 0`, never `= 1`: `derived` is a LEVEL, so every derived layer is
+ * retired together. Matching a single value would leave scenario and persona
+ * blocks standing after the set they summarize had changed — the exact
+ * shadowing D9 exists to prevent.
+ */
+const INVALIDATE_BODY = `
+      DELETE FROM memories WHERE derived != ${LAYER.RAW};
+      INSERT INTO meta (k, v) VALUES ('store_revision', '1')
+        ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT);`
+
+/**
+ * D9's three triggers AS OF v12: invalidate on a write to a row that is IN the
+ * derived layer's source set, rather than on any raw write at all.
+ *
+ * v5 stated invalidation over the DATA instead of the writer, which was the
+ * right move and is untouched here. What it did not state is WHICH data: any
+ * row at `derived = RAW` counted, while the layer is built from a strictly
+ * narrower set — `status = 'active' AND provenance IN (INJECTABLE)`. Measured
+ * on the main store (5ed2b4d2), 216 of 251 active raw rows (86.1%) are
+ * `subagent`/`tool-output`, which can reach neither the packet nor the rollup;
+ * every one of their writes still destroyed the whole layer, and a `candidate`
+ * insert — invisible to every read path — did too. Across all nine stores the
+ * same share is 363 of 512 (70.9%), and it ranges 0%–100% per store: this
+ * narrowing pays off very unevenly, and on four stores not at all.
+ *
+ * The layer's own uptime, same window, same main store: it was present 47.6%
+ * of the time. A counterfactual in which D9 fired only on injectable raw
+ * writes puts that at 62.9% — an ESTIMATE, and an upper bound, because it
+ * dates each layer's death exactly but assumes rebuild latency stays put. (An
+ * earlier one-axis pass claimed 76.3%; that number is retracted in the audit's
+ * own appendix.) The narrowing retires the layer on every write that can
+ * actually change what it summarizes; the uptime it buys is the uncertain
+ * part, not the correctness.
+ *
+ * ## The UPDATE trigger takes OLD ∪ NEW, and that is the load-bearing part
+ *
+ * A row can enter or leave the source set by an UPDATE, so a single-sided test
+ * misses one direction each. Measured by enumerating the ordered pairs of the
+ * 30 non-derived (status, provenance) states — 900 pairs, of which 171 touch
+ * the source set and must invalidate:
+ *   - NEW only: fires on 90, missing 81 — every DEPARTURE, including
+ *     `active/human -> dormant/human` (decay) and `active/human -> tombstone`
+ *     (the user's own `forget`). The layer would keep serving a memory the
+ *     user just deleted.
+ *   - OLD only: fires on 90, missing the other 81 — every ARRIVAL, including
+ *     `candidate/human -> active/human` (reconcile adopting a candidate) and
+ *     `dormant -> active` (decay reviving one). That is exactly the defect v5
+ *     was written to close, reopened.
+ *   - OLD ∪ NEW: all 171, and nothing else.
+ *
+ * `AFTER UPDATE` with NO column list, deliberately. Narrowing it to
+ * `OF status, provenance` would drop body and title edits, and a rewritten
+ * memory is precisely a changed summary input. The column list is an
+ * enumeration that can be short; the whole-row form cannot be.
+ *
+ * All three keep the `derived = RAW` test: without it a rebuild's own INSERT of
+ * derived rows would delete the layer it is in the middle of writing.
+ */
+const createInvalidationTriggers = (db: DatabaseSync): void => {
+  db.exec(`
+    CREATE TRIGGER invalidate_derived_insert AFTER INSERT ON memories
+      WHEN NEW.derived = ${LAYER.RAW} AND (${inSourceSet('NEW')})
+      BEGIN${INVALIDATE_BODY}
+    END;
+    CREATE TRIGGER invalidate_derived_update AFTER UPDATE ON memories
+      WHEN OLD.derived = ${LAYER.RAW}
+        AND ((${inSourceSet('OLD')}) OR (${inSourceSet('NEW')}))
+      BEGIN${INVALIDATE_BODY}
+    END;
+    CREATE TRIGGER invalidate_derived_delete AFTER DELETE ON memories
+      WHEN OLD.derived = ${LAYER.RAW} AND (${inSourceSet('OLD')})
+      BEGIN${INVALIDATE_BODY}
+    END;
+  `)
+}
+
 /**
  * Every trigger attached to `memories`, in one place.
  *
@@ -201,14 +316,6 @@ const recreateFtsTriggers = (db: DatabaseSync): void => {
  * unrepresentable — which is exactly what v4's comment always claimed.
  */
 const createMemoryTriggers = (db: DatabaseSync): void => {
-  // `!= 0`, never `= 1`: `derived` is a LEVEL, so every derived layer is
-  // retired together. Matching a single value would leave scenario and
-  // persona blocks standing after the set they summarize had changed — the
-  // exact shadowing D9 exists to prevent.
-  const invalidate = `
-      DELETE FROM memories WHERE derived != ${LAYER.RAW};
-      INSERT INTO meta (k, v) VALUES ('store_revision', '1')
-        ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT);`
   recreateFtsTriggers(db)
   db.exec(`
     -- D2, data-driven: 'private' is allowed in the global store and only there (v3).
@@ -230,25 +337,11 @@ const createMemoryTriggers = (db: DatabaseSync): void => {
     CREATE TRIGGER guard_derived_status_insert BEFORE INSERT ON memories
       WHEN new.status != 'active' AND new.derived != ${LAYER.RAW}
       BEGIN SELECT RAISE(ABORT, 'a derived row must be born active'); END;
-
-    -- D9: invalidation is a property of the data, not of the writer (v5).
-    -- The guard matches RAW only, so a rebuild writing its own derived rows
-    -- does not fence itself, whichever layer it is producing.
-    CREATE TRIGGER invalidate_derived_insert AFTER INSERT ON memories
-      WHEN NEW.derived = ${LAYER.RAW} BEGIN${invalidate}
-    END;
-    CREATE TRIGGER invalidate_derived_update AFTER UPDATE ON memories
-      WHEN OLD.derived = ${LAYER.RAW} BEGIN${invalidate}
-    END;
-    CREATE TRIGGER invalidate_derived_delete AFTER DELETE ON memories
-      WHEN OLD.derived = ${LAYER.RAW} BEGIN${invalidate}
-    END;
   `)
+  // D9: invalidation is a property of the data, not of the writer (v5), and
+  // of the data that FEEDS the layer (v12). See `createInvalidationTriggers`.
+  createInvalidationTriggers(db)
 }
-
-/** Render a string enum as a SQL `IN (...)` list, quoted. */
-const sqlEnum = (values: readonly string[]): string =>
-  values.map((value) => `'${value}'`).join(',')
 
 /**
  * The `derived` column AS OF v10: a layer value, and every non-RAW layer
@@ -781,6 +874,126 @@ const migrateV11 = (db: DatabaseSync): void => {
   `)
 }
 
+/**
+ * user_version = 12: D9 invalidates on a write to the layer's SOURCE SET, not
+ * on any raw write at all.
+ *
+ * v5's rule — "any change to a non-derived row invalidates" — is right about
+ * WHERE the rule belongs (the data, not the writer) and too wide about WHICH
+ * data. The derived layer is built from `queryInjectableSet` /
+ * `queryPersonaSources`, i.e. `status = 'active' AND provenance IN
+ * (INJECTABLE)`. Rows outside that set cannot change what the layer says, yet
+ * every write to one retired the whole layer.
+ *
+ * Measured on the main store (5ed2b4d2): 216 of 251 active raw rows (86.1%)
+ * are `subagent` or `tool-output` and can reach neither the packet nor the
+ * rollup; `candidate` inserts, invisible to every read path, invalidated too,
+ * as did reconcile's own `drop`. Across the nine stores that share is 363 of
+ * 512 (70.9%), ranging 0%–100% per store — four of them carry no such row at
+ * all and gain nothing here.
+ *
+ * The derived layer's median lifetime was 63 seconds at 47.6% online (main
+ * store, two-axis). A counterfactual in which D9 fired only on injectable raw
+ * writes puts uptime at 62.9% — an ESTIMATE and an upper bound: it dates each
+ * layer's death exactly but assumes rebuild latency stays put, and a
+ * cross-store pass moved only one store of six. (An earlier one-axis pass said
+ * 76.3%; the audit's own appendix retracts it.) The same over-wide shape was
+ * fixed as a bug upstream in Graphiti (issue #1657, PR #1658, narrowed to a
+ * group scope).
+ *
+ * WHAT IS NOT CHANGED: the trigger BODY. `DELETE FROM memories WHERE derived
+ * != RAW` still retires the layer wholesale, because a layer is regenerated as
+ * a unit (v4/v7). This migration changes only WHEN invalidation happens, never
+ * WHAT it invalidates.
+ *
+ * `AFTER UPDATE` keeps NO column list. `OF status, provenance` would be
+ * cheaper and wrong: an edit to a body or title changes a summary input just
+ * as much, and a column enumeration is exactly the kind of list that ends up
+ * one name short.
+ *
+ * ## Why the SQL is written out here instead of calling the live definition
+ *
+ * Review suggested sharing one module-level constant between this migration
+ * and `createInvalidationTriggers`, on the ground that v12 is the newest
+ * version so the two are necessarily identical today. They are — and that is
+ * the argument for freezing, not against it. This file's standing convention
+ * is that a migration reproduces the schema of ITS OWN version: v3, v4, v5 and
+ * v11 each write their trigger text out, and `migrateV11`'s header says why in
+ * so many words ("this one is frozen at what v11 means, while the live set is
+ * free to move on, exactly as v4's `= 'dormant'` stayed frozen").
+ *
+ * It is not only convention. The suite pins behaviour per version through
+ * `migrate(db, kind, N)`, and `test/store.test.mjs` already carries a case
+ * ("the LIVE trigger set carries the v11 rule, not just the v11 migration")
+ * whose entire subject is that the two copies are independently reachable —
+ * measured there, weakening the live definition alone left the suite green. A
+ * shared symbol would make `migrate(db, kind, 12)` install whatever v13 later
+ * says, so the seam would stop being able to observe a version at all, and
+ * that existing test's premise would quietly become false.
+ *
+ * The drift this costs is answered by TESTING both copies rather than by
+ * merging them, which is what the D9 cases below do: a store migrated to a
+ * target below 12 carries the live set (reinstalled by `migrateV10`'s
+ * rebuild), a store at the default target carries this frozen one, and the
+ * assertions run against each.
+ *
+ * `INJECTABLE` is interpolated rather than spelled out, which is the same
+ * split `migrateV6` makes with `sqlEnum(MEMORY_KINDS)`: the ENUM is
+ * single-sourced so the code's idea of an injectable provenance and the
+ * database's cannot diverge, while the PREDICATE SHAPE — the part v13 might
+ * revise — is frozen right here.
+ *
+ * A bare `DROP TRIGGER`, not `IF EXISTS`, and unlike `migrateV11` that is not
+ * an oversight. These three names have existed unconditionally since
+ * `migrateV5` — every later rebuild drops the table and puts them straight
+ * back through `createMemoryTriggers` — so both arrival paths reach v11
+ * carrying all three under exactly these names. v11 needed the tolerant form
+ * because it faced two DIFFERENT names; here a missing trigger would mean a
+ * store whose D9 layer is already not what any version says it is, and the
+ * migration should stop rather than quietly install over the gap.
+ *
+ * No `rebuildMemories`: a trigger is an independent object in `sqlite_master`,
+ * so replacing one needs no table rebuild (the v11 argument, unchanged).
+ * Measured on a v11 store — after this migration the other seven triggers (3
+ * FTS, 2 visibility, 2 derived guards) are present and byte-identical. That is
+ * the v12-specific evidence: this migration replaces three triggers by name and
+ * must leave the rest untouched. (`foreign_key_check` and the FTS integrity
+ * check also pass, but they are the generic post-migration gate every step runs
+ * through `migrateWithForeignKeysOff`, so they say nothing about v12 in
+ * particular.)
+ */
+const migrateV12 = (db: DatabaseSync): void => {
+  db.exec(`
+    DROP TRIGGER invalidate_derived_insert;
+    DROP TRIGGER invalidate_derived_update;
+    DROP TRIGGER invalidate_derived_delete;
+  `)
+  // ⚠️ FROZEN AT WHAT v12 MEANS. Identical to `createInvalidationTriggers`
+  // today because v12 IS the current target. When a v13 changes D9, this text
+  // stays as it is and the live definition moves — do not re-merge them.
+  const body = `
+      DELETE FROM memories WHERE derived != ${LAYER.RAW};
+      INSERT INTO meta (k, v) VALUES ('store_revision', '1')
+        ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT);`
+  const inSet = (ref: 'OLD' | 'NEW'): string =>
+    `${ref}.status = 'active' AND ${ref}.provenance IN (${INJECTABLE})`
+  db.exec(`
+    CREATE TRIGGER invalidate_derived_insert AFTER INSERT ON memories
+      WHEN NEW.derived = ${LAYER.RAW} AND (${inSet('NEW')})
+      BEGIN${body}
+    END;
+    CREATE TRIGGER invalidate_derived_update AFTER UPDATE ON memories
+      WHEN OLD.derived = ${LAYER.RAW}
+        AND ((${inSet('OLD')}) OR (${inSet('NEW')}))
+      BEGIN${body}
+    END;
+    CREATE TRIGGER invalidate_derived_delete AFTER DELETE ON memories
+      WHEN OLD.derived = ${LAYER.RAW} AND (${inSet('OLD')})
+      BEGIN${body}
+    END;
+  `)
+}
+
 const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
   migrateV1,
   migrateV2,
@@ -793,6 +1006,7 @@ const MIGRATIONS: readonly ((db: DatabaseSync, kind: StoreKind) => void)[] = [
   migrateV9,
   migrateV10,
   migrateV11,
+  migrateV12,
 ]
 
 /**

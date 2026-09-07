@@ -716,14 +716,21 @@ for (const layer of DERIVED_LAYERS) {
         //    checkout" are both claims that some session could.
         assert.match(error.message, /no session can forget it directly/i)
         // 4. WHY, which is the only honest reason: the whole LAYER is dropped on
-        //    ANY write to that repository, so there is no row-by-row deletion to
-        //    perform. Two regexes, because the sentence has two load-bearing
-        //    parts and one regex would let either rot:
+        //    a write to a memory that FEEDS it, so there is no row-by-row
+        //    deletion to perform. Two regexes, because the sentence has two
+        //    load-bearing parts and one regex would let either rot:
         //      - the UNIT is the layer, not this row;
-        //      - the TRIGGER is any memory in that repository, not the set this
-        //        rollup summarizes (D9 keys on any raw write, related or not).
+        //      - the TRIGGER is any memory that feeds the layer, which is wider
+        //        than the set this rollup summarizes (D9 keys on the whole
+        //        source set, related to this rollup or not) and narrower than
+        //        every raw row in the store (v12 scoped it to
+        //        `status = 'active' AND provenance IN (INJECTABLE)`).
         assert.match(error.message, /dropped as a whole layer/i)
-        assert.match(error.message, /any memory in that repository/i)
+        assert.match(error.message, /any memory that FEEDS it/i)
+        // The pre-v12 trigger wording, pinned dead: it overstates when the drop
+        // happens now that tool-output/subagent/candidate writes leave the
+        // layer standing.
+        assert.doesNotMatch(error.message, /any memory in that repository is written/i)
         return true
       },
     )
@@ -788,7 +795,10 @@ test("6d. an ARCHIVED member's derived row does not promise a future checkout wi
       assert.match(error.message, new RegExp(escapeRe(s.sources.archived)))
       assert.match(error.message, /no session can forget it directly/i)
       assert.match(error.message, /dropped as a whole layer/i)
-      assert.match(error.message, /any memory in that repository/i)
+      // Same two halves as the live-member case, and the same v12 trigger: a
+      // memory that FEEDS the layer, not every memory in that repository.
+      assert.match(error.message, /any memory that FEEDS it/i)
+      assert.doesNotMatch(error.message, /any memory in that repository is written/i)
       assert.doesNotMatch(error.message, /Start a session inside/)
       // The one this case exists for.
       assert.doesNotMatch(

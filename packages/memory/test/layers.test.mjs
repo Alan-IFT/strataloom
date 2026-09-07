@@ -3195,6 +3195,105 @@ test('L3: the portrait is written once, and "keep" does not churn it', async () 
   cleanup(root)
 })
 
+/**
+ * The fencing table in `pipeline/rebuild.ts` (`runPersonaJob`'s empty-source
+ * guard), as an ASSERTION rather than a comment.
+ *
+ * That comment argues the guard is unreachable in-process: every way of
+ * emptying the source set is itself a write to the source set, so D9 bumps
+ * `store_revision` and the revision precheck settles the job one frame EARLIER
+ * — no LLM call, no portrait. It carried a measured table of five mutations,
+ * and the table was a HISTORICAL READING taken at v11, when D9 fired on any raw
+ * write. v12 narrowed D9 to the source set, which changes the table's PREMISE
+ * without (as this test pins) changing its result.
+ *
+ * Worth a test rather than a re-measured comment because the two differ in what
+ * happens NEXT time the premise moves: a comment's numbers rot silently, and
+ * this one already outlived one rewrite of the rule it describes.
+ *
+ * NOT redundant with store.test.mjs's D9/A-C. Those drive the TRIGGERS directly
+ * and prove which writes invalidate; this drives the real
+ * `runRebuildJob`/`runPersonaJob` and proves the consequence the comment
+ * actually claims — that the job is fenced BEFORE the model is called. A
+ * trigger-level test cannot see an LLM call, and `ctx.get` returning a throwing
+ * `llm` is what makes "llm 0" measured here rather than assumed.
+ *
+ * The sharp row is `provenance -> subagent`: the row LEAVES the source set, so
+ * only the UPDATE trigger's OLD arm catches it. A NEW-only reading of v12 would
+ * let that job through to the model.
+ */
+const FENCING_MUTATIONS = [
+  ['supersede last source', (db) => db.prepare(`UPDATE memories SET status='superseded' WHERE id='src'`).run()],
+  ['forget/tombstone', (db) => db.prepare(`UPDATE memories SET status='tombstone', title='', body='' WHERE id='src'`).run()],
+  ['decay -> dormant', (db) => db.prepare(`UPDATE memories SET status='dormant' WHERE id='src'`).run()],
+  ['hard DELETE', (db) => db.prepare(`DELETE FROM memories WHERE id='src'`).run()],
+  ['provenance -> subagent', (db) => db.prepare(`UPDATE memories SET provenance='subagent' WHERE id='src'`).run()],
+]
+
+test('the rebuild.ts fencing table holds at v12: each mutation fences before the model call', async () => {
+  for (const [label, mutate] of FENCING_MUTATIONS) {
+    const { root, registry, principal, ctx, service } = setup()
+    // Seeded directly rather than through `propose`, and with the fixture's own
+    // id: `propose` mints a UUID and the `evidence` FK refuses to let it be
+    // renamed afterwards. `active` + `human` puts it squarely in the source set
+    // — the single row every mutation below targets.
+    const global = service.globalStore(true)
+    global.db
+      .prepare(
+        `INSERT INTO memories (id, kind, visibility, status, title, body, provenance, created_at, updated_at, derived)
+         VALUES ('src', 'preference', 'private', 'active', 'be terse', 'the user prefers short answers', 'human', 0, 0, ${LAYER.RAW})`,
+      )
+      .run()
+    // A portrait to observe: planted AFTER the raw write, or D9 would take it.
+    plantDerivedRow(global, 'portrait', LAYER.PERSONA)
+
+    const revBefore = readRevision(global)
+    const payload = { expectedRevision: revBefore, provider: 'p', model: 'm' }
+    enqueueJob(global, 'rebuild', 'rb1', payload, 0)
+
+    // THE MUTATION, between enqueue and execution.
+    mutate(global.db)
+    assert.ok(
+      readRevision(global) > revBefore,
+      `${label}: the mutation must move the revision — that IS the fence`,
+    )
+
+    // An `llm` that THROWS if reached, so "burns no LLM call" is measured by
+    // the test failing rather than asserted by a counter nobody checks.
+    ctx.get = (name) =>
+      name === 'llm'
+        ? { stream: () => assert.fail(`${label}: the model was called; the job was not fenced`) }
+        : name === 'agentDefaultModel'
+          ? { currentSelection: () => ({ provider: 'p', model: 'm' }) }
+          : undefined
+    const built = await runRebuildJob(
+      ctx, global, claimNextJob(global, Date.now(), Date.now() + 60_000),
+      payload, new AbortController().signal,
+    )
+    assert.equal(built, false, `${label}: a fenced job builds nothing`)
+    registry.dispose()
+    cleanup(root)
+  }
+})
+
+test('the fencing table CONTROL: with no mutation the same job reaches the model', async () => {
+  // Without this, the test above passes for the wrong reason — a fixture that
+  // never reaches the model at all would satisfy every row of it.
+  const { root, registry, principal, ctx, service } = setup()
+  await service.propose(
+    { title: 'be terse', body: 'the user prefers short answers', kind: 'preference', scope: 'personal' },
+    principal,
+  )
+  const global = registry.get(GLOBAL_STORE_KEY)
+  assert.equal(
+    await judgePersona(ctx, global, personaReply('Prefers short answers.'), 'ctrl'),
+    true,
+    'control: an unmutated job is not fenced and writes a portrait',
+  )
+  registry.dispose()
+  cleanup(root)
+})
+
 /* ── L3 obeys §2.3: 注入资格随最低来源 ───────────────────────────────────────
 
    The portrait is not a read-only view of its sources. `runPersonaJob` stores

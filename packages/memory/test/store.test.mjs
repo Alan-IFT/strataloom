@@ -9,7 +9,13 @@ import { migrate, MigrationError } from '../lib/store/schema.js'
 import { immediateTx } from '../lib/store/tx.js'
 import { APPLICATION_ID, TARGET_USER_VERSION } from '../lib/constants.js'
 import { StoreRegistry } from '../lib/store/store.js'
-import { queryAllMemories, toFtsPhrase } from '../lib/store/fts.js'
+import {
+  queryAllMemories,
+  queryInjectableSet,
+  queryPersonaSources,
+  queryRecallRows,
+  toFtsPhrase,
+} from '../lib/store/fts.js'
 import {
   DERIVED_LAYERS,
   DERIVED_PROVENANCE,
@@ -1053,6 +1059,87 @@ for (const layer of DERIVED_LAYERS) {
   })
 }
 
+/**
+ * `EXCLUDED_STATUSES` drives exactly ONE read surface — `queryRecallRows` — and
+ * until this case existed only 2 of its 5 members were held by anything.
+ *
+ * Measured before writing it, by deleting one status at a time from the array
+ * and running the whole suite: `superseded` and `dormant` each turn a test red
+ * (one recall assertion apiece, both incidental to that test's real subject),
+ * while `tombstone`, `archived` and `candidate` all leave 310/310 green. The
+ * three unguarded ones are not unreachable — each is merely MASKED by a second
+ * mechanism that happens to hide the leak: `forget` blanks title and body in
+ * the same transaction, so a tombstoned row has no text left for FTS to match;
+ * `archived` is written only where `reconcile` supersedes a `procedure`, which
+ * no test drives; and a `candidate` is normally reconciled into `active` or
+ * `superseded` before any read happens. A mask is not the rule, and none of
+ * the three would survive a change to the mechanism that hides it.
+ *
+ * So the fixture defeats every mask on purpose: the rows are written straight
+ * to the table, so no `forget`/`reconcile` path gets to intervene, and all six
+ * share ONE distinctive term, so FTS genuinely matches all six and the status
+ * filter is the only thing that can separate them. The premise is asserted
+ * rather than assumed — without the unfiltered count below, a fixture whose
+ * term stopped matching would satisfy "only the active row comes back"
+ * vacuously, which is precisely how the three masked statuses read as covered.
+ *
+ * Table-driven over `MEMORY_STATUSES` rather than a list of six literals: a
+ * status added to the enum with no thought given to recall lands here as a
+ * failure instead of passing unnoticed.
+ */
+test('recall exclusion table: queryRecallRows serves `active` alone, one row per status', () => {
+  const { root, registry } = openRegistry()
+  const store = registry.open('k1')
+
+  // One term, shared by all six rows and used by nothing else in this file, so
+  // the MATCH is common to every row and the WHERE clause is the only variable.
+  const TERM = 'zarquon'
+  MEMORY_STATUSES.forEach((status, index) =>
+    insertMemory(store, {
+      id: `recall-${status}`,
+      title: `${TERM} ${status}`,
+      at: 1000 + index,
+      provenance: 'human',
+      status,
+    }),
+  )
+
+  // PREMISE: FTS really matches all six, so exclusion has something to exclude.
+  // This is the assertion the three masked statuses never had — it is what
+  // distinguishes "the filter removed it" from "there was nothing to remove".
+  assert.equal(
+    store.db
+      .prepare(
+        `SELECT count(*) AS n FROM memories_fts f JOIN memories m ON m.rowid = f.rowid
+         WHERE memories_fts MATCH ?`,
+      )
+      .get(`"${TERM}"`).n,
+    MEMORY_STATUSES.length,
+    `all ${MEMORY_STATUSES.length} rows must be MATCHED by FTS before the status filter ` +
+      'runs; if they are not, this case excludes nothing and passes vacuously',
+  )
+
+  assert.deepEqual(
+    queryRecallRows(store, TERM, undefined).map((row) => row.id),
+    ['recall-active'],
+    'recall must serve the active row and no other: every non-active status is in ' +
+      'EXCLUDED_STATUSES, and dropping any one of them from that array shows up HERE ' +
+      'rather than being masked by forget blanking the text, by archived having no ' +
+      'writer under test, or by a candidate being reconciled away first',
+  )
+
+  // The exclusion is the STATUS, not the kind filter or the term: the same
+  // query with the kind these rows carry still returns the one active row.
+  assert.deepEqual(
+    queryRecallRows(store, TERM, 'fact').map((row) => row.id),
+    ['recall-active'],
+    'and the same holds with the kind filter engaged',
+  )
+
+  registry.dispose()
+  cleanup(root)
+})
+
 test('foreign application_id is refused', () => {
   const root = tempRoot()
   const db = openRaw(join(root, 'm.sqlite'))
@@ -1226,5 +1313,556 @@ test('a real v1 store upgrades to the current version with its data intact', () 
   assert.equal(store.db.prepare(`SELECT count(*) c FROM conversations`).get().c, 0)
   store.db.exec(`INSERT INTO memories_fts(memories_fts) VALUES ('integrity-check')`)
   registry.dispose()
+  cleanup(root)
+})
+
+// ------------------------------------------- D9 source-set invalidation ----
+
+/**
+ * v12: D9 fires on a write to the derived layer's SOURCE SET, not on any raw
+ * write at all.
+ *
+ * ⛔ ASSERTION A ALONE IS FALSE GREEN, AND THAT IS MEASURED, NOT FEARED.
+ *
+ * The natural test to write is "a surviving derived layer always matches the
+ * sources it was built from" (A below). It is necessary and it is not
+ * sufficient: an implementation that invalidates TOO MUCH satisfies it
+ * perfectly. Reverting this change entirely — keeping v11's
+ * `WHEN NEW.derived = RAW` with no source predicate — produces 0 violations of
+ * A, because a layer destroyed on every write is never around to be stale. So
+ * would `WHEN 1`.
+ *
+ * A therefore pins CORRECTNESS and can say nothing about the point of the
+ * change. B pins the point: a write that CANNOT affect the layer must leave it
+ * standing. Neither is redundant and neither is the safety property alone — A
+ * without B admits the do-nothing implementation, B without A admits a trigger
+ * that never fires. They are written as a pair and must stay one.
+ *
+ * C states the rule over the whole transition space, which is what separates
+ * OLD ∪ NEW from either single side: 81 ordered transitions are visible only
+ * to OLD and another 81 only to NEW.
+ */
+
+const revisionOf = (db) =>
+  Number(db.prepare(`SELECT v FROM meta WHERE k = 'store_revision'`).get()?.v ?? 0)
+
+const countDerived = (db) =>
+  db.prepare(`SELECT count(*) AS n FROM memories WHERE derived != ${LAYER.RAW}`).get().n
+
+/**
+ * Plant a derived row. Every raw write must ALREADY have happened — D9 retires
+ * the whole layer, and a fixture that plants the summary first holds nothing by
+ * the time the assertion runs.
+ */
+const plantLayer = (db, id = 'derived-1') =>
+  db
+    .prepare(
+      `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+       VALUES (?,'fact','repo-local','active','generated rollup','generated',?,0,0,?)`,
+    )
+    .run(id, DERIVED_PROVENANCE, LAYER.SCENARIO)
+
+const insertRaw = (db, { id, status = 'active', provenance = 'human', title = 't', body = 'b' }) =>
+  db
+    .prepare(
+      `INSERT INTO memories (id,kind,visibility,status,title,body,provenance,created_at,updated_at,derived)
+       VALUES (?,'fact','repo-local',?,?,?,?,0,0,${LAYER.RAW})`,
+    )
+    .run(id, status, title, body, provenance)
+
+/**
+ * ASSERTION A — "never stale". While a derived layer is alive, the sources it
+ * was built from must still be byte-for-byte what they were.
+ *
+ * Driven by a random operation sequence over the write shapes the pipeline
+ * actually performs (propose, reconcile adoption, decay, revival, forget,
+ * edit, drop), because the interesting states are reached by SEQUENCES: the
+ * transition that matters is often the second write to the same row.
+ *
+ * Snapshotting BOTH source queries, not one. `queryInjectableSet` and
+ * `queryPersonaSources` share a predicate but differ in columns and order, and
+ * the L2 and L3 paths read one each — a violation reachable through only one
+ * of them would be invisible to a test that sampled the other.
+ *
+ * Read this together with B: on its own this assertion is satisfied by an
+ * implementation that never keeps a layer at all.
+ *
+ * Run against BOTH copies of the trigger set, and this is the case that
+ * carries INSERT and DELETE coverage for the live definition. C parameterizes
+ * too, but every one of its 900 pairs is driven as an UPDATE, so it can only
+ * ever observe `invalidate_derived_update`; B is a "does not fire too widely"
+ * assertion that a never-firing trigger satisfies trivially. This walk is the
+ * only D9 case that issues all three statement shapes against a live layer.
+ * Measured: gutting the live DELETE or INSERT trigger to `WHEN 0` leaves the
+ * whole suite green unless THIS test runs against the live set.
+ */
+for (const [label, target] of [
+  ['the v12 migration copy (current target)', undefined],
+  ['the live definition (last step is a rebuild)', 10],
+]) {
+  test(`D9/A: while a derived layer lives, its source set is unchanged (random sequences) — ${label}`, () => {
+    const root = tempRoot()
+    const db = openRaw(join(root, 'm.sqlite'))
+    migrate(db, 'repo', target)
+    // Asserted, not assumed — the same precondition D9/B and D9/C carry: if
+    // `migrate(db,'repo',10)` ever stopped installing the live set, this case
+    // would silently test the frozen copy twice.
+    assert.match(
+      db.prepare(`SELECT sql FROM sqlite_master WHERE name = 'invalidate_derived_insert'`).get().sql,
+      /provenance IN/,
+      'precondition: the store under test carries a source-set-scoped D9 trigger',
+    )
+
+    // Deterministic PRNG, because a failure must be reproducible and a walk drawn
+    // from Math.random tells a different story every run.
+    //
+    // ⚠️ mulberry32, NOT the textbook LCG, and this is measured rather than
+    // stylistic. The first version of this test used
+    // `seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n`, whose
+    // LOW BITS are famously correlated — over 6000 draws `rnd(6)` returned
+    // {0:1977, 1:9, 2:1997, 3:14, 4:1997, 5:6}. Index 1 is `active` in
+    // `MEMORY_STATUSES`, so the walk essentially never created an active row: at
+    // the end of 1200 steps the source set held 0 rows, the layer was never once
+    // invalidated, and the assertion below passed while exercising nothing. It
+    // stayed green under the NEW-only and OLD-only mutants it exists to kill.
+    // The liveness assertions at the bottom are what turn a repeat of that into
+    // a failure instead of a green run.
+    let seed = 0x5eed_1234
+    const rnd = (n) => {
+      seed = (seed + 0x6d_2b_79_f5) | 0
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+      return Math.floor((((t ^ (t >>> 14)) >>> 0) / 4_294_967_296) * n)
+    }
+    const sources = () =>
+      JSON.stringify([
+        queryInjectableSet({ db }, 200),
+        queryPersonaSources({ db }, 100),
+      ])
+
+    const STATUSES = MEMORY_STATUSES
+    const PROVS = PROVENANCES.filter((p) => p !== DERIVED_PROVENANCE)
+    let planted = null
+    let snapshot = null
+    let live = 0
+    let deaths = 0
+    let sawSources = 0
+    let violations = []
+    let ids = []
+
+    for (let step = 0; step < 1200; step++) {
+      // If a layer is alive, check it against the sources BEFORE writing again.
+      if (planted !== null) {
+        if (countDerived(db) === 0) {
+          planted = null
+          deaths++
+        } else {
+          live++
+          if (sources() !== snapshot) {
+            violations.push(`step ${step}: layer alive but its source set had changed`)
+          }
+        }
+      }
+      if (
+        db
+          .prepare(
+            `SELECT count(*) AS n FROM memories WHERE derived = ${LAYER.RAW} AND status = 'active'
+               AND provenance IN ('human','principal-explicit','parent-agent')`,
+          )
+          .get().n > 0
+      ) {
+        sawSources++
+      }
+      const op = rnd(6)
+      if (op === 0 || ids.length === 0) {
+        const id = `m${step}`
+        insertRaw(db, {
+          id,
+          status: STATUSES[rnd(STATUSES.length)],
+          provenance: PROVS[rnd(PROVS.length)],
+        })
+        ids.push(id)
+      } else {
+        const id = ids[rnd(ids.length)]
+        if (op === 1) {
+          db.prepare(`UPDATE memories SET status = ? WHERE id = ?`).run(
+            STATUSES[rnd(STATUSES.length)],
+            id,
+          )
+        } else if (op === 2) {
+          db.prepare(`UPDATE memories SET provenance = ? WHERE id = ?`).run(
+            PROVS[rnd(PROVS.length)],
+            id,
+          )
+        } else if (op === 3) {
+          // `forget`'s shape: tombstone AND blank the text, in one statement.
+          db.prepare(
+            `UPDATE memories SET status = 'tombstone', title = '', body = '' WHERE id = ?`,
+          ).run(id)
+        } else if (op === 4) {
+          db.prepare(`UPDATE memories SET body = ? WHERE id = ?`).run(`edited ${step}`, id)
+        } else {
+          db.prepare(`DELETE FROM memories WHERE id = ?`).run(id)
+          ids = ids.filter((x) => x !== id)
+        }
+      }
+      // Rebuild the layer whenever there is none, exactly as the job would:
+      // snapshot the sources, then write the derived row.
+      if (planted === null && countDerived(db) === 0) {
+        snapshot = sources()
+        plantLayer(db, `d${step}`)
+        planted = `d${step}`
+      }
+    }
+
+    assert.deepEqual(violations, [], 'a live derived layer must never summarize a stale source set')
+
+    // ⛔ LIVENESS OF THE FIXTURE, in three parts. The assertion above is a
+    // statement about states the walk actually reached, so a walk that reaches
+    // none of them proves nothing while reporting success — the failure this
+    // test shipped with once already (see the PRNG note above), and the reason
+    // each of these is checked rather than assumed.
+    //
+    // MARGINS, measured over 201 seeds (0 failures): `live` bottomed out at 1047
+    // against a floor of 100 (10.5x), `deaths` at 55 against 10 (5.5x), and
+    // `sawSources` at 164 against 100 — only 1.6x, much the tightest of the
+    // three. Left as is because these are LIVENESS floors, not the property under
+    // test: a seed change that scrapes one is a signal to re-measure the walk,
+    // not a flake to paper over by lowering the bar.
+    assert.ok(
+      live > 100,
+      `the layer must be observed ALIVE many times, or a never-built layer passes (was ${live})`,
+    )
+    assert.ok(
+      sawSources > 100,
+      `the SOURCE SET must be non-empty for much of the walk (was ${sawSources} steps); with an ` +
+        'empty source set every write is out of scope, nothing ever invalidates, and this ' +
+        'case is green against any implementation whatsoever',
+    )
+    assert.ok(
+      deaths > 10,
+      `the layer must actually be RETIRED sometimes (was ${deaths}); a walk that only ever ` +
+        'adds out-of-scope rows never exercises invalidation at all',
+    )
+    db.close()
+    cleanup(root)
+  })
+}
+
+/**
+ * ASSERTION B — "not too much". The narrowing IS the change, and this is the
+ * only assertion that can observe it.
+ *
+ * A `tool-output` row is the case that motivated v12: §2.3 keeps that
+ * provenance out of the injection packet, `queryInjectableSet` and
+ * `queryPersonaSources` both filter it away, so it can reach neither a rollup
+ * nor a portrait and cannot change what either says. On the main store
+ * (5ed2b4d2) 216 of 251 active raw rows are of exactly this shape (86.1%);
+ * across the nine stores it is 363 of 512 (70.9%), and under v11 every one of
+ * their writes destroyed the whole derived layer.
+ *
+ * `store_revision` is asserted beside the row count deliberately: it rides the
+ * rebuild job's idempotence key, so a bump with no invalidation still mints a
+ * fresh job id and re-does the work. "The layer survived" and "nothing was
+ * disturbed" are two claims.
+ *
+ * Run against BOTH copies of the trigger set — `migrateV12`'s frozen text,
+ * which a default-target store carries, and the live
+ * `createInvalidationTriggers`, which a store whose last schema step was a
+ * rebuild carries. This file already learned that lesson at v11: a version of
+ * this test written only against the default target leaves the live definition
+ * unpinned, and the live one is what the next rebuild migration installs
+ * everywhere.
+ */
+for (const [label, target] of [
+  ['the v12 migration copy (current target)', undefined],
+  ['the live definition (last step is a rebuild)', 10],
+]) {
+  test(`D9/B: a write outside the source set leaves the derived layer standing — ${label}`, () => {
+    const root = tempRoot()
+    const db = openRaw(join(root, 'm.sqlite'))
+    migrate(db, 'repo', target)
+    // Asserted, not assumed: if `migrate(db,'repo',10)` ever stopped installing
+    // the live set, this case would silently test the frozen copy twice.
+    assert.match(
+      db.prepare(`SELECT sql FROM sqlite_master WHERE name = 'invalidate_derived_insert'`).get().sql,
+      /provenance IN/,
+      'precondition: the store under test carries a source-set-scoped D9 trigger',
+    )
+
+    insertRaw(db, { id: 'src-1', provenance: 'human' })
+    plantLayer(db)
+    assert.equal(countDerived(db), 1, 'precondition: a derived layer exists')
+    const before = revisionOf(db)
+
+    insertRaw(db, { id: 'noise-tool', provenance: 'tool-output' })
+    assert.equal(
+      countDerived(db),
+      1,
+      'inserting an active tool-output row must NOT retire the layer: §2.3 keeps that ' +
+        'provenance out of the packet and both source queries filter it away, so it ' +
+        'cannot change anything the layer says',
+    )
+
+    insertRaw(db, { id: 'noise-cand', status: 'candidate', provenance: 'human' })
+    assert.equal(
+      countDerived(db),
+      1,
+      'nor may a candidate row: it is invisible to every read path until reconcile adopts ' +
+        'it, and that adoption is itself an UPDATE which DOES invalidate',
+    )
+
+    db.prepare(`UPDATE memories SET body = 'edited' WHERE id = 'noise-tool'`).run()
+    assert.equal(
+      countDerived(db),
+      1,
+      'nor may editing one — outside the source set on both sides of the update',
+    )
+
+    db.prepare(`DELETE FROM memories WHERE id = 'noise-tool'`).run()
+    assert.equal(countDerived(db), 1, 'nor may deleting one')
+
+    assert.equal(
+      revisionOf(db),
+      before,
+      'and store_revision must not move: it rides the rebuild job idempotence key, so a ' +
+        'bump with no invalidation still mints a fresh job id and redoes the work',
+    )
+    db.close()
+    cleanup(root)
+  })
+}
+
+/**
+ * ASSERTION C — the rule over the WHOLE transition space, which is what
+ * distinguishes OLD ∪ NEW from either side alone.
+ *
+ * Every ordered pair of the 30 non-derived (status, provenance) states — 6
+ * statuses × 5 provenances, 900 pairs — driven as a real UPDATE against the
+ * real trigger and asserted to invalidate exactly when
+ * `inSet(OLD) OR inSet(NEW)`.
+ *
+ * Of the 900, 171 must fire. The single-sided implementations each miss 81 of
+ * those 171 (counted directly from the rule, then confirmed by running them),
+ * and the misses are not exotic:
+ *   - NEW only misses every DEPARTURE — `active/human -> dormant/human` is
+ *     decay, `active/human -> tombstone/human` is the user's own `forget`. The
+ *     layer would go on serving a memory its owner had just deleted.
+ *   - OLD only misses every ARRIVAL — `candidate/human -> active/human` is
+ *     reconcile adopting a candidate, `dormant -> active` is decay reviving
+ *     one. That is v5's original defect, reopened.
+ *
+ * Failures are COLLECTED rather than thrown at the first one: which cell
+ * escapes is the diagnosis, and a bare assert inside the loop would report one
+ * pair and hide the shape of the other 80.
+ *
+ * Run against BOTH copies of the trigger set, for the reason D9/B is, and with
+ * more at stake here: C is the strongest falsifier of the three (171 counted
+ * exactly, 900 pairs compared one by one), so a version of it bound to the
+ * default target leaves the LIVE definition — the one the next rebuild
+ * migration installs everywhere — resting on B alone. Measured before this was
+ * parameterized: weakening the live UPDATE trigger to OLD only (v5's original
+ * defect, reopened), the live DELETE to `WHEN 0`, and the live INSERT to
+ * `WHEN 0 AND ...` each left the whole suite green. B could not catch any of
+ * them — it asserts that invalidation does not fire too WIDELY, which a
+ * trigger that never fires at all satisfies trivially, and its `provenance IN`
+ * precondition is a TEXT match that a gutted WHEN clause still passes.
+ */
+for (const [label, target] of [
+  ['the v12 migration copy (current target)', undefined],
+  ['the live definition (last step is a rebuild)', 10],
+]) {
+  test(`D9/C: invalidation fires exactly when the row is in the source set before OR after — ${label}`, () => {
+    const root = tempRoot()
+    const db = openRaw(join(root, 'm.sqlite'))
+    migrate(db, 'repo', target)
+    // Asserted, not assumed — the same precondition D9/B carries, for the same
+    // reason: if `migrate(db,'repo',10)` ever stopped installing the live set,
+    // this case would silently test the frozen copy twice.
+    assert.match(
+      db.prepare(`SELECT sql FROM sqlite_master WHERE name = 'invalidate_derived_insert'`).get().sql,
+      /provenance IN/,
+      'precondition: the store under test carries a source-set-scoped D9 trigger',
+    )
+    const inSet = (status, provenance) =>
+      status === 'active' && INJECTABLE_PROVENANCE.includes(provenance)
+
+    const states = MEMORY_STATUSES.flatMap((status) =>
+      PROVENANCES.filter((p) => p !== DERIVED_PROVENANCE).map((provenance) => ({ status, provenance })),
+    )
+    assert.equal(states.length, 30, 'six statuses times the five non-derived provenances')
+
+    const wrong = []
+    let firedCount = 0
+    let expectedCount = 0
+    for (const from of states) {
+      for (const to of states) {
+        db.exec(`DELETE FROM memories`)
+        db.exec(`DELETE FROM meta WHERE k = 'store_revision'`)
+        insertRaw(db, { id: 'x', status: from.status, provenance: from.provenance })
+        plantLayer(db)
+        // Sampled, never assumed: the planting INSERT must really have landed, or
+        // "the layer is gone" would be true before the transition ran.
+        assert.equal(countDerived(db), 1, 'the layer must exist before each transition')
+        db.prepare(`UPDATE memories SET status = ?, provenance = ? WHERE id = 'x'`).run(
+          to.status,
+          to.provenance,
+        )
+        const fired = countDerived(db) === 0
+        const expected = inSet(from.status, from.provenance) || inSet(to.status, to.provenance)
+        if (fired) firedCount++
+        if (expected) expectedCount++
+        if (fired !== expected) {
+          wrong.push(
+            `${from.status}/${from.provenance} -> ${to.status}/${to.provenance}: ` +
+              `fired=${fired} expected=${expected}`,
+          )
+        }
+      }
+    }
+    assert.deepEqual(
+      wrong,
+      [],
+      'every ordered transition must invalidate exactly when the row is in the source set on ' +
+        'EITHER side; a NEW-only trigger misses every departure (decay, forget) and an ' +
+        'OLD-only one misses every arrival (reconcile adoption, decay revival)',
+    )
+    // The COUNT, stated as a literal, so a rule that agreed with itself while
+    // meaning something else cannot pass. `wrong` compares the trigger against
+    // `inSet`, and both sides would move together if the expectation were
+    // rewritten; 171 is the number the rule yields for these 900 pairs, computed
+    // independently. A single-sided trigger fires 90 times here, not 171.
+    assert.equal(expectedCount, 171, '171 of the 900 ordered pairs touch the source set')
+    assert.equal(firedCount, 171, 'and the trigger fires on exactly those')
+    db.close()
+    cleanup(root)
+  })
+}
+
+/**
+ * The MIGRATION, on the route that matters: a v11 store that already exists.
+ *
+ * All nine live stores measured at `user_version = 11`, all nine carrying the
+ * wide v11 triggers, so a change confined to TypeScript would reach none of
+ * them. That is the v11-era lesson restated — "the rule is written correctly"
+ * and "the rule is in force" are two claims, and only the second protects
+ * anyone. The precondition below MEASURES the old behaviour first, so this
+ * cannot pass against a fixture that never had the defect.
+ *
+ * Shaped after `v10 -> v11`, including its fixture-ordering trap: raw writes go
+ * in before the derived row, or D9 has already emptied the layer the
+ * assertions are about.
+ */
+test('v11 -> v12 scopes D9 to the derived layer source set, on a store that already exists', () => {
+  const root = tempRoot()
+  const db = openRaw(join(root, 'm.sqlite'))
+  migrate(db, 'repo', 11)
+  assert.equal(userVersion(db), 11)
+
+  // A store as it EXISTS ON DISK at v11. `migrate(db,'repo',11)` does not
+  // produce one: v11 is pure trigger DDL layered over whatever `migrateV10`'s
+  // rebuild installed, so today's build already carries v12's D9 by the time
+  // v11 runs. Restoring v5's wide triggers is what makes this an UPGRADE test
+  // rather than a test of a store that never existed.
+  const wide = `
+        DELETE FROM memories WHERE derived != ${LAYER.RAW};
+        INSERT INTO meta (k, v) VALUES ('store_revision', '1')
+          ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT);`
+  db.exec(`
+    DROP TRIGGER invalidate_derived_insert;
+    DROP TRIGGER invalidate_derived_update;
+    DROP TRIGGER invalidate_derived_delete;
+    CREATE TRIGGER invalidate_derived_insert AFTER INSERT ON memories
+      WHEN NEW.derived = ${LAYER.RAW} BEGIN${wide}
+    END;
+    CREATE TRIGGER invalidate_derived_update AFTER UPDATE ON memories
+      WHEN OLD.derived = ${LAYER.RAW} BEGIN${wide}
+    END;
+    CREATE TRIGGER invalidate_derived_delete AFTER DELETE ON memories
+      WHEN OLD.derived = ${LAYER.RAW} BEGIN${wide}
+    END;
+  `)
+
+  // Data that must survive a trigger-only migration, evidence row included —
+  // the cascade a table rebuild would have endangered.
+  insertRaw(db, { id: 'raw-keep', provenance: 'human', title: 'title raw-keep' })
+  db.prepare(
+    `INSERT INTO evidence (memory_id,kind,ref,excerpt) VALUES ('raw-keep','session','s1','the exact words')`,
+  ).run()
+  plantLayer(db)
+
+  // PRECONDITION: the fixture really does over-invalidate.
+  insertRaw(db, { id: 'probe-v11', provenance: 'tool-output' })
+  assert.equal(
+    countDerived(db),
+    0,
+    'precondition: at v11 an active tool-output insert retires the WHOLE derived layer',
+  )
+
+  const before = {
+    memories: db.prepare(`SELECT count(*) c FROM memories`).get().c,
+    evidence: db.prepare(`SELECT excerpt FROM evidence WHERE memory_id='raw-keep'`).get().excerpt,
+  }
+
+  migrate(db, 'repo', 12)
+  assert.equal(userVersion(db), 12)
+
+  // Nothing lost, index coherent, no dangling reference.
+  assert.equal(db.prepare(`SELECT count(*) c FROM memories`).get().c, before.memories)
+  assert.equal(
+    db.prepare(`SELECT excerpt FROM evidence WHERE memory_id='raw-keep'`).get().excerpt,
+    before.evidence,
+    'no evidence row may be lost to a trigger-only migration',
+  )
+  assert.equal(
+    db
+      .prepare(`SELECT count(*) c FROM memories_fts WHERE memories_fts MATCH '"title raw-keep"'`)
+      .get().c,
+    1,
+    'the FTS index still matches the surviving row',
+  )
+  assert.equal(db.prepare('PRAGMA foreign_key_check').all().length, 0)
+
+  // The other seven triggers are untouched — this migration replaces three.
+  assert.deepEqual(
+    db
+      .prepare(`SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name`)
+      .all()
+      .map((r) => r.name),
+    [
+      'guard_derived_status',
+      'guard_derived_status_insert',
+      'guard_visibility_insert',
+      'guard_visibility_update',
+      'invalidate_derived_delete',
+      'invalidate_derived_insert',
+      'invalidate_derived_update',
+      'mem_ad',
+      'mem_ai',
+      'mem_au',
+    ],
+    'all ten triggers stand: 3 FTS, 2 visibility, 2 derived guards, 3 D9',
+  )
+
+  // THE BEHAVIOUR CHANGED — the whole point of registering the migration.
+  // Asserted as an OUTCOME, never as `userVersion === TARGET_USER_VERSION`,
+  // which reads the same symbol on both sides and passes at any value.
+  plantLayer(db, 'derived-2')
+  assert.equal(countDerived(db), 1, 'a layer can be planted again after the migration')
+  insertRaw(db, { id: 'probe-v12', provenance: 'tool-output' })
+  assert.equal(
+    countDerived(db),
+    1,
+    'after v12 the same insert that emptied the layer above leaves it standing — this ' +
+      'migration is what carries the change to the nine live stores, all on v11',
+  )
+  db.prepare(`UPDATE memories SET status = 'dormant' WHERE id = 'raw-keep'`).run()
+  assert.equal(
+    countDerived(db),
+    0,
+    'while an active/human row going dormant still retires it: decay REMOVES a source, and ' +
+      'a NEW-only trigger would have missed exactly this',
+  )
+  db.close()
   cleanup(root)
 })

@@ -182,12 +182,35 @@ test("memory_forget's description is true of BOTH kinds of member row", () => {
   // would have refused the correct wording. D9 runs `DELETE FROM memories
   // WHERE derived != RAW` and enqueues nothing; a rebuild is queued only while
   // `packetOverflows(store)` holds, so a dropped layer may never come back.
-  // Measured: after an unrelated raw write, derived goes 1 -> 0 and `jobs`
+  // Measured: after a write to a source-set row, derived goes 1 -> 0 and `jobs`
   // stays 0.
+  //
+  // The reason has TWO load-bearing halves, and each gets its own assertion so
+  // that one cannot rot behind the other:
+  //   - the UNIT is the whole layer, never this row;
+  //   - the TRIGGER is a write to a memory that FEEDS the layer.
   assert.match(
     text,
-    /dropped whenever that repository is written/i,
-    'the reason must be that the layer is DROPPED on any write to that repository',
+    /whole derived layer is dropped/i,
+    'the reason must be that the whole LAYER is dropped, not that this row is deleted',
+  )
+  assert.match(
+    text,
+    /dropped whenever a memory that feeds it is written/i,
+    'and the trigger must be a write to a memory that FEEDS the layer — D9 keys on the ' +
+      "layer's source set, not on every write to the repository",
+  )
+  // The pre-v12 wording, pinned dead. It was TRUE through v11, when D9 fired on
+  // any raw write; v12 scoped D9 to the source set (`status = 'active' AND
+  // provenance IN (INJECTABLE)`) and thereby made it false — `tool-output`, at
+  // 86.1% of active raw rows on the main store, is written constantly and now
+  // leaves the layer standing. Without this guard the sentence could silently
+  // revert to a claim the system stopped honouring.
+  assert.doesNotMatch(
+    text,
+    /whenever that repository is written/i,
+    'v12 does NOT drop the layer on every write to the repository — the commonest raw ' +
+      'writes (tool-output, subagent, candidate) leave it standing, so this overstates it',
   )
   assert.doesNotMatch(
     text,

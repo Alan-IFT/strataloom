@@ -206,7 +206,8 @@ const fillEntry = (tokens: number): RenderableHit => {
  * back to up to `INJECT_TOP_N` raw L1 rows. `buildContextProvider` calls it
  * ONCE PER SIDE — personal and repo — so both sides can be in fallback at the
  * same time, and the global store takes that branch often (D9's triggers delete
- * the L3 portrait on any personal raw write; measured absent 41.5% of the time).
+ * the L3 portrait on a personal write to its source set; measured absent 41.5%
+ * of the time, at v11, when any personal raw write did it).
  * The entry count is therefore `INJECT_TOP_N * 2`, not `ROLLUP_MAX_SCENARIOS + 1`.
  *
  * That sentence is a PREMISE, and it is only now true of both branches. The
@@ -358,10 +359,15 @@ export const buildContextProvider = (
       // L1 atoms — a branch that bounds the row COUNT and nothing else, since
       // a row's only size limit is `BODY_MAX_CHARS` (2000). The global store
       // takes that branch often: D9's `invalidate_derived_*` triggers delete
-      // the L3 portrait on ANY personal raw write, and nothing rebuilds it
-      // until the next maintenance pass (`CLEANUP_INTERVAL_MS`, 6 hours).
-      // Measured over a 32.2-hour window, the portrait was present 58.5% of
-      // the time and absent 41.5%. During an absence the live global store
+      // the L3 portrait on a personal write to the portrait's SOURCE SET
+      // (`queryPersonaSources`: `active` + INJECTABLE provenance), and nothing
+      // rebuilds it until the next maintenance pass (`CLEANUP_INTERVAL_MS`, 6
+      // hours). Measured over a 32.2-hour window, the portrait was present
+      // 58.5% of the time and absent 41.5% — measured at v11, when ANY personal
+      // raw write dropped it, so v12 can only make absences rarer, never more
+      // frequent. That does not retire this cap: it is sized for the fallback
+      // branch being taken AT ALL, not for how often, and one absence is enough
+      // to exhaust the budget. During an absence the live global store
       // returned 8 rows costing 2348 tokens — against a 1300-token packet, so
       // personal alone exhausted the budget and the repo store's L2 blocks
       // were dropped, all six of them, with nobody deciding which. The

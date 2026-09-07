@@ -1163,8 +1163,11 @@ export class MemoryService extends Service {
         //
         // Reachability, stated honestly rather than assumed: this is
         // UNREACHABLE today, and measured so. The INSERT above lands first, and
-        // it is a raw write, so D9's `invalidate_derived_insert` has already
-        // deleted the entire derived layer by the time this UPDATE runs — the
+        // it writes `status = 'active'` with `provenance = 'principal-explicit'`
+        // — squarely inside D9's source set at v12, so this argument does not
+        // rest on the pre-v12 "any raw write" rule that no longer holds. D9's
+        // `invalidate_derived_insert` has therefore already deleted the entire
+        // derived layer by the time this UPDATE runs — the
         // derived row is gone rather than superseded, and the statement matches
         // zero rows either way. The clause is here because "unreachable today"
         // is not a reason this project accepts (todo p was closed on exactly
@@ -1363,8 +1366,8 @@ export class MemoryService extends Service {
           //     memories to go after.
           // Strike the false halves and what remains is the only honest
           // answer: this row is never deleted row by row, because the whole
-          // derived LAYER is dropped the moment ANY raw row in that repository
-          // is written.
+          // derived LAYER is dropped the moment a row that FEEDS it in that
+          // repository is written.
           //
           // Two words this sentence must NOT use. Both were in its first
           // draft, and both are false — measured, not reasoned:
@@ -1374,19 +1377,30 @@ export class MemoryService extends Service {
           //     `enqueueRebuildIfOverflowing` queues only while
           //     `packetOverflows(store)` holds, so once the raw set no longer
           //     overflows, the layer never comes back at all. Measured: after
-          //     an unrelated raw INSERT/UPDATE/DELETE the derived count goes
+          //     a source-set INSERT/UPDATE/DELETE the derived count goes
           //     1 -> 0 while `jobs` stays 0 throughout. Promising a rebuild
           //     would be exactly the defect this branch exists to remove — an
           //     assurance the system does not actually make.
-          //   - NOT "the memories it summarizes". D9 keys on ANY raw write in
-          //     that store, related or not; the measurement above used a row
-          //     this rollup does not summarize. That qualifier understates
-          //     when this happens, and is simply the wrong set.
+          //   - NOT "the memories it summarizes". D9 keys on any write to the
+          //     layer's SOURCE SET, not on the subset this rollup happens to
+          //     summarize; the measurement above used a source-set row this
+          //     rollup does not summarize, and it still took the layer down.
+          //     That qualifier understates when this happens, and is simply
+          //     the wrong set.
+          //
+          // Nor, since v12, is the trigger "any memory in that repository".
+          // That was true through v11 and this sentence used to say it; v12
+          // scoped D9 to `status = 'active' AND provenance IN (INJECTABLE)`,
+          // so writes to the rows that can never reach the packet — the
+          // 86.1%-of-active-raw `tool-output`/`subagent` majority on the main
+          // store, plus every `candidate` insert — now leave the layer
+          // standing. The sentence names the set that actually fires it: the
+          // memories that FEED the layer.
           throw new MemoryInputError(
             `${id} is a generated summary in group member repository ${foreign.source}, not a ` +
               'stored memory. No session can forget it directly — not this one, and not one ' +
               'started inside that repository. It is dropped as a whole layer the moment any ' +
-              'memory in that repository is written, changed or removed, so it is never ' +
+              'memory that FEEDS it is written, changed or removed, so it is never ' +
               'deleted row by row.',
           )
         }

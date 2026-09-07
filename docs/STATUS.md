@@ -1,5 +1,45 @@
 # 当前状态
 
+> 🆕 **最后更新：2026-09-07（第三节，纯决策，产品代码零改动，仍为 v0.4.17）**：
+> **三项裁定已出，见 [ADR 0015](decisions/0015-converge-at-the-write-and-scope-invalidation-to-what-is-visible.md)。**
+> 四路 agent 并行审计 + 主 agent 逐项复现。**一句话：收敛在写期、失效按可见性、状态按语义拆分——三件事各删一处结构，不新增机制。**
+> ⛔ **本轮推翻了我自己前两轮写下的三条前提，全部登记**：
+> ①「L2 于 09-06T23:09 **首次**触发」→ **第 25 次**（`jobs` 表 25 条 done，最早 08-31T14:55）；
+> ②「13 条 superseded preference 是**被收敛掉的偏好**」→ **全是从未 active 的 drop 候选**
+> （存活 11–15 秒，用户从未见过）；**真正「曾 active 被取代」的 preference ＝ 0 条**——
+> ADR 0014 §三的观察是对的，**我据它类比出的结论是错的**；
+> ③「修写期收敛可解决 rollup 只产 3 块」→ **覆盖率 28.6% → 25.0%，不升反降**（C 组自证伪，我已复现）。
+> ✅ **前置阻塞项解除**：`sourceOf` 谓词是 `m.status != 'tombstone'`（**不是** `EXCLUDED_STATUSES`），
+> superseded 行**畅通**；全库 77 条带 evidence 100%，L0 豁免使其不失效。
+> **arXiv 2605.12978 要求的「不覆写证据」本仓已满足**，故 A4 无阻塞。
+> ⭐ **真根因不是「派生层替代 raw」，是 D9 触发器对可见性失明**：
+> 生产触发器 `WHEN NEW.derived = 0 … DELETE WHERE derived != 0` **只看一列**，于是
+> **86.1%**（216/251）永不进包也永不进 rollup 的 `tool-output` 行、**以及所有不可见的 `candidate` 行**，
+> 每次写入都删掉整层；连 `drop` 也杀层。**删除发生在流水线判断出结果之前，与判断结果无关。**
+> 实测派生层双轴寿命 **median 63s、<60s 12/24、在线率 ~47%**；写入型 job 97 次 vs rebuild 25 次（**≈4∶1**）。
+> 🌐 **外部佐证方向一致**：Graphiti [#1657](https://github.com/getzep/graphiti/issues/1657) 把同形状的宽失效
+> **当 bug 修掉**（"destroys all other groups' communities … with no error or log line"），
+> #1729 进一步收窄；#1837 表明反方向代价是摘要撒谎，但可接受方案是
+> **"invalidated until rebuilt"（标脏），不是删除**。两组 GitHub 全站检索 **TOTAL=0**——
+> 缓存式「写入即失效摘要」在本领域几乎无人采用。
+> ⛔ **证伪并作废两个「显而易见」的修法**：`ROLLUP_TRANSCRIPT_CHARS` **不调**
+> （调到 10000 使 `exchange 13782 > LLM_MAX_TOKENS 12000`，直接复现已修过三次的截断缺陷；
+> 且窗口只占语料 **21.7%**，`coding` 中位 1087 字符是 `preference` 的 1.8 倍——**容量问题非重复问题**）；
+> **C3 条件替代零效果**（raw 集 7132 tok ≫ 1300，`packetOverflows` **恒为真**）。
+> 🟡 **`EXCLUDED_STATUSES` 的注释是假的**：声称排除「every read surface」，实测 **12 个面里只管 1 个**；
+> **删掉 `'superseded'` 一行，310/310 全绿**（变异实测，已还原）。
+> 🟡 **`superseded` 承担两种不相干语义**：A 类（candidate 被 drop、从未 active）**66 条**
+> vs B 类（曾 active 被取代）**46 条**——建议拆开，Honcho（`REJECTED`/`REPLACED_EXISTING` 双枚举）
+> 与 MemOS（`resolving`/`archived` 四态）均有先例。
+> **落地顺序**：B4-a 改假注释 → **C5a 失效加可见性判据**（正交、最便宜、且它改变 A4 的验证基线）
+> → **A4 删 kind 豁免**（净删除：代码 −1 行、prompt 规则 5→4）→ B4-b 拆状态 → 重估 C4/C5b/C2。
+> ⚠️ **清单勘误**：`letta-ai/letta` 现仅为落地页（源码在 `letta-code`）；`MemTensor/MemOS` ≠ `BAI-LAB/MemoryOS`。
+> **Awesome-Agent-Memory 的条目描述不可直接引用，须核对源仓库**（继 Lians 之后第 2、3 例）。
+>
+> ⬇️ 以下 2026-09-07（第二节）及更早各节仍然有效。
+
+---
+
 > 最后更新：2026-09-07（第二节） · **本轮不发版，版本仍为 v0.4.17**（只动 `test/`，产品代码零改动）：
 > **`files` 是通配符 `lib/**/*.js`，而四个测试写入点直接往 `lib/`（交付物目录）里写模块。**
 > ⛔ **判别式是「一条规则两个面」**：既有 `package.test.mjs` 只守**发版面**（不许被打进包），

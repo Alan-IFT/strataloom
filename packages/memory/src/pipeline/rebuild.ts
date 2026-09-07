@@ -128,10 +128,15 @@ export const readRevision = (store: OpenStore): number => {
  * because it names a trap worth recognising: it assumed "the raw set keeps
  * growing" and "the derived layer stays alive" could hold at the same time.
  * They cannot. D9's `invalidate_derived_*` triggers delete every derived row on
- * ANY authoritative raw write and bump `store_revision`, so the growth that
- * would make the trigger matter is the very event that clears the layer.
+ * a write to the derived layer's SOURCE SET (v12; before v12, any authoritative
+ * raw write) and bump `store_revision`, so the growth that would make the
+ * trigger matter is the very event that clears the layer. The v12 narrowing
+ * leaves this intact, and not by luck: `packetOverflows` prices
+ * `queryInjectableSet`, which IS the source set, so growth that moves this
+ * trigger is growth of the very set D9 watches. A write D9 now ignores is
+ * equally a write that cannot make the raw set overflow.
  * Measured end to end — 60 raw rows, a committed rollup, then four growth
- * cycles of one raw write each:
+ * cycles of one source-set write each:
  *
  *     bootstrap                derived rows 1   raw-set rule true, injection rule false
  *     round 1..4  after write  derived rows 0   both rules true — IDENTICAL
@@ -496,11 +501,21 @@ const runPersonaJob = async (
   // for the reason that first suggests itself. "The last source row was
   // superseded or forgotten in the meantime" is precisely the example this
   // guard cannot be reached by: `schema.ts`'s `invalidate_derived_*` triggers
-  // bump `store_revision` on ANY write to a RAW row, and `runRebuildJob`'s
-  // first act is to compare that revision against the payload's. So every
-  // in-process way of emptying the source set fences the job one frame EARLIER,
-  // and control never arrives here. Measured, one mutation applied between
-  // enqueue and execution on a store whose single source row is the target:
+  // bump `store_revision` on a write to a row in the derived layer's SOURCE SET
+  // (v12; before v12, any raw row), and `runRebuildJob`'s first act is to
+  // compare that revision against the payload's. So every in-process way of
+  // emptying the source set fences the job one frame EARLIER, and control never
+  // arrives here.
+  //
+  // The v12 narrowing does not weaken that argument, and the table below is why
+  // it is stated rather than assumed: emptying the source set is BY DEFINITION
+  // a write to the source set, so the narrower trigger still covers every row
+  // here. The sharp case is `provenance -> subagent`, where the row leaves the
+  // set — caught by the UPDATE trigger's OLD arm, which a NEW-only reading
+  // would miss. Measured, one mutation applied between enqueue and execution on
+  // a store whose single source row is the target (re-measured at v12 through
+  // the real `runRebuildJob`/`runPersonaJob`, with an adapter counting LLM
+  // calls; every row below still holds):
   //
   //     supersede last source     rev 1->2  fenced  guard not reached  llm 0
   //     forget/tombstone          rev 1->2  fenced  guard not reached  llm 0

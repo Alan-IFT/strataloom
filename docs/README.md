@@ -10,6 +10,7 @@
 | 这个东西为什么是这样设计的 | [`../plugin-architecture.md`](../plugin-architecture.md) | 决策变化时 |
 | 4×4 记忆架构的目标形态与差距 | [`design/4x4-memory.md`](design/4x4-memory.md) | 阶段完成时 |
 | 某个决定当时是怎么权衡的 | [`decisions/`](decisions/) | 只增不改 |
+| 这个问题领域里别人是怎么解的 | `research-<日期>-<主题>.md` | 调研时新增，只增不改 |
 | 怎么装、怎么用 | [`../README.md`](../README.md) · [`../INSTALL.md`](../INSTALL.md) | 用户可见行为变化时 |
 | 代码内部怎么组织的 | [`../packages/memory/README.md`](../packages/memory/README.md) | 不变量/测试变化时 |
 

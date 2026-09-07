@@ -38,9 +38,14 @@ export const APPLICATION_ID = 0x53_54_4c_4d
  * carry a row past the trust filter written against the provenance column,
  * v11 = a derived row is only ever active, over every route into the state — v4
  * stated that principle in a comment and enforced `dormant` alone, which
- * measured 1 of the 5 non-active statuses).
+ * measured 1 of the 5 non-active statuses,
+ * v12 = D9 invalidates on a write to the derived layer's SOURCE SET
+ * (`status = 'active' AND provenance IN (INJECTABLE)`) rather than on any raw
+ * write, so the raw rows that can never reach the packet stop retiring a layer
+ * they cannot change — 86.1% of active raw rows on the main store 5ed2b4d2,
+ * 70.9% across the nine stores and 0% on four of them).
  */
-export const TARGET_USER_VERSION = 11
+export const TARGET_USER_VERSION = 12
 
 /**
  * How much of a failure cause is kept on the job row. Long enough for an
