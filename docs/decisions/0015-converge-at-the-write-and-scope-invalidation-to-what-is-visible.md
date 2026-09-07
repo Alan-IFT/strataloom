@@ -696,6 +696,229 @@ C2 raw 填充 = withinBudget(queryInjectableSet(...))            → 同一列�
 3. 届时重测 `kinds_seen`：若仍是 2/4、1/2，C5b 立即升为主修；
    **若 A4 意外抬高了它，则本节结论需推翻**。
 
+## 四·十一、重启后的实测更正（2026-09-07，v0.5.2 已真正运行）
+
+**用户已重装并重启：9 库全部迁移到 v12、A4 豁免已从安装的构建中移除。**
+本节记录随之而来的更正——**头两处是我自己写错的**。
+
+### ⛔ 更正 1：「B4-c 只能摘分母」是错的，且错因值得记
+
+`docs/STATUS.md` 曾写：B4-c 不可照抄 B4-b′，因为「分子的行**物理上已不存在**，只能摘分母」。
+
+**实测证伪**：C5a 生效后派生行**可以同时活着且已被 recall 命中**
+（`queryRecallRows` 的谓词只有 `status NOT IN (EXCLUDED_LIST)`，**不过滤 derived**）。
+此时分子含派生行、分母不含 ⇒ 算出**大于 1 的「率」**：
+
+```
+fixture: 4 raw active（2 条被召回）+ 3 derived active（3 条被召回，v12 才可达）
+shipped    = 0.714
+denomOnly  = 1.250   ← 我写的处方，结构上不可能的「率」
+bothSides  = 0.500   ← 正解，与 B4-b′ 同形
+```
+
+> **错因**：那条处方**写在 v11 数据上**——当时派生层在线率接近 0，
+> 「分子的行物理上已不存在」当时为真。**C5a 落地后前提失效，而我没回头复审引用它的论证。**
+> **这正是本文教训 8 自己写的失败模式**：「改一条规则后，grep 它的名字，逐条读引用它的论证」。
+> **我写下了那条教训，然后在同一份文档里违反了它。**
+
+### ⛔ 更正 2：Honcho 三枚举不是持久化状态，§四·八 的引用有误
+
+本文曾把 Honcho 的 `NOT_DUPLICATE`/`REPLACED_EXISTING`/`REJECTED`
+列为「在枚举层面就分开了」的业界先例。**回源核实后不成立**：
+
+```
+crud/document.py:1342  class SemanticRejectionResult(Enum)   ← 存在
+models.py              grep SemanticRejection → 0 处          ← 不是列
+函数签名 -> tuple[SemanticRejectionResult, Document | None]
+docstring: "Classify a semantic duplicate without writing."
+```
+
+**它是分类器的瞬时返回值，不是状态列。** 落到行上时语义被完全抹平——
+`REPLACED_EXISTING` 唯一持久动作是盖 `deleted_at`，后台 reconciler 到期物理删除；
+全库读侧一律 `deleted_at IS NULL`，**无任何读路径区别对待「被替换」与「被删除」**。
+**用它论证 A/B 类拆分属于类比尚可，但不能用作「业界在存储层区分终态」的证据。**
+
+### ✅ 更正 3：`retrievedRate` 的声明用途已被实现取代，而它自己无人消费
+
+```
+唯一消费者：runner.ts 的一条 logger.info —— 无阈值、无持久化、无下游判据
+声明用途：metrics.ts 写着 "activeCount / retrievedRate → dormant/decay"
+实测：decay 已完整落地（9/9 库各 7 次 done），且它不读这个数——
+      decay.ts 直接读 usage 逐行字段，其 active 计数自己写着 AND derived = 0
+```
+
+⭐ **真正消费该语义的代码早就把口径写对了；写错的只有那条没人读的日志。**
+
+**并且它零守护**——把 `retrievedRate` 换成**常量 1**：
+`BUILD_EXIT=0 / TEST_EXIT=0 / tests 325 / pass 325 / fail 0`。
+那条 `assert.equal(m.retrievedRate, 1)` 是假绿——fixture 恰好 1/1，
+「正确实现」与「恒返回 1」同值。**这是「没变红」的第四种形态**
+（前三种：没跑 / 没执行到 / 自比恒真）。
+
+🔴 **还有一个更深的问题，修口径治不了**：`retrieved` 是**自建库以来累计**的，
+`active` 是**当下快照**。**一个累计量除以一个瞬时量，本身就不是「率」。**
+实测 9/9 库自派生层诞生以来 recall 调用数 = 0——三个库读出的 0.818/0.762/0.800，
+**分子来自 8 月、分母来自 9 月**，是两个互不重叠的时间窗被同一个除法凑在一起。
+
+### 🔴 一个今天无防护的真实数值损害（独立于任何裁定，应尽早补）
+
+把 `overturnRate` 的 `archived` 项从分子分母同时删掉：
+`BUILD_EXIT=0 / TEST_EXIT=0 / 325 pass` —— **存活**。
+生产上这会让 **13 条真实 B 类退休**从信任指标里消失，而无人察觉。
+
+### 🟡 口径更正：不是「5 个库有活派生层」，是 6 个；且只有 2 个是 C5a 的功劳
+
+```
+3e857510 建于 09-04 | ec2636fc 09-01 | edf7a686 09-01 | global 09-06   ← 早于 v12
+5ed2b4d2 建于 09-07T07:40 | 94394b03 09-07T07:41                        ← v12 后
+```
+前 4 个是**靠闲置活下来的**（`rawWritesSinceLastRebuild = 0`），不是靠 C5a。
+**把 6 个活层整体归功于 C5a 会是又一次口径夸大。**
+
+## 四·十二、v12 运行后的四项裁定（2026-09-07，四路 agent 并行审计）
+
+**全部四项：不做。** 每一项的否决理由都比立项时更强，且有三项**推翻了立项时的论证本身**。
+
+### 裁定一：B4-c（`retrievedRate`）→ **删掉这个指标，不要修它**
+
+```
+唯一消费者：runner.ts 一条 logger.info —— 无阈值、无持久化、无下游判据
+声明用途：metrics.ts 写 "activeCount / retrievedRate → dormant/decay"
+实测：decay 已完整落地（9/9 库各 7 次 done），且不读它——
+      decay.ts 直接读 usage 逐行字段，其 active 计数自己写着 AND derived = 0
+零守护：换成常量 1 → BUILD_EXIT=0 / TEST_EXIT=0 / 325 pass
+```
+
+⭐ **真正消费该语义的代码早就把口径写对了；写错的只有那条没人读的日志。**
+
+🔴 **而且修口径治不了它的根本问题**：`retrieved` 是**自建库以来累计**，`active` 是**当下快照**
+——**一个累计量除以一个瞬时量，本身就不是「率」**。实测 9/9 库自派生层诞生以来
+recall 调用数 = 0，三个库读出的 0.818/0.762/0.800 **分子来自 8 月、分母来自 9 月**。
+**修它只会让一个精确的错误看起来更可信。**
+
+> `metrics.ts` 自己写着判据：*"A number nobody acts on would be noise that still costs a query."*
+> `decay.ts` 写着：*"an observable that can only report 0 invites the reader to conclude
+> something was checked."* **`retrievedRate` 同时满足这两句所禁止的条件。**
+
+**外部佐证**：15 个业界项目中 **14 个不做这个指标**；唯一做的（`lazypower/continuity`）
+其指标已被自己的 issue #77 判定为坏的。graphiti 全仓 `access_count|retrieval_count|
+hit_count|last_accessed|usage_count` **0 matches**。
+
+### 裁定二：C5b（rollup 按 kind 分层）→ **不上调优先级，先加观测**
+
+⛔ **我基于「闲置 784 tok」提出的推论被实测反转**，三条独立证据：
+
+1. **`kindsFed` 零方差**：5 个库全是 2，而 scenario 产出从 2 到 6。
+   **一个零方差的变量在数学上不可能解释另一个变量的变异。**
+   真正与产出量单调相关的是 `fedRows`（10→2, 10→3, 13→4, 14→5, 15→6），
+   **而 C5b 不增加行数、多数库反而减少** ⇒ 按此关系外推，C5b 会让产出**更少**。
+2. **闲置有一半是结构性的**：`ROLLUP_MAX_SCENARIOS 6 × SCENARIO_MAX_TOKENS 188 = 1128`，
+   加 L3 画像 171 才是 1300。**repo 库永远拿不到 L3**（画像只在 global 库），
+   故 **≥172 tok 闲置是设计使然**。最好的库已达结构上限的 81%。
+3. ⭐ **「C5a 让用户看到更少记忆」不成立，内容判读反转**：
+
+```
+94394b03  DERIVED 交付 3 条：Issue Remediation Agent Pipeline / Project Audit and
+                            Guard-Check Defects / Design Proposals and Decision Records
+          RAW 会交付 10 条：前 6 条里 5 条在复述同一条工作流
+5ed2b4d2  RAW 8 行里 7 行是同一条 preference 的不同措辞
+          （近重复 Jaccard：raw 分支 0.519/0.534，derived 分支最大 0.092）
+```
+
+**C5a 让用户看到的是更少的 token、但更多的不同主题。**
+v11 那个「8 行进包」的对照组，实际是「同一条偏好念 7 遍」。**摘要在这里不是损失，是去重。**
+
+**真正该做的是先把它变成可测量的量**：全仓没有任何地方在测
+「派生层相对 raw 集的主题覆盖率」，所以「摘要是去重还是丢失」只能靠人读标题判断。
+**这比 `kinds_seen` 重要，且只加观测、不改行为。**
+
+### 裁定三：`propose`/`reconcile` 的 `archived` 不一致 → **不单独修，归入未来 v13**
+
+**全仓无消费者**：`archived` 与 `superseded` 在所有读路径上行为**逐条相同**
+（都被 `EXCLUDED_STATUSES` 排除、都不进包、`sourceOf` 都能召回）。
+唯一「分别读取」的 `metrics.ts` **立刻把两者求和**。
+
+⚠️ **但 (a)「让 propose 也写 archived」是最不该选的**：它把一个无消费者的语义断言
+**扩大到第二个写入点**，规则仍是两份。实测该方向**零防护**（改了 325/325 全绿）。
+
+**若必须动，选 (b) 删掉三元**——它是唯一减少概念数的方向。但 ADR 0015 已把它
+正确归并为「v13 一次把 `superseded`/`archived`/`rejected` 三态定清」的一半，
+**现在单独修 = 把一个已被正确归并的议题拆散**。
+
+**外部佐证**：8 个项目横向对比，**主流是合并甚至无状态**（Graphiti 纯时间戳「只记 WHEN
+不记 WHY」；Cognee 单一 `valid_to` 显式合并两种语义）。唯一站得住的反例 MemOS，
+**靠的是一条本仓没有的读路径**（`get_all` 让 `archived` 可见而 `deleted` 不可见）。
+
+### 裁定四：存量 preference 清理 → **不清理**
+
+⛔ **我上一轮说的收益「3 条 coding 进包、腾出 125 tokens」被实测证伪两处**：
+
+```
+5ed2b4d2 RAW 分支  清理前 8 条 / 1226 tok  →  清理后 6 条 / 1273 tok
+=> 条目数 -2（减少），token +47（不降反升）
+```
+**腾出的位置立刻被更长的 coding 行占满。** 正确表述是「换进 2–3 条 coding，
+条目数持平或减少、token 持平略升」，**不是腾出预算**。
+
+⭐ **更致命的一条，推翻了整个提问框架**：我问「派生层缺席时清理有没有收益」，
+实测答案是——**不存在「等派生层缺席」这回事，因为清理自己制造缺席**：
+
+```
+仅 supersede 1 条 human preference：
+5ed2b4d2  derived 2→0, revision 718→719   94394b03  derived 3→0, revision 306→307
+14 条待清理中，只有 1 条的 provenance 在 D9 源集合之外（可以安静清掉）
+```
+
+**「派生层活着 ⇒ raw 行不进包」是读的性质；「清理 raw 行」是写，
+而这个写把「派生层活着」这个前提当场消灭。前提在被使用的那一刻就失效了。**
+
+**且代价随 C5a 上升**：v12 前派生层每天被杀 14–24 次，多杀一次无所谓；
+现在每天只被杀 2.4–3.6 次且此刻全部活着——**C5a 让派生层变值钱了，
+于是破坏它的代价也变大了。**
+
+**其余理由**：7/9 库无同族可清；A4 已封顶 **94–97%** 的新复述（增长动力学已死，
+剩下的是静止残余）；判据在 T=0.20↔0.40 间摆动 3 倍，已找到误合真例
+（「授权范围」vs「收尾流程」）。
+
+**外部佐证——本裁定有生产先例**：mem0 v0.2.13 changelog 处理的是**同型事故**
+（写路径 bug 污染 `preference`），其官方处置原文：
+
+> "Existing memories written by the previous versions are **not rewritten**. If your
+> memories contain preferences you never expressed, **delete them**; the plugin will
+> not recreate them."
+
+⭐ **cognee 迁移给出了可用判据**：它敢用一条 SQL 无人确认地清理，是因为其「重复」
+判据是 `GROUP BY (user_id, session_id, entry_id)` —— **精确主键相等**，且
+**清理与 `CREATE UNIQUE INDEX` 原子落地**。
+> **当且仅当「重复」能被确定性主键定义时，才可无人确认地批量清理。**
+> **本例的「同族」是语义近似，落在这个判据的反面；且结构上不可能有约束阻止
+> 下一条近义 preference 写入——cognee 模式里最关键的那一半，本例无法复制。**
+
+**反面实证**：graphiti #1728 人工抽检 4 条误判 3 条（**75%**）且**静默**
+（原文 "silently, with no signal that anything was lost"）；
+honcho #728 批量重跑 **300→121 且无任何报错**。
+穷尽检索：**8 个仓库无一提供存量重跑去重 CLI**；graphiti `backfill`/`dedupe existing` 搜索 **TOTAL=0**。
+
+### 🔴 唯一现在就该做的事（独立于以上四项裁定）
+
+把 `overturnRate` 的 `archived` 项从分子分母同时删掉：
+`BUILD_EXIT=0 / TEST_EXIT=0 / 325 pass` —— **存活**。
+生产上这会让 **13 条真实 B 类退休**从信任指标里消失，而无人察觉。
+**这是本轮唯一防护真实数值损害的缺口。**
+
+### ⚠️ 本轮的纪律事故（如实登记）
+
+1. 一个 agent 的变异实验**污染了真实仓库**（`metrics.ts` 被改一行），
+   它按纪律逐步 `git status` 才发现并复原。**根因未能确定。**
+   **教训：变异实验即使已复制到 /tmp，仍必须在每步后对真实仓库 `git status`
+   ——「我 cd 到 /tmp 了」这个推理不足以保证隔离。**
+2. 一个子代理**把调研报告写进了仓库**（`docs/prior-art-memory-backfill.md`），
+   派它的 agent 未在 prompt 中禁止写仓库。已保全内容后删除。
+3. 一个子代理把 MemOS #1789 的归因说反了（称「批量 UPDATE 被删掉」，
+   原文是「移出事务、分块执行」），且**尺度不匹配**：事故阈值 687MB/98000 行，
+   本例最大库 18MB/353 行，**小 2 个数量级**。已剔除，不作为裁定依据。
+   **这是「真实案例套用到尺度不匹配场景」——本会话反复出现的同型错误。**
+
 ## 五、遗留与限定
 - 🟡 **C5a 收益无法从历史数据反推**：`memories` 不存历史 status，C 组的近似算出
   105.2% 的荒谬值，**该读数已作废**。其 76.3% → 62.9% 的自我更正同样只是估计。
