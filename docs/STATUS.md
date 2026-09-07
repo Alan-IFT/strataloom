@@ -1,6 +1,43 @@
 # 当前状态
 
-> 🆕 **最后更新：2026-09-07（第三节，纯决策，产品代码零改动，仍为 v0.4.17）**：
+> 🆕 **最后更新：2026-09-07（第四节，已发版 **v0.5.0**）：B4-a + C5a 已落地，310 → 320 全绿。**
+> 走完整五步（方案审查 → 执行 → 代码审查 → 返工 → QA → 返工）。**ADR 0015 的第 1、2 步完成。**
+> **D9 三条触发器加源集合判据**：insert 用 NEW、delete 用 OLD、**update 用 `OLD ∪ NEW`**；
+> `INJECTABLE` 由 `sqlEnum(INJECTABLE_PROVENANCE)` 插值——**触发器文本会被固化进每个库的
+> `sqlite_master`，第二份副本是跨越持久化边界的重复，编译器看不见**。
+> 新增 **schema v12 迁移**（9 个生产库全部 v11，只改 TypeScript 对它们零作用）。
+> **真实生产库副本实测**：v11→v12、295 行无损；**tool-output 写入不再杀层且 revision 不动**、
+> human 写入照常失效；真实管线序列（extract 插 candidate 不杀层 → reconcile 转 active 杀层、
+> decay `active/human→dormant` 杀层、`active/tool-output→dormant` 不杀层）全部符合预期。
+> ⛔ **`update` 单侧是错的，这是全部正确性所在**：900 个有序转移对中单侧各漏 81 类——
+> NEW-only 漏 `active/human→dormant|tombstone`（**用户刚 forget 的记忆会留在摘要里**），
+> OLD-only 漏 `candidate/human→active/human`（**正是 v5 写来修的那个缺陷**）。
+> ⛔ **本轮被下游关卡拦下三次，都值得记**：
+> ①**代码审查抓出注释造假**——实施把 **76.3%** 写进注释，而**该数已被本仓审计附录亲手作废**
+> （正确 62.9%；`481 of 630` 全仓无出处、疑从百分比倒推），又把主库 **86.1%** 写成
+> "nine live stores"（跨 9 库真值 **70.9%、4 个库为 0%**）。**本轮起因就是一条口径夸大的假注释，
+> 用新的夸大替换旧的等于自我否定。**
+> ②**返工推翻了代码审查的处方**——审查说「参数化 D9/C 即可」，实测只杀掉 1 个变异：
+> **C 的 900 对全由 UPDATE 驱动，结构上碰不到 insert/delete 触发器**；真正有覆盖力的是 **D9/A**
+> （唯一对活层同时发 INSERT/UPDATE/DELETE 的用例）。**覆盖面 = 它实际执行的语句种类，与精确度无关。**
+> ③**QA 抓出 C5a 让自己的对外承诺变成假话**——`memory_forget` 的 description（**发给每一个 agent，
+> 当时就在主 agent 自己的 system prompt 里**）与 `forget` 抛给用户的文案都写着
+> 「layer is dropped whenever that repository is written」，而 v12 下占 86% 的 tool-output 写入**不掉层**；
+> **且三条断言正在锁死这两句假话——任何想改对的人都会先撞红**。已连同 6 处过期论证一并修正。
+> ✅ **测试可证伪，非假绿**：A（不许漏）+ B（不许滥）**必须成对**——实测 M4（完全不改）下
+> **A 保持绿、B 变红**；A/B/C 三条均已参数化跑 frozen 与 live 两份副本；
+> 另吸收一条**作业层** fencing 断言（job 在调用模型前被 revision 栅栏挡下、烧 0 次 LLM，
+> stub 被调用即 fail，另配 control 用例防假绿）。
+>
+> **下一步**：ADR 0015 第 3 步 **A4**（删 `reconcile.ts` 的 `kind !== 'preference'`、prompt 改按关系陈述）。
+> ⚠️ **A4 落地时 `pipeline.test.mjs` 的 `preference kept` 断言必然变红**（已确认它直接钉住「必须降级为并存」），
+> 按本仓判据「区分钉住不变量与钉住当前行为」处置。
+>
+> ⬇️ 以下 2026-09-07（第三节）及更早各节仍然有效。
+
+---
+
+> 最后更新：2026-09-07（第三节，纯决策，产品代码零改动，当时为 v0.4.17）：
 > **三项裁定已出，见 [ADR 0015](decisions/0015-converge-at-the-write-and-scope-invalidation-to-what-is-visible.md)。**
 > 四路 agent 并行审计 + 主 agent 逐项复现。**一句话：收敛在写期、失效按可见性、状态按语义拆分——三件事各删一处结构，不新增机制。**
 > ⛔ **本轮推翻了我自己前两轮写下的三条前提，全部登记**：
